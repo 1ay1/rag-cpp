@@ -80,6 +80,48 @@ softmax `p(z|x)` over retrieval scores) + a `replug_combine` distribution mixer;
 *continuation* — the following chunk); **In-Context RALM** stride schedule with a
 rerank hook; and grounded, source-attributed prompt assembly.
 
+### sparse — learned-sparse (SPLADE-style)
+An inverted-index retriever with **saturated impact weighting** (`log(1+tf)·idf`)
+and **query-time term EXPANSION** from a corpus co-occurrence graph — SPLADE's
+two ideas (learned weights + expansion) approximated model-free, or driven by a
+real SPLADE model through the encoder seam. BM25 speed, dense-like recall.
+
+### late — ColBERT late interaction
+Token-level **MaxSim** scoring: every query token softly matches its best
+document token and the matches sum. Precomputable document token embeddings make
+it a fast reranker between bi-encoders and cross-encoders. Ships a deterministic
+hashed-n-gram token embedder; a real ColBERT checkpoint plugs into the seam.
+
+### raptor — recursive tree retrieval
+**RAPTOR** (Sarthi 2024): recursively cluster → summarize chunks bottom-up into a
+tree of increasing abstraction, then retrieve over the **collapsed tree** (all
+levels pooled) so a query matches a fine leaf or a high-level synopsis. Dense or
+lexical agglomerative clustering; extractive summaries with an abstractive seam.
+
+### query — HyDE + multi-query
+**HyDE** (Gao 2022): embed an LLM-hallucinated *hypothetical* answer document to
+close the query-document distribution gap. **Multi-query / RAG-Fusion**: retrieve
+for several paraphrases and RRF-fuse. Both degrade to plain dense search with no
+generator.
+
+### crag — Corrective RAG + Self-RAG
+A **retrieval evaluator** grades the retrieved set's confidence and triggers
+CRAG's three actions (correct / ambiguous / incorrect) with decompose-recompose
+knowledge strips and an external-source fallback seam. Self-RAG **reflection**:
+per-passage relevance filtering and an answer **groundedness** (`IsSupported`)
+score. Model-free graders by default; learned graders via seams.
+
+### dense/local_embedder — in-process ONNX + GGUF
+**OnnxEmbedder** (ONNX Runtime + WordPiece) and **GgufEmbedder** (llama.cpp) run
+embedding models INSIDE the process — no server, no network. Gated behind
+`RAGCPP_WITH_ONNX` / `RAGCPP_WITH_LLAMA`; absent the dep, `load()` returns
+`unavailable` (the same graceful-degradation contract as the HTTP backends).
+
+### eval — BEIR harness
+Loads the standard BEIR format (corpus/queries jsonl + qrels tsv) and computes
+**nDCG@k, Recall@k, Precision@k, MAP, MRR** — the measurement that turns "SOTA"
+from a claim into a number you can diff.
+
 ### rerank — the accuracy ceiling
 Cross-encoder reranking over HTTP (TEI `/rerank` and Cohere/Jina `/v1/rerank`
 wire formats) and a local `ScoreFnReranker` for in-process models. Adapts into a

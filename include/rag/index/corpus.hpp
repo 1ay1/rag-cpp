@@ -55,6 +55,11 @@ public:
     void set_embedder(dense::AnyEmbedder e) { embedder_ = std::move(e); }
     [[nodiscard]] bool has_embedder() const noexcept { return embedder_.has_value(); }
 
+    // Embed arbitrary text with the attached embedder (unit-normalized, same as
+    // indexed chunks). Fails with Errc::unavailable if no embedder is set. Used
+    // by RAPTOR / HyDE / late-interaction which embed synthetic text.
+    [[nodiscard]] Result<Vector> embed_text(const std::string& text) const;
+
     // Ingest a document: chunk it, assign ids, index lexically, and (if an
     // embedder is set) embed its chunks. Returns the assigned DocId.
     Result<DocId> add_document(std::string uri, std::string text, Metadata meta = {}, std::string title = {});

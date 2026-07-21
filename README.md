@@ -59,6 +59,25 @@ The library treats the type system as a proof assistant:
   **Global search** (rank community summaries) — the full GraphRAG recipe with
   the expensive LLM ingredients made deterministic by default.
 
+### Cutting-edge retrieval
+- **SPLADE-style learned sparse** — saturated impact weighting + query-time term
+  expansion over an inverted index (BM25 speed, dense-like recall).
+- **ColBERT late interaction** — token-level **MaxSim** reranking between
+  bi-encoders and cross-encoders.
+- **RAPTOR** — recursive cluster-summarize tree; retrieve the **collapsed tree**
+  across abstraction levels (Sarthi et al., ICLR 2024).
+- **HyDE** — hypothetical-document embeddings + **multi-query / RAG-Fusion**
+  (Gao et al. 2022).
+- **Corrective RAG + Self-RAG** — a retrieval evaluator grading confidence into
+  correct / ambiguous / incorrect actions, decompose-recompose knowledge strips,
+  external-source fallback, and an answer **groundedness** score (Yan et al.
+  2024; Asai et al. 2024).
+
+### Evaluation
+A **BEIR-format harness** (corpus/queries jsonl + qrels tsv) computing
+**nDCG@k, Recall@k, Precision@k, MAP, MRR** — so SOTA is a measured number, not
+a claim. See [`examples/beir_eval.cpp`](examples/beir_eval.cpp).
+
 ### RALM assemblies (retrieval-augmented language modeling)
 Generator-agnostic retrieval frontends for four landmark recipes (the LM call is
 your seam):
@@ -74,6 +93,11 @@ your seam):
 server · deterministic local `Hash` (no network). Decorators: `RetryingEmbedder`
 (exponential backoff), `FallbackEmbedder` (primary → secondary). All behind an
 injectable **`HttpTransport`** seam — bring your own TLS/gRPC/mock.
+
+**In-process** (no server): **ONNX Runtime** (`OnnxEmbedder`, with WordPiece
+tokenization + mean/CLS/max pooling) and **GGUF via llama.cpp** (`GgufEmbedder`).
+Opt in with `-DRAGCPP_WITH_ONNX=ON` / `-DRAGCPP_WITH_LLAMA=ON`; without the dep
+they report `unavailable` and the core stays dependency-free.
 
 ### Source loaders
 Filesystem directory walker (include/exclude globs) · HTML → text · PDF (via
@@ -100,6 +124,8 @@ cmake --build build -j
 ctest --test-dir build                     # C++ + C-API suites
 ./build/examples/ragcpp_full_pipeline      # the maximal funnel
 ./build/examples/ragcpp_graphrag           # GraphRAG + RALM assemblies
+./build/examples/ragcpp_advanced           # SPLADE, ColBERT, RAPTOR, HyDE, CRAG
+./build/examples/ragcpp_beir_eval <dir>    # BEIR nDCG/Recall/MAP/MRR
 ./build/bench/ragcpp_bench 5000            # ablation + latency
 ```
 
@@ -134,6 +160,18 @@ The design draws on the retrieval-augmentation literature:
   documents.
 - Edge et al., **GraphRAG** (Microsoft 2024) — entity/document graph →
   communities → community summaries → graph-aware local + global search.
+- Sarthi et al., **RAPTOR** (ICLR 2024) — recursive cluster-summarize tree,
+  collapsed-tree retrieval across abstraction levels.
+- Khattab & Zaharia, **ColBERT** (SIGIR 2020) — late interaction (MaxSim) over
+  token embeddings.
+- Formal et al., **SPLADE** (SIGIR 2021) — learned sparse retrieval with term
+  expansion.
+- Gao et al., **HyDE** (2022) — precise zero-shot dense retrieval via
+  hypothetical documents.
+- Yan et al., **Corrective RAG** (2024) and Asai et al., **Self-RAG** (ICLR
+  2024) — retrieval evaluation, correction, and reflective critique.
+- Thakur et al., **BEIR** (NeurIPS 2021) — the zero-shot IR benchmark this
+  library's eval harness targets.
 
 ## License
 

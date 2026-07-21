@@ -10,6 +10,8 @@ option(RAGCPP_BUILD_BENCH    "Build the benchmark harness"  ON)
 option(RAGCPP_BUILD_EXAMPLES "Build the example programs"   ON)
 option(RAGCPP_USE_SIMD       "Enable SIMD distance kernels" ON)
 option(RAGCPP_WERROR         "Treat warnings as errors"     OFF)
+option(RAGCPP_WITH_ONNX      "Build in-process ONNX Runtime embedder" OFF)
+option(RAGCPP_WITH_LLAMA     "Build in-process GGUF (llama.cpp) embedder" OFF)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
@@ -40,6 +42,37 @@ target_include_directories(ragcpp
         $<INSTALL_INTERFACE:include>)
 
 target_link_libraries(ragcpp PUBLIC nlohmann_json::nlohmann_json)
+
+# ── Optional in-process embedder backends ────────────────────────────────────
+if(RAGCPP_WITH_ONNX)
+    # Point CMake at your ONNX Runtime install via -Donnxruntime_ROOT=... .
+    find_package(onnxruntime QUIET)
+    if(onnxruntime_FOUND)
+        target_link_libraries(ragcpp PUBLIC onnxruntime::onnxruntime)
+    else()
+        find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+            PATH_SUFFIXES onnxruntime onnxruntime/core/session)
+        find_library(ONNXRUNTIME_LIB onnxruntime)
+        if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIB)
+            message(FATAL_ERROR "RAGCPP_WITH_ONNX=ON but ONNX Runtime not found. "
+                "Set onnxruntime_ROOT or ONNXRUNTIME_INCLUDE_DIR/ONNXRUNTIME_LIB.")
+        endif()
+        target_include_directories(ragcpp PUBLIC ${ONNXRUNTIME_INCLUDE_DIR})
+        target_link_libraries(ragcpp PUBLIC ${ONNXRUNTIME_LIB})
+    endif()
+    target_compile_definitions(ragcpp PUBLIC RAGCPP_WITH_ONNX)
+endif()
+
+if(RAGCPP_WITH_LLAMA)
+    # Provide llama.cpp via find_package or add_subdirectory before this.
+    find_package(llama QUIET)
+    if(NOT llama_FOUND)
+        message(FATAL_ERROR "RAGCPP_WITH_LLAMA=ON but llama.cpp not found. "
+            "Install llama.cpp with CMake config, or add_subdirectory it first.")
+    endif()
+    target_link_libraries(ragcpp PUBLIC llama)
+    target_compile_definitions(ragcpp PUBLIC RAGCPP_WITH_LLAMA)
+endif()
 target_compile_features(ragcpp PUBLIC cxx_std_23)
 
 if(RAGCPP_USE_SIMD)

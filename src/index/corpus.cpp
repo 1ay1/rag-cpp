@@ -97,6 +97,14 @@ Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_
     return dense_search(query, k, MetaFilter{});
 }
 
+Result<Vector> Corpus::embed_text(const std::string& text) const {
+    if (!embedder_) return fail<Vector>(Errc::unavailable, "no embedder");
+    auto v = embedder_->embed_one(text);
+    if (!v) return std::unexpected(v.error());
+    dense::normalize(*v);
+    return v;
+}
+
 Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_t k,
                                               const MetaFilter& filter) const {
     if (!embedder_) return fail<std::vector<Hit>>(Errc::unavailable, "no embedder");

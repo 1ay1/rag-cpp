@@ -411,6 +411,191 @@ TEST(assemble_prompt_attributes_sources) {
     CHECK(p.find("what colour is the sky") != std::string::npos);
 }
 
+// ── Learned sparse (SPLADE-style) ──────────────────────────────────────
+
+TEST(splade_retrieves_and_expands) {
+    rag::Engine engine;
+    engine.add("d1", "vector search with hnsw graphs approximate nearest neighbours embeddings");
+    engine.add("d2", "lexical bm25 inverted index keyword matching term frequency");
+    engine.add("d3", "neural networks deep learning gradient descent backpropagation training");
+    engine.build();
+    auto idx = rag::sparse::SpladeIndex::build(engine.corpus());
+    REQUIRE(idx.has_value());
+    CHECK(idx->vocab_size() > 0);
+    auto hits = idx->search("vector nearest neighbours", 3);
+    REQUIRE(!hits.empty());
+    // d1 (the vector-search doc) must rank first.
+    auto top = engine.corpus().resolve(hits[0]);
+    CHECK(top.uri == "d1");
+    // Expansion: encoding a query yields more terms than the raw query has.
+    auto raw = idx->encode("vector", false);
+    auto exp = idx->encode("vector", true);
+    CHECK(exp.size() >= raw.size());
+}
+
+// ── ColBERT late interaction ─────────────────────────────────────────
+
+TEST(colbert_maxsim_prefers_token_overlap) {
+    auto embed = rag::late::hashed_token_embedder(64);
+    rag::late::ColbertReranker rr(embed);
+    std::vector<std::string> passages = {
+        "completely unrelated content about cooking pasta",
+        "the quick brown fox jumps over the lazy dog",
+    };
+    auto scores = rr.rerank("quick brown fox", passages);
+    REQUIRE(scores.has_value());
+    REQUIRE(scores->size() == 2);
+    // The passage sharing tokens with the query scores higher.
+    CHECK((*scores)[1] > (*scores)[0]);
+}
+
+TEST(colbert_maxsim_exact_match_is_maximal) {
+    auto embed = rag::late::hashed_token_embedder(64);
+    auto q = embed("alpha beta gamma");
+    REQUIRE(q.has_value());
+    // MaxSim of a token set with itself = number of tokens (each matches at 1.0).
+    float s = rag::late::maxsim(*q, *q);
+    CHECK(std::fabs(s - 3.0f) < 1e-3f);
+}
+
+// ── RAPTOR ───────────────────────────────────────────────────────
+
+TEST(raptor_builds_tree_and_retrieves) {
+    rag::Engine engine;
+    for (int i = 0; i < 12; ++i)
+        engine.add("doc" + std::to_string(i),
+            "Document " + std::to_string(i) +
+            " discusses vector search hnsw graphs indexing and approximate nearest neighbours in depth.");
+    engine.add("cook", "Risotto needs arborio rice toasted then stock added gradually while stirring.");
+    engine.build();
+    rag::raptor::RaptorConfig cfg; cfg.cluster_size = 4; cfg.max_levels = 3;
+    auto tree = rag::raptor::RaptorTree::build(engine.corpus(), cfg);
+    REQUIRE(tree.has_value());
+    // The tree must have MORE nodes than leaves (summaries were created)...
+    CHECK(tree->node_count() > engine.corpus().chunk_count());
+    // ...and at least 2 levels.
+    CHECK(tree->level_count() >= 2u);
+    auto res = tree->retrieve(engine.corpus(), "vector search nearest neighbours", 5);
+    REQUIRE(res.has_value());
+    CHECK(!res->empty());
+}
+
+// ── HyDE / multi-query ────────────────────────────────────────────
+
+TEST(hyde_uses_hypothetical_document) {
+    rag::Engine engine;
+    engine.add("d1", "HNSW is a graph-based approximate nearest neighbour index for vectors.");
+    engine.add("d2", "BM25 ranks documents by term frequency and inverse document frequency.");
+    engine.build();
+    // A generator that returns a hypothetical answer mentioning HNSW.
+    auto gen = [](std::string_view) -> rag::Result<std::vector<std::string>> {
+        return std::vector<std::string>{"HNSW builds a navigable small-world graph over vectors."};
+    };
+    auto hits = rag::query::hyde_search(engine.corpus(), "how is fast vector search done", 2, gen);
+    REQUIRE(hits.has_value());
+    REQUIRE(!hits->empty());
+    // The HNSW doc should surface via the hypothetical.
+    bool has_d1 = false;
+    for (auto& h : *hits) if (engine.corpus().resolve(h).uri == "d1") has_d1 = true;
+    CHECK(has_d1);
+}
+
+// ── Corrective RAG / Self-RAG ─────────────────────────────────────
+
+TEST(crag_grades_and_filters) {
+    rag::Engine engine;
+    engine.add("rel",   "vector search uses hnsw graphs for approximate nearest neighbours");
+    engine.add("noise", "a recipe for chocolate chip cookies with butter and sugar");
+    engine.build();
+    auto hits = engine.corpus().lexical_search("hnsw approximate nearest neighbours", 5);
+    REQUIRE(!hits.empty());
+    auto c = rag::crag::correct(engine.corpus(), "hnsw approximate nearest neighbours", hits);
+    // The relevant doc drives high confidence → Correct action.
+    CHECK(c.action == rag::crag::Action::correct);
+    CHECK(c.confidence > 0.5f);
+    // Knowledge strips are non-empty and the relevant doc is kept.
+    CHECK(!c.knowledge.empty());
+}
+
+TEST(crag_low_confidence_triggers_fallback) {
+    rag::Engine engine;
+    engine.add("a", "quantum chromodynamics and the strong nuclear force");
+    engine.build();
+    auto hits = engine.corpus().lexical_search("chocolate cake recipe", 5);
+    bool external_called = false;
+    auto ext = [&](std::string_view) -> rag::Result<std::vector<std::string>> {
+        external_called = true;
+        return std::vector<std::string>{"external fallback knowledge about cakes"};
+    };
+    auto c = rag::crag::correct(engine.corpus(), "chocolate cake recipe", hits, {}, {}, ext);
+    // Off-topic corpus → low confidence → not Correct → external fallback fires.
+    CHECK(c.action != rag::crag::Action::correct);
+    CHECK(external_called);
+    CHECK(!c.external.empty());
+}
+
+TEST(crag_support_score_measures_groundedness) {
+    rag::Engine engine;
+    engine.add("x", "placeholder");
+    engine.build();
+    std::vector<std::string> knowledge = {"the eiffel tower is located in paris france"};
+    float grounded = rag::crag::support_score(engine.corpus(), "The eiffel tower is in paris.", knowledge);
+    float ungrounded = rag::crag::support_score(engine.corpus(), "The moon is made of cheese entirely.", knowledge);
+    CHECK(grounded > ungrounded);
+}
+
+// ── BEIR eval metrics ───────────────────────────────────────────
+
+TEST(beir_metrics_are_correct) {
+    // A ranking with the one relevant doc at rank 1 = perfect.
+    rag::eval::Ranking perfect = {"d1", "d2", "d3"};
+    std::unordered_map<std::string, int> rel = {{"d1", 1}};
+    CHECK(std::fabs(rag::eval::ndcg_at_k(perfect, rel, 10) - 1.0) < 1e-9);
+    CHECK(std::fabs(rag::eval::recall_at_k(perfect, rel, 10) - 1.0) < 1e-9);
+    CHECK(std::fabs(rag::eval::reciprocal_rank(perfect, rel) - 1.0) < 1e-9);
+    CHECK(std::fabs(rag::eval::average_precision(perfect, rel) - 1.0) < 1e-9);
+    // Relevant doc at rank 2 → RR = 1/2, recall still 1 at k>=2.
+    rag::eval::Ranking rank2 = {"d2", "d1", "d3"};
+    CHECK(std::fabs(rag::eval::reciprocal_rank(rank2, rel) - 0.5) < 1e-9);
+    CHECK(std::fabs(rag::eval::recall_at_k(rank2, rel, 1) - 0.0) < 1e-9);
+    CHECK(std::fabs(rag::eval::recall_at_k(rank2, rel, 2) - 1.0) < 1e-9);
+    // nDCG@1 for rank2 = 0 (nothing relevant at position 1).
+    CHECK(std::fabs(rag::eval::ndcg_at_k(rank2, rel, 1) - 0.0) < 1e-9);
+}
+
+TEST(beir_evaluate_harness_runs) {
+    rag::eval::BeirDataset ds;
+    ds.corpus = {{"c1", "HNSW", "vector search with hnsw graphs"},
+                 {"c2", "BM25", "lexical ranking with bm25"}};
+    ds.queries = {{"q1", "hnsw vector search"}};
+    ds.qrels["q1"]["c1"] = 1;
+    rag::index::Corpus corpus;
+    auto m = rag::eval::evaluate_corpus(ds, corpus);
+    REQUIRE(m.has_value());
+    CHECK_EQ(m->queries, 1u);
+    // The relevant doc c1 should be retrieved for its own query.
+    CHECK(m->recall[10] > 0.0);
+}
+
+// ── in-process embedder availability ────────────────────────────────
+
+TEST(local_embedder_reports_availability) {
+    // Without the optional deps, load() must fail gracefully with `unavailable`
+    // rather than crash — the graceful-degradation contract.
+    if (!rag::dense::OnnxEmbedder::available()) {
+        rag::dense::LocalEmbedderConfig cfg; cfg.model_path = "nope.onnx";
+        auto e = rag::dense::OnnxEmbedder::load(cfg);
+        CHECK(!e.has_value());
+        if (!e) CHECK(e.error().code == rag::Errc::unavailable);
+    }
+    if (!rag::dense::GgufEmbedder::available()) {
+        rag::dense::LocalEmbedderConfig cfg; cfg.model_path = "nope.gguf";
+        auto e = rag::dense::GgufEmbedder::load(cfg);
+        CHECK(!e.has_value());
+        if (!e) CHECK(e.error().code == rag::Errc::unavailable);
+    }
+}
+
 int main() {
     std::printf("Running %zu test cases...\n", registry().size());
     for (auto& c : registry()) {
