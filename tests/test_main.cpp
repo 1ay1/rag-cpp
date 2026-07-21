@@ -285,6 +285,132 @@ TEST(prf_expand_stage_grows_query) {
     CHECK(expanded);
 }
 
+// ── GraphRAG ────────────────────────────────────────────────────────────────
+
+TEST(graph_builds_link_and_similarity_edges) {
+    rag::Engine engine;
+    // d1 links to d2 by markdown; d3 shares vocabulary with d1/d2.
+    engine.add("alpha.md", "Alpha is about vector search. See [beta](beta.md) for HNSW graphs.");
+    engine.add("beta.md",  "Beta covers HNSW graphs and vector search indexing in depth.");
+    engine.add("gamma.md", "Gamma discusses HNSW vector search graphs and indexing performance.");
+    engine.add("delta.md", "Delta is about cooking pasta and unrelated culinary topics entirely.");
+    engine.build();
+    auto g = engine.graph();
+    REQUIRE(g.has_value());
+    CHECK((*g)->node_count() == 4);
+    // There should be at least one explicit LINK edge (alpha → beta).
+    bool has_link = false;
+    for (auto& e : (*g)->edges())
+        if (e.kind == rag::graph::Edge::Kind::link) has_link = true;
+    CHECK(has_link);
+    // Communities are detected and cover every node.
+    std::size_t covered = 0;
+    for (auto& c : (*g)->communities()) covered += c.docs.size();
+    CHECK_EQ(covered, 4u);
+    // Every community has a non-empty extractive summary.
+    for (auto& c : (*g)->communities()) CHECK(!c.summary.empty());
+}
+
+TEST(graph_local_search_expands_via_edges) {
+    rag::Engine engine;
+    engine.add("a.md", "The retrieval engine uses BM25 for lexical ranking. See [dense](b.md).");
+    engine.add("b.md", "The dense retriever embeds text and scores by cosine similarity.");
+    engine.add("c.md", "Fusion combines lexical and dense rankings with reciprocal rank fusion.");
+    engine.build();
+    auto hits = engine.graph_local("BM25 lexical ranking", 5);
+    REQUIRE(hits.has_value());
+    CHECK(!hits->empty());
+    // The seed doc (a.md) must appear.
+    bool has_a = false;
+    for (auto& h : *hits) if (h.uri == "a.md") has_a = true;
+    CHECK(has_a);
+}
+
+TEST(graph_global_search_ranks_communities) {
+    rag::Engine engine;
+    engine.add("net1.md", "Neural networks learn representations via gradient descent and backprop.");
+    engine.add("net2.md", "Deep neural networks stack layers to learn hierarchical features.");
+    engine.add("cook.md", "To cook risotto, toast the rice then add stock gradually while stirring.");
+    engine.build();
+    auto hits = engine.graph_global("how do neural networks learn", 3);
+    REQUIRE(hits.has_value());
+    CHECK(!hits->empty());
+    // Top global hit should be a neural-network community, not the cooking one.
+    CHECK((*hits)[0].uri != "cook.md");
+}
+
+// ── RALM ────────────────────────────────────────────────────────────────────
+
+TEST(ralm_ensemble_weights_are_a_distribution) {
+    rag::Engine engine;
+    engine.add("d1", "vector search with hnsw graphs and approximate nearest neighbours");
+    engine.add("d2", "lexical search with bm25 and inverted indexes for keyword matching");
+    engine.build();
+    auto hits = engine.corpus().lexical_search("vector search", 4);
+    REQUIRE(!hits.empty());
+    auto wd = rag::ralm::ensemble_weights(engine.corpus(), hits, 1.0f);
+    REQUIRE(!wd.empty());
+    float sum = 0.0f;
+    for (auto& w : wd) { CHECK(w.weight >= 0.0f); sum += w.weight; }
+    CHECK(std::fabs(sum - 1.0f) < 1e-4f);
+    // Higher-scored hit gets >= weight of lower-scored (softmax monotone).
+    if (wd.size() >= 2) CHECK(wd[0].weight >= wd[1].weight);
+}
+
+TEST(replug_combine_mixes_distributions) {
+    rag::ralm::WeightedDoc a, b;
+    a.weight = 0.75f; b.weight = 0.25f;
+    std::vector<rag::ralm::WeightedDoc> docs = {a, b};
+    std::vector<std::vector<float>> logits = {{1.0f, 0.0f}, {0.0f, 1.0f}};
+    auto out = rag::ralm::replug_combine(docs, logits);
+    REQUIRE(out.size() == 2);
+    CHECK(std::fabs(out[0] - 0.75f) < 1e-5f);
+    CHECK(std::fabs(out[1] - 0.25f) < 1e-5f);
+}
+
+TEST(retro_retrieves_neighbours_with_continuation) {
+    rag::Engine engine;
+    // A long doc so the chunker yields multiple chunks (continuation exists).
+    std::string body;
+    for (int i = 0; i < 40; ++i)
+        body += "Paragraph " + std::to_string(i) + " about vector search and hnsw graphs indexing. ";
+    engine.add("long.md", body);
+    engine.add("other.md", "unrelated content about cooking and recipes and food preparation.");
+    engine.build();
+    rag::ralm::RetroConfig cfg; cfg.stride = 4; cfg.neighbours = 2;
+    auto rows = rag::ralm::retro_retrieve(engine.corpus(), "vector search hnsw graphs indexing", cfg);
+    REQUIRE(rows.has_value());
+    REQUIRE(!rows->empty());
+    bool any_neighbour = false;
+    for (auto& r : *rows) if (!r.neighbours.empty()) any_neighbour = true;
+    CHECK(any_neighbour);
+}
+
+TEST(incontext_plan_fires_at_strides) {
+    rag::Engine engine;
+    engine.add("d1", "retrieval augmented generation grounds the model on external documents");
+    engine.add("d2", "in context ralm prepends retrieved passages without modifying the model");
+    engine.build();
+    rag::ralm::RalmConfig cfg; cfg.stride = 4;
+    auto plan = rag::ralm::incontext_plan(
+        engine.corpus(), /*n_tokens=*/12,
+        [](std::size_t pos) { (void)pos; return std::string("retrieval augmented generation model"); },
+        cfg);
+    REQUIRE(plan.has_value());
+    // 12 tokens / stride 4 = 3 retrieval points.
+    CHECK_EQ(plan->size(), 3u);
+    for (auto& d : *plan) CHECK(!d.text.empty());
+}
+
+TEST(assemble_prompt_attributes_sources) {
+    rag::ralm::WeightedDoc a; a.text = "the sky is blue"; a.weight = 1.0f;
+    std::vector<rag::ralm::WeightedDoc> docs = {a};
+    auto p = rag::ralm::assemble_prompt("what colour is the sky", docs, "Answer using the context.");
+    CHECK(p.find("[1]") != std::string::npos);
+    CHECK(p.find("the sky is blue") != std::string::npos);
+    CHECK(p.find("what colour is the sky") != std::string::npos);
+}
+
 int main() {
     std::printf("Running %zu test cases...\n", registry().size());
     for (auto& c : registry()) {

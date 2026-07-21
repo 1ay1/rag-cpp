@@ -13,8 +13,10 @@
 #include "rag/core/types.hpp"
 #include "rag/dense/backends.hpp"
 #include "rag/dense/embedder.hpp"
+#include "rag/graph/graph.hpp"
 #include "rag/index/corpus.hpp"
 #include "rag/pipeline/pipeline.hpp"
+#include "rag/ralm/ralm.hpp"
 
 namespace rag {
 
@@ -48,11 +50,48 @@ public:
     [[nodiscard]] index::Corpus&       corpus()       noexcept { return corpus_; }
     [[nodiscard]] const index::Corpus& corpus() const noexcept { return corpus_; }
 
+    // ── GraphRAG ──────────────────────────────────────────────────────────────
+    // Build (and cache) the document graph. Rebuilds if the corpus changed.
+    Result<const graph::DocGraph*> graph(graph::GraphConfig cfg = {}, graph::Summarizer s = {}) {
+        if (!graph_ || graph_docs_ != corpus_.document_count()) {
+            auto g = graph::DocGraph::build(corpus_, cfg, std::move(s));
+            if (!g) return std::unexpected(g.error());
+            graph_ = std::make_unique<graph::DocGraph>(std::move(*g));
+            graph_docs_ = corpus_.document_count();
+        }
+        return graph_.get();
+    }
+
+    // GraphRAG local search: hybrid seed → PPR graph expansion → resolved hits.
+    Result<std::vector<SearchResult>> graph_local(std::string_view query, std::size_t k) {
+        auto g = graph(); if (!g) return std::unexpected(g.error());
+        auto hits = (*g)->local_search(corpus_, query, k);
+        if (!hits) return std::unexpected(hits.error());
+        return resolve_all(*hits);
+    }
+
+    // GraphRAG global search: rank community summaries → community lead chunks.
+    Result<std::vector<SearchResult>> graph_global(std::string_view query, std::size_t k) {
+        auto g = graph(); if (!g) return std::unexpected(g.error());
+        auto hits = (*g)->global_search(corpus_, query, k);
+        if (!hits) return std::unexpected(hits.error());
+        return resolve_all(*hits);
+    }
+
     Result<void> save(const std::string& path) const { return corpus_.save(path); }
 
 private:
-    index::Corpus     corpus_;
-    pipeline::Pipeline pipeline_;
+    std::vector<SearchResult> resolve_all(const std::vector<Hit>& hits) const {
+        std::vector<SearchResult> out;
+        out.reserve(hits.size());
+        for (const auto& h : hits) out.push_back(corpus_.resolve(h));
+        return out;
+    }
+
+    index::Corpus                     corpus_;
+    pipeline::Pipeline                pipeline_;
+    std::unique_ptr<graph::DocGraph>  graph_;
+    std::size_t                       graph_docs_ = static_cast<std::size_t>(-1);
 };
 
 } // namespace rag

@@ -49,6 +49,26 @@ The library treats the type system as a proof assistant:
 - **Query expansion** (RM3-lite PRF) and **parent-document stitching**
   (small-to-big) pipeline stages.
 
+### GraphRAG
+- An explicit **document graph**: **link edges** (markdown `[..](..)`, bare
+  URLs, `[[wikilinks]]`) + **similarity edges** (dense centroid cosine, else
+  lexical Jaccard; k-NN sparsified).
+- **Communities** via deterministic label propagation, **summarized
+  extractively** (free, no model) with an optional abstractive summarizer seam.
+- **Local search** (hybrid seed → **Personalized-PageRank** graph expansion) and
+  **Global search** (rank community summaries) — the full GraphRAG recipe with
+  the expensive LLM ingredients made deterministic by default.
+
+### RALM assemblies (retrieval-augmented language modeling)
+Generator-agnostic retrieval frontends for four landmark recipes (the LM call is
+your seam):
+- **RAG / REPLUG** — temperature-scaled softmax ensemble weights `p(z|x)` over
+  retrieval scores + a distribution-mixing combinator.
+- **RETRO** — chunked-neighbour retrieval with **continuations** (the chunk that
+  followed each neighbour).
+- **In-Context RALM** — a retrieval **stride schedule** with a rerank hook.
+- **Grounded prompt assembly** — numbered, source-attributed context.
+
 ### Embedders (pluggable)
 `Ollama` · `OpenAI`-compatible (+ **Together**, **TEI** presets) · `llama.cpp`
 server · deterministic local `Hash` (no network). Decorators: `RetryingEmbedder`
@@ -79,6 +99,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build                     # C++ + C-API suites
 ./build/examples/ragcpp_full_pipeline      # the maximal funnel
+./build/examples/ragcpp_graphrag           # GraphRAG + RALM assemblies
 ./build/bench/ragcpp_bench 5000            # ablation + latency
 ```
 
@@ -98,6 +119,21 @@ dense (HNSW):  ~0.14 ms/query
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layers, seams, invariants.
 - [`FORMAT.md`](FORMAT.md) — the `.ragdb` on-disk contract.
+
+## References
+
+The design draws on the retrieval-augmentation literature:
+
+- Lewis et al., **Retrieval-Augmented Generation** (NeurIPS 2020) — marginalize
+  the generator over retrieved documents weighted by `p(z|x)`.
+- Borgeaud et al., **RETRO** (ICML 2022) — chunked cross-attention over
+  retrieved neighbours and their continuations.
+- Ram et al., **In-Context RALM** (TACL 2023) — retrieve at a generation stride,
+  rerank, prepend; leave the LM untouched.
+- Shi et al., **REPLUG** (NAACL 2024) — black-box LM ensembling over retrieved
+  documents.
+- Edge et al., **GraphRAG** (Microsoft 2024) — entity/document graph →
+  communities → community summaries → graph-aware local + global search.
 
 ## License
 

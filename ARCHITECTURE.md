@@ -59,6 +59,27 @@ chunks + both indexes, does incremental ingest, and persists via `store/`.
 ### fusion — combine retrievers
 Reciprocal Rank Fusion (weighted) and Relative Score Fusion.
 
+### graph — GraphRAG
+An explicit **document graph** (nodes = documents) with two edge kinds — **link
+edges** (markdown `[..](..)`, bare URLs, `[[wikilinks]]` mined from the text and
+resolved against document URIs/titles) and **similarity edges** (dense centroid
+cosine when embedded, else lexical Jaccard; k-NN sparsified). Communities are
+found by deterministic **synchronous label propagation** (Raghavan 2007) and
+summarized **extractively** by default (highest-centrality sentences — free, no
+model) with an optional abstractive `Summarizer` seam. Two retrieval entries:
+**local** (hybrid seed → Personalized-PageRank expansion over the graph →
+chunks re-scored by their document's restart-biased centrality) and **global**
+(rank community summaries against the query — GraphRAG's map-reduce over
+community reports, reduced to its retrieval core).
+
+### ralm — retrieval-augmented LM assembly
+The retrieval-side machinery of four landmark recipes, generator-agnostic (the
+LM call is an injected seam): **RAG/REPLUG** ensemble weights (temperature-scaled
+softmax `p(z|x)` over retrieval scores) + a `replug_combine` distribution mixer;
+**RETRO** chunked-neighbour retrieval (per-stride neighbours with their
+*continuation* — the following chunk); **In-Context RALM** stride schedule with a
+rerank hook; and grounded, source-attributed prompt assembly.
+
 ### rerank — the accuracy ceiling
 Cross-encoder reranking over HTTP (TEI `/rerank` and Cohere/Jina `/v1/rerank`
 wire formats) and a local `ScoreFnReranker` for in-process models. Adapts into a
