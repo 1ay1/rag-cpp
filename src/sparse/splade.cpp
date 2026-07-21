@@ -6,6 +6,8 @@
 #include <cmath>
 #include <unordered_set>
 
+#include "rag/store/format.hpp"
+
 namespace rag::sparse {
 
 std::uint32_t SpladeIndex::intern(std::string_view term) {
@@ -154,6 +156,79 @@ std::vector<Hit> SpladeIndex::search(std::string_view query, std::size_t k) cons
         [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
     hits.resize(keep);
     return hits;
+}
+
+std::string SpladeIndex::serialize() const {
+    store::Writer w;
+    w.bytes("SPL1");
+    // vocab: term strings in id order.
+    std::vector<std::string> terms(term_id_.size());
+    for (auto& [s, id] : term_id_) if (id < terms.size()) terms[id] = s;
+    w.u<std::uint32_t>((std::uint32_t)terms.size());
+    for (auto& t : terms) { w.u<std::uint32_t>((std::uint32_t)t.size()); w.bytes(t); }
+    // idf
+    w.u<std::uint32_t>((std::uint32_t)idf_.size());
+    for (float f : idf_) w.u<float>(f);
+    // expansion graph
+    w.u<std::uint32_t>((std::uint32_t)expand_.size());
+    for (auto& row : expand_) {
+        w.u<std::uint32_t>((std::uint32_t)row.size());
+        for (auto& [nbr, wt] : row) { w.u<std::uint32_t>(nbr); w.u<float>(wt); }
+    }
+    // doc vectors + ids
+    w.u<std::uint32_t>((std::uint32_t)doc_vecs_.size());
+    for (std::size_t i = 0; i < doc_vecs_.size(); ++i) {
+        w.u<std::uint32_t>(doc_ids_[i].get());
+        w.u<std::uint32_t>((std::uint32_t)doc_vecs_[i].size());
+        for (auto& [t, wt] : doc_vecs_[i]) { w.u<std::uint32_t>(t); w.u<float>(wt); }
+    }
+    return std::move(w.data());
+}
+
+Result<SpladeIndex> SpladeIndex::deserialize(std::string_view blob) {
+    store::Reader r(blob);
+    std::string_view magic;
+    if (!r.bytes(4, magic) || magic != "SPL1")
+        return std::unexpected(Error{Errc::corrupt_index, "splade: bad magic"});
+    SpladeIndex s;
+    std::uint32_t nterms;
+    if (!r.u(nterms)) return std::unexpected(Error{Errc::corrupt_index, "splade: nterms"});
+    for (std::uint32_t i = 0; i < nterms; ++i) {
+        std::uint32_t len; std::string_view sv;
+        if (!r.u(len) || !r.bytes(len, sv)) return std::unexpected(Error{Errc::corrupt_index, "splade: term"});
+        s.term_id_.emplace(std::string(sv), i);
+    }
+    std::uint32_t nidf;
+    if (!r.u(nidf)) return std::unexpected(Error{Errc::corrupt_index, "splade: nidf"});
+    s.idf_.resize(nidf);
+    for (auto& f : s.idf_) if (!r.u(f)) return std::unexpected(Error{Errc::corrupt_index, "splade: idf"});
+    std::uint32_t nexp;
+    if (!r.u(nexp)) return std::unexpected(Error{Errc::corrupt_index, "splade: nexp"});
+    s.expand_.resize(nexp);
+    for (auto& row : s.expand_) {
+        std::uint32_t rn;
+        if (!r.u(rn)) return std::unexpected(Error{Errc::corrupt_index, "splade: exprow"});
+        row.resize(rn);
+        for (auto& [nbr, wt] : row)
+            if (!r.u(nbr) || !r.u(wt)) return std::unexpected(Error{Errc::corrupt_index, "splade: expedge"});
+    }
+    std::uint32_t ndocs;
+    if (!r.u(ndocs)) return std::unexpected(Error{Errc::corrupt_index, "splade: ndocs"});
+    s.doc_vecs_.resize(ndocs);
+    s.doc_ids_.resize(ndocs);
+    s.inverted_.assign(s.idf_.size(), {});
+    for (std::uint32_t i = 0; i < ndocs; ++i) {
+        std::uint32_t id, nnz;
+        if (!r.u(id) || !r.u(nnz)) return std::unexpected(Error{Errc::corrupt_index, "splade: docvec"});
+        s.doc_ids_[i] = ChunkId{id};
+        for (std::uint32_t j = 0; j < nnz; ++j) {
+            std::uint32_t t; float wt;
+            if (!r.u(t) || !r.u(wt)) return std::unexpected(Error{Errc::corrupt_index, "splade: nz"});
+            s.doc_vecs_[i][t] = wt;
+            if (t < s.inverted_.size()) s.inverted_[t].emplace_back(i, wt);
+        }
+    }
+    return s;
 }
 
 } // namespace rag::sparse

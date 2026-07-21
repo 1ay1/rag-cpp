@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "rag/core/types.hpp"
@@ -49,6 +50,15 @@ public:
 
     // k-NN search: returns (id, cosine-similarity) pairs, descending.
     [[nodiscard]] std::vector<Hit> search(std::span<const float> query, std::size_t k) const;
+
+    // Soft-delete a node by id (tombstone): it stays in the graph for
+    // connectivity but is never returned by search. O(1). Re-adding the same id
+    // resurrects it. `compact()` physically removes tombstones by rebuilding.
+    void remove(std::uint32_t id);
+    [[nodiscard]] bool is_deleted(std::uint32_t id) const noexcept;
+    [[nodiscard]] std::size_t deleted_count() const noexcept { return deleted_.size(); }
+    // Rebuild the graph without tombstoned nodes (amortizes delete churn).
+    void compact();
 
     // Filtered k-NN (FILTERED-HNSW / pre-filter): `allow(id)` decides whether a
     // chunk id may appear in the result. The predicate is evaluated DURING the
@@ -82,6 +92,7 @@ private:
     int           max_layer_ = -1;
     std::uint32_t entry_     = 0;
     std::vector<Node> nodes_;                 // index == internal node ordinal
+    std::unordered_set<std::uint32_t> deleted_;  // tombstoned ids (soft-delete)
     mutable std::mt19937_64 rng_{cfg_.seed};
 
     [[nodiscard]] int  random_level();

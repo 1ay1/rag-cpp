@@ -63,6 +63,12 @@ public:
     [[nodiscard]] std::size_t vocab_size() const noexcept { return term_id_.size(); }
     [[nodiscard]] std::size_t doc_count()  const noexcept { return doc_vecs_.size(); }
 
+    // Persist the trained index (vocab, idf, expansion graph, doc vectors) to a
+    // versioned blob (magic "SPL1"); reopening never rebuilds. Mirrors the
+    // Bm25Index / HnswIndex serialization contract.
+    [[nodiscard]] std::string serialize() const;
+    [[nodiscard]] static Result<SpladeIndex> deserialize(std::string_view blob);
+
 private:
     SpladeConfig                                          cfg_{};
     text::Tokenizer                                       tok_;

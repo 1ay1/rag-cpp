@@ -107,6 +107,9 @@ void HnswIndex::add(std::uint32_t id, std::span<const float> vec) {
     if (dim_ == 0) dim_ = vec.size();
     if (vec.size() != dim_ || dim_ == 0) return; // dimension mismatch: ignore
 
+    // Re-adding a tombstoned id resurrects it (incremental upsert).
+    deleted_.erase(id);
+
     Node nd;
     nd.id  = id;
     nd.vec.assign(vec.begin(), vec.end());
@@ -160,6 +163,7 @@ std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k) 
     std::vector<Hit> hits;
     hits.reserve(cand.size());
     for (std::uint32_t node : cand) {
+        if (!deleted_.empty() && deleted_.count(nodes_[node].id)) continue;
         float s = dense::dot(nodes_[node].vec, q);
         hits.push_back(Hit{ChunkId{nodes_[node].id}, Score{s}});
     }
@@ -167,6 +171,21 @@ std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k) 
         [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
     if (hits.size() > k) hits.resize(k);
     return hits;
+}
+
+void HnswIndex::remove(std::uint32_t id) { deleted_.insert(id); }
+bool HnswIndex::is_deleted(std::uint32_t id) const noexcept { return deleted_.count(id) != 0; }
+
+void HnswIndex::compact() {
+    if (deleted_.empty()) return;
+    // Rebuild the graph from the surviving nodes' vectors (their ids preserved).
+    std::vector<std::pair<std::uint32_t, std::vector<float>>> survivors;
+    survivors.reserve(nodes_.size());
+    for (const auto& nd : nodes_)
+        if (!deleted_.count(nd.id)) survivors.emplace_back(nd.id, nd.vec);
+    HnswConfig cfg = cfg_;
+    *this = HnswIndex(cfg);
+    for (auto& [id, v] : survivors) add(id, v);
 }
 
 std::vector<Hit> HnswIndex::search_filtered(std::span<const float> query, std::size_t k,
@@ -198,6 +217,7 @@ std::vector<Hit> HnswIndex::search_filtered(std::span<const float> query, std::s
     for (std::uint32_t node : cand) {
         std::uint32_t id = nodes_[node].id;
         if (!allow(id)) continue;
+        if (!deleted_.empty() && deleted_.count(id)) continue;
         float s = dense::dot(nodes_[node].vec, q);
         hits.push_back(Hit{ChunkId{id}, Score{s}});
     }

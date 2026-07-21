@@ -90,8 +90,33 @@ Result<void> Corpus::build() {
 }
 
 std::vector<Hit> Corpus::lexical_search(std::string_view query, std::size_t k) const {
-    return bm25_.search(query, k);
+    if (deleted_docs_.empty()) return bm25_.search(query, k);
+    // Over-fetch, then drop tombstoned chunks and truncate to k.
+    auto hits = bm25_.search(query, k + deleted_docs_.size() * 2 + k);
+    std::vector<Hit> out;
+    out.reserve(std::min(hits.size(), k));
+    for (const auto& h : hits) {
+        const Chunk* ch = chunk(h.chunk);
+        if (ch && deleted_docs_.count(ch->doc.get())) continue;
+        out.push_back(h);
+        if (out.size() >= k) break;
+    }
+    return out;
 }
+
+Result<void> Corpus::remove_document(DocId id) {
+    if (id.get() >= docs_.size() || deleted_docs_.count(id.get()))
+        return fail<void>(Errc::not_found, "remove_document: unknown or already-deleted id");
+    deleted_docs_.insert(id.get());
+    // Tombstone the doc's chunks in the HNSW graph so dense search skips them.
+    if (hnsw_)
+        for (const auto& ch : chunks_)
+            if (ch.doc.get() == id.get()) hnsw_->remove(ch.id.get());
+    return {};
+}
+
+bool Corpus::is_deleted(DocId id) const noexcept { return deleted_docs_.count(id.get()) != 0; }
+std::size_t Corpus::live_document_count() const noexcept { return docs_.size() - deleted_docs_.size(); }
 
 Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_t k) const {
     return dense_search(query, k, MetaFilter{});
@@ -131,6 +156,7 @@ Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_
     hits.reserve(chunks_.size());
     for (const auto& ch : chunks_) {
         if (ch.embedding.empty()) continue;
+        if (!deleted_docs_.empty() && deleted_docs_.count(ch.doc.get())) continue;
         if (allow && !allow(ch.id.get())) continue;
         float s = dense::dot(ch.embedding, *qv);
         hits.push_back(Hit{ch.id, Score{s}});

@@ -431,6 +431,14 @@ TEST(splade_retrieves_and_expands) {
     auto raw = idx->encode("vector", false);
     auto exp = idx->encode("vector", true);
     CHECK(exp.size() >= raw.size());
+    // Persistence round-trips: reopened index returns the same top hit.
+    auto blob = idx->serialize();
+    auto idx2 = rag::sparse::SpladeIndex::deserialize(blob);
+    REQUIRE(idx2.has_value());
+    CHECK_EQ(idx2->vocab_size(), idx->vocab_size());
+    auto hits2 = idx2->search("vector nearest neighbours", 3);
+    REQUIRE(!hits2.empty());
+    CHECK(engine.corpus().resolve(hits2[0]).uri == "d1");
 }
 
 // ── ColBERT late interaction ─────────────────────────────────────────
@@ -594,6 +602,192 @@ TEST(local_embedder_reports_availability) {
         CHECK(!e.has_value());
         if (!e) CHECK(e.error().code == rag::Errc::unavailable);
     }
+}
+
+// ── MMR diversity rerank ──────────────────────────────────────────
+
+TEST(mmr_diversifies_results) {
+    rag::Engine engine;
+    // Three near-duplicate docs about cats + one about dogs.
+    engine.add("c1", "cats are wonderful feline pets that purr and love to nap");
+    engine.add("c2", "cats are lovely feline companions that purr and nap often");
+    engine.add("c3", "cats the feline pets purr and nap and love warmth greatly");
+    engine.add("dog", "dogs are loyal canine companions that bark and fetch balls");
+    engine.build();
+    auto hits = engine.corpus().lexical_search("cats feline pets purr", 4);
+    REQUIRE(!hits.empty());
+    // Pure relevance (lambda=1) keeps the near-dupes together.
+    rag::rerank::MmrConfig relev; relev.lambda = 1.0f; relev.k = 4;
+    auto pure = rag::rerank::mmr(engine.corpus(), hits, relev);
+    // Diversity (lambda=0.3) should pull the dog doc up relative to pure rel.
+    rag::rerank::MmrConfig div; div.lambda = 0.3f; div.k = 4;
+    auto diverse = rag::rerank::mmr(engine.corpus(), hits, div);
+    REQUIRE(diverse.size() == pure.size());
+    auto rank_of = [&](const std::vector<rag::Hit>& v, const char* uri) {
+        for (std::size_t i = 0; i < v.size(); ++i)
+            if (engine.corpus().resolve(v[i]).uri == uri) return (int)i;
+        return 99;
+    };
+    CHECK(rank_of(diverse, "dog") <= rank_of(pure, "dog"));
+}
+
+// ── Product Quantization ────────────────────────────────────────
+
+TEST(pq_compresses_and_ranks) {
+    // 8-dim unit vectors; PQ with m=4, so 4 bytes/vector (8x compression).
+    std::vector<rag::Vector> data;
+    for (int i = 0; i < 32; ++i) {
+        rag::Vector v(8, 0.0f);
+        v[i % 8] = 1.0f; v[(i + 1) % 8] = 0.5f;
+        rag::dense::normalize(v);
+        data.push_back(v);
+    }
+    rag::index::PqConfig cfg; cfg.m = 4; cfg.ksub = 16; cfg.iters = 20;
+    auto pq = rag::index::ProductQuantizer::train(data, cfg);
+    REQUIRE(pq.has_value());
+    CHECK(pq->compression_ratio() > 1.0f);
+    for (std::size_t i = 0; i < data.size(); ++i) pq->add((std::uint32_t)i, data[i]);
+    // Querying with a training vector should return its own id near the top.
+    auto hits = pq->search(data[3], 5);
+    REQUIRE(!hits.empty());
+    bool found = false;
+    for (auto& h : hits) if (h.chunk.get() == 3) found = true;
+    CHECK(found);
+    // Serialization round-trips.
+    auto blob = pq->serialize();
+    auto pq2 = rag::index::ProductQuantizer::deserialize(blob);
+    REQUIRE(pq2.has_value());
+    CHECK_EQ(pq2->code_count(), pq->code_count());
+}
+
+// ── Semantic + proposition chunking ────────────────────────────────
+
+TEST(semantic_chunk_lexical_splits_on_topic_shift) {
+    std::string body =
+        "Cats are feline pets. Cats purr when happy. Cats love to nap in the sun. "
+        "Quantum computers use qubits. Qubits exploit superposition. Quantum gates transform states.";
+    rag::text::SemanticChunkOptions opts; opts.breakpoint_percentile = 70.0f;
+    auto chunks = rag::text::semantic_chunk_lexical(rag::DocId{0}, body, opts);
+    // The topic shift (cats -> quantum) should produce at least 2 chunks.
+    CHECK(chunks.size() >= 2);
+}
+
+TEST(proposition_chunk_atomizes) {
+    std::string body = "The sky is blue. Grass is green. Water is wet.";
+    auto props = rag::text::proposition_chunk(rag::DocId{0}, body);
+    CHECK_EQ(props.size(), 3u);
+}
+
+// ── Contextual retrieval ──────────────────────────────────────
+
+TEST(contextualize_adds_situating_context) {
+    std::string doc =
+        "# Acme Q3 Earnings\n\nAcme Corporation reported strong results. "
+        "Revenue grew 3% year over year in the quarter.";
+    std::vector<rag::Chunk> chunks;
+    rag::Chunk ch; ch.doc = rag::DocId{0}; ch.text = "Revenue grew 3% year over year in the quarter.";
+    chunks.push_back(ch);
+    rag::text::contextualize(chunks, doc);
+    // The chunk's context should now mention Acme (the disambiguating title).
+    CHECK(chunks[0].context.find("Acme") != std::string::npos);
+}
+
+// ── Cascade ────────────────────────────────────────────────
+
+TEST(cascade_narrows_through_stages) {
+    rag::Engine engine;
+    for (int i = 0; i < 20; ++i)
+        engine.add("d" + std::to_string(i),
+            "vector search hnsw approximate nearest neighbours graph indexing document " + std::to_string(i));
+    engine.build();
+    rag::cascade::CascadeConfig cfg;
+    cfg.retrieve_k = 15; cfg.colbert_k = 8; cfg.final_k = 5;
+    cfg.use_rerank = false;   // no cross-encoder server in tests
+    rag::cascade::Cascade casc(cfg);
+    casc.with_colbert(rag::late::ColbertReranker(rag::late::hashed_token_embedder(64)));
+    std::vector<rag::cascade::StageTrace> trace;
+    auto hits = casc.run(engine.corpus(), "vector nearest neighbours", &trace);
+    REQUIRE(hits.has_value());
+    CHECK(hits->size() <= 5u);
+    CHECK(!hits->empty());
+    // The trace records the funnel narrowing.
+    CHECK(trace.size() >= 2u);
+}
+
+// ── Caches ────────────────────────────────────────────────
+
+TEST(lru_cache_evicts_and_hits) {
+    rag::cache::EmbeddingCache ec(2);
+    ec.put("m", "a", {1.0f});
+    ec.put("m", "b", {2.0f});
+    CHECK(ec.get("m", "a").has_value());   // hit, touches a (MRU)
+    ec.put("m", "c", {3.0f});              // evicts b (LRU)
+    CHECK(!ec.get("m", "b").has_value());   // b was evicted
+    CHECK(ec.get("m", "a").has_value());   // a survived
+    // Identity guards against stale cross-model hits.
+    CHECK(!ec.get("other-model", "a").has_value());
+}
+
+// ── Incremental delete ────────────────────────────────────────
+
+TEST(corpus_remove_document_tombstones) {
+    rag::Engine engine;
+    auto d1 = engine.add("keep", "vector search with hnsw graphs and indexing");
+    auto d2 = engine.add("drop", "vector search with hnsw graphs and indexing too");
+    engine.build();
+    REQUIRE(d2.has_value());
+    CHECK_EQ(engine.corpus().live_document_count(), 2u);
+    auto rm = engine.corpus().remove_document(*d2);
+    REQUIRE(rm.has_value());
+    CHECK(engine.corpus().is_deleted(*d2));
+    CHECK_EQ(engine.corpus().live_document_count(), 1u);
+    // The dropped doc must not appear in results.
+    auto hits = engine.corpus().lexical_search("vector search hnsw", 10);
+    for (auto& h : hits) CHECK(engine.corpus().resolve(h).uri != "drop");
+    // Removing again fails cleanly.
+    CHECK(!engine.corpus().remove_document(*d2).has_value());
+}
+
+TEST(hnsw_tombstone_excludes_from_search) {
+    rag::index::HnswConfig cfg;
+    rag::index::HnswIndex idx(cfg);
+    for (std::uint32_t i = 0; i < 10; ++i) {
+        rag::Vector v(8, 0.0f); v[i % 8] = 1.0f; rag::dense::normalize(v);
+        idx.add(i, v);
+    }
+    rag::Vector q(8, 0.0f); q[0] = 1.0f; rag::dense::normalize(q);
+    idx.remove(0);
+    CHECK(idx.is_deleted(0));
+    auto hits = idx.search(q, 10);
+    for (auto& h : hits) CHECK(h.chunk.get() != 0u);
+    idx.compact();
+    CHECK_EQ(idx.deleted_count(), 0u);
+}
+
+// ── ONNX integration (only when built with RAGCPP_WITH_ONNX + a model path) ──
+// Set RAGCPP_TEST_ONNX_MODEL and RAGCPP_TEST_ONNX_TOKENIZER env vars to a real
+// sentence-transformer ONNX export to exercise the real in-process path and
+// measure a dense retrieval lift. Skipped (as a pass) when unavailable.
+TEST(onnx_embedder_real_model_if_available) {
+    if (!rag::dense::OnnxEmbedder::available()) { CHECK(true); return; }
+    const char* model = std::getenv("RAGCPP_TEST_ONNX_MODEL");
+    const char* toks  = std::getenv("RAGCPP_TEST_ONNX_TOKENIZER");
+    if (!model || !toks) { CHECK(true); return; }
+    rag::dense::LocalEmbedderConfig cfg;
+    cfg.model_path = model; cfg.tokenizer_path = toks;
+    auto emb = rag::dense::OnnxEmbedder::load(cfg);
+    REQUIRE(emb.has_value());
+    CHECK(emb->dimension() > 0);
+    rag::Engine engine;
+    engine.with_embedder(rag::dense::AnyEmbedder{std::move(*emb)});
+    engine.add("d1", "The Eiffel Tower is a wrought-iron lattice tower in Paris, France.");
+    engine.add("d2", "Photosynthesis converts light energy into chemical energy in plants.");
+    engine.build();
+    // A semantic query with no lexical overlap should still find d1.
+    auto hits = engine.search("famous landmark in the French capital", 1);
+    REQUIRE(hits.has_value());
+    REQUIRE(!hits->empty());
+    CHECK((*hits)[0].uri == "d1");
 }
 
 int main() {

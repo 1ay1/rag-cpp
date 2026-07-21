@@ -122,6 +122,53 @@ Loads the standard BEIR format (corpus/queries jsonl + qrels tsv) and computes
 **nDCG@k, Recall@k, Precision@k, MAP, MRR** — the measurement that turns "SOTA"
 from a claim into a number you can diff.
 
+### rerank/mmr — diversity
+**Maximal Marginal Relevance** (Carbonell & Goldstein 1998): greedily trade
+relevance against novelty (`λ·rel − (1−λ)·max-sim-to-chosen`) so the top-k stop
+being k paraphrases of the same passage. Cosine or lexical similarity; a pipeline
+stage too.
+
+### index/pq — Product Quantization
+Compress embeddings 4–64×: split each vector into `m` sub-vectors, k-means each
+subspace to 256 centroids, store one byte per sub-vector. Scoring is **ADC**
+(Asymmetric Distance Computation): a per-subspace query·centroid lookup table,
+then `m` table lookups per vector — no decompression. Serializable.
+
+### cascade — telescoping retrieval
+The production funnel as one call: hybrid retrieve (top-N₀) → ColBERT late
+interaction (top-N₁) → cross-encoder rerank (top-N₂) → top-k, each stage with a
+candidate BUDGET so the expensive stages never blow up. Stages are optional and
+degrade gracefully (an unavailable stage is skipped).
+
+### cache — embedding + query memoization
+Bounded thread-safe LRU caches. **EmbeddingCache** keys on `(embedder identity,
+text)` so a model swap never returns a stale vector; **QueryCache** memoizes
+`(query, k)` → hits (clear on corpus mutation). Both are the cheapest latency win
+in a RAG loop.
+
+### text/semantic_chunker — meaning-aware splitting
+**Semantic chunking**: embed sentences and break where consecutive-sentence
+similarity drops below a percentile — chunks are topically coherent runs.
+**Proposition chunking** (dense-x): atomic self-contained statements. Lexical
+fallback with no embedder.
+
+### text/contextual — Contextual Retrieval (Anthropic 2024)
+Prepend to each chunk a short blurb SITUATING it in its document before indexing,
+so both BM25 and dense representations carry the disambiguating context.
+LLM-generated via a seam, or a deterministic extractive default (title + best-
+overlap sentence).
+
+### Incremental delete
+HNSW gains **tombstone soft-delete** (`remove`/`is_deleted`/`compact`): deleted
+nodes stay in the graph for connectivity but never surface in results; re-adding
+an id resurrects it; `compact()` rebuilds without tombstones. `Corpus::
+remove_document` tombstones a doc's chunks across BM25 + HNSW with stable ids
+(so the chunk meta-pointer invariant holds).
+
+### cli — the `ragcpp` tool
+A turnkey binary: `ragcpp index <dir> <out.ragdb>`, `query <db> "..."`,
+`eval <beir-dir>`, `info <db>` — build and search a corpus with no C++.
+
 ### rerank — the accuracy ceiling
 Cross-encoder reranking over HTTP (TEI `/rerank` and Cohere/Jina `/v1/rerank`
 wire formats) and a local `ScoreFnReranker` for in-process models. Adapts into a

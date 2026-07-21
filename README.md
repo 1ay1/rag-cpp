@@ -78,6 +78,17 @@ A **BEIR-format harness** (corpus/queries jsonl + qrels tsv) computing
 **nDCG@k, Recall@k, Precision@k, MAP, MRR** — so SOTA is a measured number, not
 a claim. See [`examples/beir_eval.cpp`](examples/beir_eval.cpp).
 
+### Production
+- **Product Quantization** — 4–64× embedding compression with ADC scoring.
+- **MMR** diversity reranking — stop returning k paraphrases of one passage.
+- **Retrieval cascade** — hybrid → ColBERT → cross-encoder with per-stage budgets.
+- **Semantic + proposition chunking** and **Contextual Retrieval** (Anthropic
+  2024) situating context.
+- **Incremental delete** — HNSW tombstones + `Corpus::remove_document` with
+  stable ids and `compact()`.
+- **Embedding + query LRU caches** (thread-safe, identity-keyed).
+- **`ragcpp` CLI** — `index` / `query` / `eval` / `info` with no C++.
+
 ### RALM assemblies (retrieval-augmented language modeling)
 Generator-agnostic retrieval frontends for four landmark recipes (the LM call is
 your seam):
@@ -131,6 +142,17 @@ ctest --test-dir build                     # C++ + C-API suites
 
 For the shared library (Python/Rust FFI): `-DBUILD_SHARED_LIBS=ON`. The only
 dependency (nlohmann/json) is fetched via `FetchContent`.
+
+## CLI
+
+The `ragcpp` binary builds and searches a corpus with no code:
+
+```sh
+ragcpp index ./docs corpus.ragdb      # walk a directory, chunk, index, save
+ragcpp info  corpus.ragdb             # document/chunk counts
+ragcpp query corpus.ragdb "my question" -k 5 --mmr
+ragcpp eval  ./nfcorpus --split=test  # BEIR metrics
+```
 
 ## Performance (5000 chunks, Apple M-series, NEON)
 

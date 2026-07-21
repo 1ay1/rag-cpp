@@ -13,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "rag/core/document.hpp"
@@ -68,6 +69,14 @@ public:
     // over threshold). Idempotent; safe to call after a batch of add_document.
     Result<void> build();
 
+    // Soft-delete a document: tombstone its chunks so they never appear in
+    // lexical/dense results. Chunk/doc ids stay stable (no renumbering, so the
+    // meta-pointer invariant holds). Returns not_found if the id is unknown or
+    // already deleted. Call compact() to physically reclaim space.
+    Result<void> remove_document(DocId id);
+    [[nodiscard]] bool is_deleted(DocId id) const noexcept;
+    [[nodiscard]] std::size_t live_document_count() const noexcept;
+
     // ── Retrieval primitives ────────────────────────────────────────────────
     [[nodiscard]] std::vector<Hit> lexical_search(std::string_view query, std::size_t k) const;
     [[nodiscard]] Result<std::vector<Hit>> dense_search(std::string_view query, std::size_t k) const;
@@ -103,6 +112,7 @@ private:
     lexical::Bm25Index                bm25_{cfg_.bm25, cfg_.tokenize};
     std::optional<HnswIndex>          hnsw_;
     bool                              dirty_ = false;
+    std::unordered_set<std::uint32_t> deleted_docs_;   // tombstoned DocId values
 
     [[nodiscard]] Result<void> embed_pending();
 
