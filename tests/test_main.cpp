@@ -790,6 +790,75 @@ TEST(onnx_embedder_real_model_if_available) {
     CHECK((*hits)[0].uri == "d1");
 }
 
+// ── Plugin registry ──────────────────────────────────────────────────────────
+
+TEST(plugin_builtins_registered) {
+    rag::plugin::ensure_builtins_registered();
+    auto& reg = rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance();
+    CHECK(reg.contains("hash"));
+    CHECK(reg.contains("ollama"));
+    CHECK(reg.contains("openai"));
+    CHECK(reg.contains("llamacpp"));
+    CHECK(reg.size() >= 4);
+}
+
+TEST(plugin_create_embedder_by_name) {
+    auto emb = rag::plugin::make_embedder(nlohmann::json{{"type", "hash"}, {"dim", 128}});
+    REQUIRE(emb.has_value());
+    CHECK_EQ(emb->dimension(), 128u);
+    std::vector<std::string> texts{"hello world"};
+    auto v = emb->embed(texts);
+    REQUIRE(v.has_value());
+    CHECK_EQ((*v).size(), 1u);
+    CHECK_EQ((*v)[0].size(), 128u);
+}
+
+TEST(plugin_create_from_bare_string) {
+    auto emb = rag::plugin::make_embedder(nlohmann::json("hash"));
+    REQUIRE(emb.has_value());
+    CHECK(emb->dimension() > 0);
+}
+
+TEST(plugin_unknown_name_is_error) {
+    auto emb = rag::plugin::make_embedder(nlohmann::json{{"type", "no_such_backend"}});
+    CHECK(!emb.has_value());
+    CHECK_EQ(emb.error().code, rag::Errc::not_found);
+}
+
+TEST(plugin_missing_type_is_error) {
+    auto emb = rag::plugin::make_embedder(nlohmann::json{{"dim", 64}});
+    CHECK(!emb.has_value());
+    CHECK_EQ(emb.error().code, rag::Errc::invalid_argument);
+}
+
+TEST(plugin_custom_registration_roundtrip) {
+    // Simulate a third-party plugin registering a factory at runtime.
+    rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().register_factory(
+        "unit_test_custom", [](const nlohmann::json& c) -> rag::Result<rag::plugin::AnyEmbedder> {
+            auto dim = c.value("dim", 32);
+            return rag::plugin::AnyEmbedder{rag::dense::HashEmbedder{static_cast<std::size_t>(dim)}};
+        });
+    auto emb = rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().create_from(
+        nlohmann::json{{"type", "unit_test_custom"}, {"dim", 77}});
+    REQUIRE(emb.has_value());
+    CHECK_EQ(emb->dimension(), 77u);
+}
+
+TEST(plugin_reranker_registered) {
+    rag::plugin::ensure_builtins_registered();
+    CHECK(rag::plugin::Registry<rag::plugin::AnyReranker>::instance().contains("cross_encoder"));
+}
+
+TEST(plugin_load_missing_lib_is_error) {
+    auto r = rag::plugin::load_plugin("/no/such/plugin.so");
+    CHECK(!r.has_value());
+}
+
+TEST(plugin_load_dir_missing_is_empty) {
+    auto v = rag::plugin::load_plugin_dir("/no/such/dir/at/all");
+    CHECK(v.empty());
+}
+
 int main() {
     std::printf("Running %zu test cases...\n", registry().size());
     for (auto& c : registry()) {

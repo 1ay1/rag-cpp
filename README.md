@@ -166,6 +166,8 @@ dense (HNSW):  ~0.14 ms/query
 ## Documentation
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layers, seams, invariants.
+- [`PLUGINS.md`](PLUGINS.md) — the three extension axes: concepts, `AnyX`, and the
+  load-time plugin registry (register backends by name / from a shared library).
 - [`FORMAT.md`](FORMAT.md) — the `.ragdb` on-disk contract.
 
 ## References

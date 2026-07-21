@@ -12,3 +12,13 @@ target_link_libraries(ragcpp_advanced PRIVATE ragcpp)
 
 add_executable(ragcpp_beir_eval beir_eval.cpp)
 target_link_libraries(ragcpp_beir_eval PRIVATE ragcpp)
+
+# ── Out-of-tree plugin demo ──────────────────────────────────────────────────
+# A shared-library backend that self-registers on dlopen, and a host that loads
+# it and builds its embedder purely by name.
+add_library(reverse_hash_plugin SHARED plugin_backend/my_embedder_plugin.cpp)
+target_link_libraries(reverse_hash_plugin PRIVATE ragcpp)
+set_target_properties(reverse_hash_plugin PROPERTIES PREFIX "lib")
+
+add_executable(ragcpp_plugin_host plugin_backend/host_demo.cpp)
+target_link_libraries(ragcpp_plugin_host PRIVATE ragcpp)

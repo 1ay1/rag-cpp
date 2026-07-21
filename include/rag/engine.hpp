@@ -16,6 +16,7 @@
 #include "rag/graph/graph.hpp"
 #include "rag/index/corpus.hpp"
 #include "rag/pipeline/pipeline.hpp"
+#include "rag/plugin/plugin.hpp"
 #include "rag/ralm/ralm.hpp"
 
 namespace rag {
@@ -29,6 +30,18 @@ public:
     // Attach a dense embedder (enables hybrid). Fluent.
     Engine& with_embedder(dense::AnyEmbedder e) { corpus_.set_embedder(std::move(e)); return *this; }
     Engine& with_pipeline(pipeline::Pipeline p) { pipeline_ = std::move(p); return *this; }
+
+    // Config-driven embedder attach: build a registered embedder by name from a
+    // JSON spec (bare name string, or object with a "type" field). Enables the
+    // whole framework to be wired from a config file with zero backend knowledge
+    // at the call site, and picks up any plugin loaded via load_plugin_dir().
+    //   engine.with_embedder_spec({{"type","ollama"},{"model","nomic-embed-text"}});
+    Result<void> with_embedder_spec(const plugin::Json& spec) {
+        auto e = plugin::make_embedder(spec);
+        if (!e) return std::unexpected(e.error());
+        corpus_.set_embedder(std::move(*e));
+        return {};
+    }
 
     Result<DocId> add(std::string uri, std::string text, Metadata meta = {}, std::string title = {}) {
         return corpus_.add_document(std::move(uri), std::move(text), std::move(meta), std::move(title));

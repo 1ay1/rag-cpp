@@ -30,6 +30,7 @@
 #include "rag/loaders/loaders.hpp"
 #include "rag/loaders/code_chunker.hpp"
 #include "rag/pipeline/pipeline.hpp"
+#include "rag/plugin/plugin.hpp"
 #include "rag/query/hyde.hpp"
 #include "rag/ralm/ralm.hpp"
 #include "rag/raptor/raptor.hpp"
