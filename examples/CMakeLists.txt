@@ -22,3 +22,7 @@ set_target_properties(reverse_hash_plugin PROPERTIES PREFIX "lib")
 
 add_executable(ragcpp_plugin_host plugin_backend/host_demo.cpp)
 target_link_libraries(ragcpp_plugin_host PRIVATE ragcpp)
+
+# ── Polyglot (Python / any-language) backend demo ─────────────────────────
+add_executable(ragcpp_python_backend polyglot/python_backend.cpp)
+target_link_libraries(ragcpp_python_backend PRIVATE ragcpp)

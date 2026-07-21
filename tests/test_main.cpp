@@ -859,6 +859,100 @@ TEST(plugin_load_dir_missing_is_empty) {
     CHECK(v.empty());
 }
 
+// ── Polyglot bridge ────────────────────────────────────────────────────
+
+// A deterministic in-memory Channel: answers embed/rerank/retrieve locally so
+// the Remote* wrappers can be tested without spawning anything.
+struct FakeChannel final : rag::bridge::Channel {
+    rag::Result<nlohmann::json> call(std::string_view method, const nlohmann::json& params) override {
+        nlohmann::json res;
+        if (method == "embed") {
+            res["vectors"] = nlohmann::json::array();
+            for (const auto& t : params["texts"]) {
+                nlohmann::json v = nlohmann::json::array();
+                for (int i = 0; i < 4; ++i) v.push_back(float((t.get<std::string>().size() + i) % 7));
+                res["vectors"].push_back(v);
+            }
+        } else if (method == "rerank") {
+            res["scores"] = nlohmann::json::array();
+            for (const auto& p : params["passages"]) res["scores"].push_back(float(p.get<std::string>().size()));
+        } else if (method == "retrieve") {
+            res["hits"] = nlohmann::json::array();
+            res["hits"].push_back({{"id", "x1"}, {"score", 0.9}, {"text", "hello"}});
+            res["hits"].push_back({{"id", 42}, {"score", 0.5}});
+        } else if (method == "graph") {
+            res["op"] = params.value("op", "");
+        } else {
+            return rag::fail<nlohmann::json>(rag::Errc::not_found, "no method");
+        }
+        return res;
+    }
+    std::string identity() const override { return "fake"; }
+};
+
+TEST(bridge_remote_embedder) {
+    auto ch = std::make_shared<FakeChannel>();
+    rag::bridge::RemoteEmbedder emb{ch, 4, "fake-embed"};
+    CHECK_EQ(emb.dimension(), 4u);
+    std::vector<std::string> texts{"ab", "abcd"};
+    auto v = emb.embed(texts);
+    REQUIRE(v.has_value());
+    CHECK_EQ(v->size(), 2u);
+    CHECK_EQ((*v)[0].size(), 4u);
+}
+
+TEST(bridge_remote_reranker) {
+    auto ch = std::make_shared<FakeChannel>();
+    rag::bridge::RemoteReranker rr{ch, "fake-rerank"};
+    std::vector<std::string> ps{"short", "a longer passage"};
+    auto s = rr.rerank("q", ps);
+    REQUIRE(s.has_value());
+    CHECK_EQ(s->size(), 2u);
+    CHECK((*s)[1] > (*s)[0]);
+}
+
+TEST(bridge_remote_retriever) {
+    auto ch = std::make_shared<FakeChannel>();
+    rag::bridge::RemoteRetriever retr{ch, "fake-retr"};
+    auto r = retr.retrieve("q", 5);
+    REQUIRE(r.has_value());
+    CHECK_EQ(r->size(), 2u);
+    CHECK((*r)[0].uri == "x1");
+    CHECK((*r)[1].uri == "42");   // numeric id stringified
+    auto g = retr.op("global");
+    REQUIRE(g.has_value());
+    CHECK((*g)["op"] == "global");
+}
+
+TEST(bridge_registered_in_registry) {
+    rag::plugin::ensure_builtins_registered();
+    CHECK(rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().contains("process"));
+    CHECK(rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().contains("http"));
+    CHECK(rag::plugin::Registry<rag::plugin::AnyReranker>::instance().contains("process"));
+}
+
+TEST(bridge_open_channel_unknown_transport) {
+    auto ch = rag::bridge::open_channel(nlohmann::json{{"transport", "carrier_pigeon"}});
+    CHECK(!ch.has_value());
+    CHECK_EQ(ch.error().code, rag::Errc::not_found);
+}
+
+TEST(bridge_process_roundtrip_with_cat) {
+    // Spawn a trivial line-echo peer that speaks the protocol using only /bin sh.
+    // It reads a request line and emits a valid reply, exercising the real pipe.
+    rag::bridge::ProcessConfig cfg;
+    cfg.argv = {"/bin/sh", "-c",
+                "while IFS= read -r line; do printf '{\"ok\":true,\"result\":{\"scores\":[1.0]}}\\n'; done"};
+    auto ch = rag::bridge::ProcessChannel::spawn(cfg);
+    REQUIRE(ch.has_value());
+    rag::bridge::RemoteReranker rr{*ch, "sh-echo"};
+    std::vector<std::string> ps{"only one"};
+    auto s = rr.rerank("q", ps);
+    REQUIRE(s.has_value());
+    CHECK_EQ(s->size(), 1u);
+    CHECK(std::abs((*s)[0] - 1.0f) < 1e-6f);
+}
+
 int main() {
     std::printf("Running %zu test cases...\n", registry().size());
     for (auto& c : registry()) {

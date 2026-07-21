@@ -15,6 +15,7 @@
 
 #include "rag/plugin/registry.hpp"
 
+#include "rag/bridge/bridge.hpp"
 #include "rag/dense/backends.hpp"
 #include "rag/dense/embedder.hpp"
 #include "rag/rerank/reranker.hpp"
@@ -106,6 +107,10 @@ RAG_REGISTER(AnyReranker, "cross_encoder", [](const json& c) -> Result<AnyRerank
 // Force the TU to be retained when the library is linked statically into an
 // executable. Call this once (e.g. from engine setup or main) to guarantee the
 // static registrars above are not stripped by the linker as "unused".
-void ensure_builtins_registered() noexcept { /* presence pulls in this TU */ }
+void ensure_builtins_registered() noexcept {
+    // Also register the polyglot bridge transports (process/http) so config like
+    // {"type":"process", ...} resolves out of the box.
+    ::rag::bridge::ensure_bridge_registered();
+}
 
 } // namespace rag::plugin

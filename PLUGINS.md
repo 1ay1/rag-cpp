@@ -84,6 +84,65 @@ Build your plugin with the **same compiler and rag headers** as the host so both
 see the same registry singletons. See `examples/plugin_backend/` for a complete,
 buildable example.
 
+## Polyglot backends — engines/retrievers/graphs in ANY language
+
+A backend does not have to be C++, and does not even have to live in your
+process. The `rag/bridge/` module lets a component written in **Python, Node,
+Rust, Go — anything** — plug in over a subprocess pipe or an HTTP endpoint. It
+models the same concepts as a native backend, so a remote Python engine drops
+into the Corpus / Pipeline / Engine with no special casing.
+
+### The wire protocol (tiny on purpose)
+
+One compact JSON object per request, one per reply:
+
+```
+--> {"method":"embed",   "params":{"texts":["..."]}}
+<-- {"ok":true,"result":{"vectors":[[...],[...]]}}
+
+--> {"method":"retrieve","params":{"query":"...","k":5}}
+<-- {"ok":true,"result":{"hits":[{"id":"d1","score":0.9,"text":"..."}]}}
+```
+
+Methods: `embed`, `rerank`, `retrieve`, `graph` (an escape hatch for GraphRAG
+local/global ops). Errors come back as `{"error":{"message":"..."}}`.
+
+### Two transports
+
+- **subprocess** (`rag::bridge::ProcessChannel`): the host spawns your program
+  (`python3 my_server.py`) and speaks newline-delimited JSON over stdin/stdout.
+  Zero dependencies; the universal bridge.
+- **HTTP/REST** (`rag::bridge::HttpChannel`): POST the same envelope to
+  `<base>/<method>` using the library's injectable `HttpTransport`.
+
+### From config (registered as `process` / `http`)
+
+```cpp
+engine.with_embedder_spec({
+    {"type", "process"},                       // or "http"
+    {"argv", {"python3", "ragcpp_server.py"}},  // or {host,port,base_path,...}
+    {"dim", 384},
+});
+```
+
+### As a self-contained remote engine
+
+When the far side owns its OWN index (a Python FAISS store, Elasticsearch, a
+graph engine), use `RemoteRetriever` — it answers full queries and exposes
+`op("local"/"global", ...)` for graph operations:
+
+```cpp
+auto ch = rag::bridge::open_channel({{"transport","process"},
+                                     {"argv",{"python3","ragcpp_server.py"}}});
+rag::bridge::RemoteRetriever engine{*ch, "python:engine"};
+auto hits = engine.retrieve("great wall", 5);
+auto summary = engine.op("global");
+```
+
+A complete, runnable reference server is in `examples/polyglot/ragcpp_server.py`
+(pure stdlib — swap the toy bodies for sentence-transformers / FAISS / networkx /
+an LLM), driven by `examples/polyglot/python_backend.cpp`.
+
 ## Why one registry serves everything
 
 `Registry<Interface>` is a single template keyed on the interface type. The same

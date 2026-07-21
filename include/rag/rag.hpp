@@ -11,6 +11,7 @@
 #include "rag/core/concepts.hpp"
 #include "rag/core/document.hpp"
 #include "rag/core/types.hpp"
+#include "rag/bridge/bridge.hpp"
 #include "rag/cache/cache.hpp"
 #include "rag/cascade/cascade.hpp"
 #include "rag/crag/crag.hpp"
