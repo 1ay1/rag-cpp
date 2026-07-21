@@ -1,0 +1,78 @@
+#pragma once
+// rag/lexical/bm25.hpp — Okapi BM25 over an inverted index.
+//
+// The lexical half of hybrid retrieval: exact-term/proper-noun matching that
+// dense embeddings miss. Pure C++/STL, deterministic, no dependencies.
+//
+//   score(q, d) = Σ_{t∈q} idf(t) · f(t,d)·(k1+1) / (f(t,d) + k1·(1-b + b·|d|/avgdl))
+//
+// with idf(t) = ln(1 + (N - n_t + 0.5)/(n_t + 0.5))  (BM25+ smoothed idf,
+// always positive so common terms never contribute negatively).
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "rag/core/types.hpp"
+#include "rag/text/tokenizer.hpp"
+
+namespace rag::lexical {
+
+struct Bm25Params {
+    float k1 = 1.2f;
+    float b  = 0.75f;
+};
+
+// One posting: which document, and the term frequency there.
+struct Posting {
+    std::uint32_t doc;   // dense internal doc ordinal (== ChunkId in the corpus)
+    std::uint32_t tf;
+};
+
+class Bm25Index {
+public:
+    Bm25Index() = default;
+    explicit Bm25Index(Bm25Params p, text::TokenizeOptions topts = {})
+        : params_(p), tok_(topts) {}
+
+    // Add a document identified by ordinal `id` (must be unique, monotonically
+    // assigned by the caller). Returns the number of indexed terms.
+    std::size_t add(std::uint32_t id, std::string_view text);
+
+    // Finalize idf/avgdl after all adds. Call once before querying; cheap to
+    // recall after incremental adds.
+    void finalize();
+
+    // Top-k by BM25. Returns hits sorted by descending score.
+    [[nodiscard]] std::vector<Hit> search(std::string_view query, std::size_t k) const;
+
+    // Score a single already-tokenized query against one doc (used by fusion
+    // to rescore a candidate set consistently).
+    [[nodiscard]] float score_doc(const std::vector<std::string>& q_terms,
+                                  std::uint32_t doc_id) const;
+
+    [[nodiscard]] std::size_t size()      const noexcept { return doc_len_.size(); }
+    [[nodiscard]] std::size_t vocab_size() const noexcept { return postings_.size(); }
+    [[nodiscard]] const text::Tokenizer& tokenizer() const noexcept { return tok_; }
+
+    // Serialization to/from a binary blob (little-endian, versioned).
+    [[nodiscard]] std::string serialize() const;
+    [[nodiscard]] static Result<Bm25Index> deserialize(std::string_view blob);
+
+private:
+    Bm25Params params_{};
+    text::Tokenizer tok_{};
+
+    // term -> postings list (sorted by doc id).
+    std::unordered_map<std::string, std::vector<Posting>> postings_;
+    // doc ordinal -> token count.
+    std::unordered_map<std::uint32_t, std::uint32_t> doc_len_;
+    double  total_len_ = 0.0;
+    float   avgdl_     = 0.0f;
+    bool    finalized_ = false;
+
+    [[nodiscard]] float idf(std::size_t n_t) const;
+};
+
+} // namespace rag::lexical

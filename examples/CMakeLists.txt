@@ -1,0 +1,2 @@
+add_executable(ragcpp_quickstart quickstart.cpp)
+target_link_libraries(ragcpp_quickstart PRIVATE ragcpp)
