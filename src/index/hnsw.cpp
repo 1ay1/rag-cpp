@@ -169,6 +169,44 @@ std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k) 
     return hits;
 }
 
+std::vector<Hit> HnswIndex::search_filtered(std::span<const float> query, std::size_t k,
+                                            const AllowFn& allow, float ef_boost) const {
+    if (!allow) return search(query, k);
+    if (nodes_.empty() || dim_ == 0) return {};
+    std::vector<float> q(query.begin(), query.end());
+    if (q.size() != dim_) q.resize(dim_, 0.0f);
+    dense::normalize(q);
+    std::vector<std::uint64_t> qb;
+    if (cfg_.binary) qb = dense::pack_signs(q);
+
+    // Descend the upper layers greedily (unfiltered — pure navigation).
+    std::uint32_t cur = entry_;
+    for (int lc = max_layer_; lc > 0; --lc) {
+        auto r = search_layer(q, qb, cur, lc, 1);
+        if (!r.empty()) cur = r.front();
+    }
+    // Widen the base-layer beam so a selective filter still yields k results.
+    std::size_t ef = static_cast<std::size_t>(
+        std::max<float>(static_cast<float>(std::max(cfg_.ef_search, k)) * std::max(1.0f, ef_boost),
+                        static_cast<float>(k)));
+    ef = std::min(ef, nodes_.size());
+    auto cand = search_layer(q, qb, cur, 0, ef);
+
+    // Rescore on the full vector, keeping only ALLOWED candidates.
+    std::vector<Hit> hits;
+    hits.reserve(cand.size());
+    for (std::uint32_t node : cand) {
+        std::uint32_t id = nodes_[node].id;
+        if (!allow(id)) continue;
+        float s = dense::dot(nodes_[node].vec, q);
+        hits.push_back(Hit{ChunkId{id}, Score{s}});
+    }
+    std::sort(hits.begin(), hits.end(),
+        [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
+    if (hits.size() > k) hits.resize(k);
+    return hits;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Serialization
 // ─────────────────────────────────────────────────────────────────────────────

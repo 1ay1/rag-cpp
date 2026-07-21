@@ -1,2 +1,5 @@
 add_executable(ragcpp_quickstart quickstart.cpp)
 target_link_libraries(ragcpp_quickstart PRIVATE ragcpp)
+
+add_executable(ragcpp_full_pipeline full_pipeline.cpp)
+target_link_libraries(ragcpp_full_pipeline PRIVATE ragcpp)

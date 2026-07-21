@@ -17,6 +17,7 @@
 //     re-opening a corpus does not rebuild the graph.
 
 #include <cstdint>
+#include <functional>
 #include <random>
 #include <span>
 #include <string>
@@ -48,6 +49,18 @@ public:
 
     // k-NN search: returns (id, cosine-similarity) pairs, descending.
     [[nodiscard]] std::vector<Hit> search(std::span<const float> query, std::size_t k) const;
+
+    // Filtered k-NN (FILTERED-HNSW / pre-filter): `allow(id)` decides whether a
+    // chunk id may appear in the result. The predicate is evaluated DURING the
+    // graph walk — disallowed nodes are still traversed (to preserve graph
+    // connectivity, ACORN-style) but never enter the result set. This beats
+    // post-filtering, which can return k=0 when the top-k are all filtered out.
+    // `ef_boost` widens the beam (× multiplier) to compensate for selective
+    // filters; pass a larger value when `allow` accepts a small fraction.
+    using AllowFn = std::function<bool(std::uint32_t id)>;
+    [[nodiscard]] std::vector<Hit>
+    search_filtered(std::span<const float> query, std::size_t k,
+                    const AllowFn& allow, float ef_boost = 4.0f) const;
 
     [[nodiscard]] std::size_t size()      const noexcept { return nodes_.size(); }
     [[nodiscard]] std::size_t dimension() const noexcept { return dim_; }

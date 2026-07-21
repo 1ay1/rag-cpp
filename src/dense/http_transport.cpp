@@ -41,15 +41,17 @@ void close_sock(socket_t s) { ::close(s); }
 
 class DefaultTransport final : public HttpTransport {
 public:
-    Result<HttpResponse> post_json(std::string_view host, std::uint16_t port,
-                                   std::string_view path, std::string_view body,
-                                   std::chrono::milliseconds timeout) const override {
+    Result<HttpResponse> post(const HttpRequest& req) const override {
+        if (req.tls)
+            return fail<HttpResponse>(Errc::unavailable,
+                "default transport is plaintext; inject a TLS transport for https");
+
         // Resolve.
         addrinfo hints{};
         hints.ai_family   = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
-        std::string host_s(host);
-        std::string port_s = std::to_string(port);
+        std::string host_s(req.host);
+        std::string port_s = std::to_string(req.port);
         addrinfo* res = nullptr;
         if (::getaddrinfo(host_s.c_str(), port_s.c_str(), &hints, &res) != 0 || !res)
             return fail<HttpResponse>(Errc::unavailable, "getaddrinfo failed");
@@ -58,7 +60,7 @@ public:
         for (addrinfo* ai = res; ai; ai = ai->ai_next) {
             fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
             if (fd == kInvalid) continue;
-            set_timeout(fd, timeout);
+            set_timeout(fd, req.timeout);
             if (::connect(fd, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) break;
             close_sock(fd); fd = kInvalid;
         }
@@ -66,16 +68,17 @@ public:
         if (fd == kInvalid) return fail<HttpResponse>(Errc::unavailable, "connect failed");
 
         // Build request.
-        std::string req;
-        req.reserve(body.size() + 256);
-        req += "POST "; req += path; req += " HTTP/1.1\r\n";
-        req += "Host: "; req += host; req += "\r\n";
-        req += "Content-Type: application/json\r\n";
-        req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-        req += "Connection: close\r\n\r\n";
-        req += body;
+        std::string r;
+        r.reserve(req.body.size() + 256);
+        r += "POST "; r += req.path; r += " HTTP/1.1\r\n";
+        r += "Host: "; r += req.host; r += "\r\n";
+        r += "Content-Type: application/json\r\n";
+        for (const auto& [k, v] : req.headers) { r += k; r += ": "; r += v; r += "\r\n"; }
+        r += "Content-Length: " + std::to_string(req.body.size()) + "\r\n";
+        r += "Connection: close\r\n\r\n";
+        r += req.body;
 
-        if (!send_all(fd, req)) { close_sock(fd); return fail<HttpResponse>(Errc::transport_error, "send"); }
+        if (!send_all(fd, r)) { close_sock(fd); return fail<HttpResponse>(Errc::transport_error, "send"); }
 
         // Read full response.
         std::string raw;

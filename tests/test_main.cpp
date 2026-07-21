@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <string>
 #include <vector>
@@ -174,6 +175,114 @@ TEST(engine_metadata_filter) {
     });
     REQUIRE(res.has_value());
     for (auto& r : *res) CHECK_EQ(r.uri, std::string("d2"));
+}
+
+// ─── Filtered-HNSW pre-filter ─────────────────────────────────────────
+TEST(hnsw_filtered_search) {
+    rag::index::HnswIndex idx(rag::index::HnswConfig{});
+    for (int i = 0; i < 50; ++i) {
+        std::vector<float> v(8, 0);
+        v[i % 8] = 1.0f; v[(i+3) % 8] = 0.5f;
+        idx.add(static_cast<std::uint32_t>(i), v);
+    }
+    // Only allow even ids.
+    auto allow = [](std::uint32_t id) { return id % 2 == 0; };
+    std::vector<float> q(8, 0); q[0] = 1.0f;
+    auto hits = idx.search_filtered(q, 5, allow);
+    REQUIRE(!hits.empty());
+    for (auto& h : hits) CHECK(h.chunk.get() % 2 == 0);
+}
+
+// ─── Persistence container round-trip ──────────────────────────────────
+TEST(container_roundtrip_and_crc) {
+    rag::store::Container c;
+    c.put(rag::store::Tag::docs, "hello-docs-payload");
+    c.put(rag::store::Tag::bm25, std::string(1000, 'x'));
+    c.set_flags(rag::store::kHasEmbeddings);
+    auto blob = c.serialize();
+    auto back = rag::store::Container::parse(blob);
+    REQUIRE(back.has_value());
+    REQUIRE(back->get(rag::store::Tag::docs) != nullptr);
+    CHECK_EQ(*back->get(rag::store::Tag::docs), std::string("hello-docs-payload"));
+    CHECK(back->flags() == rag::store::kHasEmbeddings);
+    // Corrupt one byte in the payload region: CRC must reject.
+    blob[40] ^= 0xFF;
+    auto bad = rag::store::Container::parse(blob);
+    CHECK(!bad.has_value());
+}
+
+TEST(corpus_save_load_ragdb) {
+    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/ragcpp_test.ragdb";
+    {
+        rag::Engine engine;
+        engine.with_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{64}});
+        engine.add("a.md", "# Vectors\n\nEmbeddings map text to a dense space.", {{"k","v"}});
+        engine.add("b.md", "# Lexical\n\nBM25 scores exact term overlap.");
+        engine.build();
+        auto s = engine.save(path);
+        REQUIRE(s.has_value());
+    }
+    auto loaded = rag::index::Corpus::load(path);
+    REQUIRE(loaded.has_value());
+    CHECK_EQ(loaded->document_count(), 2u);
+    CHECK(loaded->chunk_count() >= 2u);
+    // Lexical search survives the round-trip.
+    auto hits = loaded->lexical_search("bm25 term", 3);
+    CHECK(!hits.empty());
+    std::remove(path.c_str());
+}
+
+// ─── Code-aware chunker ───────────────────────────────────────────
+TEST(code_chunker_splits_on_functions) {
+    std::string py =
+        "import os\n\n"
+        "def alpha():\n    return 1\n\n"
+        "def beta(x):\n    return x + 1\n\n"
+        "class Gamma:\n    def method(self):\n        return 2\n";
+    auto chunks = rag::loaders::chunk_code(rag::DocId{0}, ".py", py);
+    CHECK(chunks.size() >= 2);
+    CHECK_EQ(rag::loaders::detect_language(".py"), rag::loaders::Language::python);
+}
+
+// ─── HTML → text ────────────────────────────────────────────────
+TEST(html_to_text_strips_tags) {
+    std::string html = "<html><head><style>x{}</style></head><body>"
+                       "<h1>Title</h1><p>Hello &amp; welcome</p><script>bad()</script></body></html>";
+    auto text = rag::loaders::html_to_text(html);
+    CHECK(text.find("Title") != std::string::npos);
+    CHECK(text.find("Hello & welcome") != std::string::npos);
+    CHECK(text.find("bad()") == std::string::npos);   // script dropped
+    CHECK(text.find("x{}") == std::string::npos);      // style dropped
+}
+
+// ─── Reranker (local scoring fn) via pipeline stage ────────────────────────
+TEST(scorefn_reranker_reorders) {
+    // A reranker that prefers passages containing the exact word "target".
+    rag::rerank::ScoreFnReranker rr([](std::string_view q, std::string_view p) {
+        (void)q; return p.find("target") != std::string_view::npos ? 1.0f : 0.0f;
+    });
+    std::vector<std::string> passages = {"nothing here", "the target is here", "also nothing"};
+    auto scores = rr.rerank("q", passages);
+    REQUIRE(scores.has_value());
+    REQUIRE(scores->size() == 3);
+    CHECK((*scores)[1] > (*scores)[0]);
+}
+
+TEST(prf_expand_stage_grows_query) {
+    rag::Engine engine;
+    engine.add("d1", "neural networks deep learning gradient descent backpropagation");
+    engine.add("d2", "neural networks activation functions training epochs");
+    engine.build();
+    rag::pipeline::Pipeline p;
+    p.add(std::make_shared<rag::pipeline::PrfExpandStage>())
+     .add(std::make_shared<rag::pipeline::HybridRetrieveStage>())
+     .add(std::make_shared<rag::pipeline::TopKStage>());
+    std::vector<std::string> trace;
+    auto hits = p.run(engine.corpus(), "neural", 5, {}, &trace);
+    REQUIRE(hits.has_value());
+    bool expanded = false;
+    for (auto& t : trace) if (t.find("prf:") != std::string::npos) expanded = true;
+    CHECK(expanded);
 }
 
 int main() {

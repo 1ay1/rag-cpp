@@ -43,6 +43,14 @@ public:
     Corpus() = default;
     explicit Corpus(CorpusConfig cfg) : cfg_(std::move(cfg)) {}
 
+    // Chunks hold a borrowed pointer into `docs_` metadata; any move must
+    // re-link those pointers to the NEW storage, and copying is disabled to
+    // avoid silently sharing dangling pointers. (Move is cheap: vector steals.)
+    Corpus(const Corpus&) = delete;
+    Corpus& operator=(const Corpus&) = delete;
+    Corpus(Corpus&& o) noexcept { move_from(std::move(o)); }
+    Corpus& operator=(Corpus&& o) noexcept { if (this != &o) move_from(std::move(o)); return *this; }
+
     // Attach a dense embedder (enables the dense half). Optional.
     void set_embedder(dense::AnyEmbedder e) { embedder_ = std::move(e); }
     [[nodiscard]] bool has_embedder() const noexcept { return embedder_.has_value(); }
@@ -58,6 +66,13 @@ public:
     // ── Retrieval primitives ────────────────────────────────────────────────
     [[nodiscard]] std::vector<Hit> lexical_search(std::string_view query, std::size_t k) const;
     [[nodiscard]] Result<std::vector<Hit>> dense_search(std::string_view query, std::size_t k) const;
+
+    // Dense search with a metadata pre-filter pushed into the ANN walk (or the
+    // brute-force scan when HNSW isn't built). Beats post-filtering under
+    // selective predicates — it won't return fewer than k just because the
+    // top-k were filtered out.
+    [[nodiscard]] Result<std::vector<Hit>>
+    dense_search(std::string_view query, std::size_t k, const MetaFilter& filter) const;
 
     // ── Resolution / access ─────────────────────────────────────────────────
     [[nodiscard]] const Chunk*    chunk(ChunkId id) const;
@@ -85,6 +100,11 @@ private:
     bool                              dirty_ = false;
 
     [[nodiscard]] Result<void> embed_pending();
+
+    // Re-point every chunk's borrowed `meta` at the current `docs_` storage.
+    void relink_meta();
+    // Steal all state from `o` and relink meta pointers to our storage.
+    void move_from(Corpus&& o);
 };
 
 } // namespace rag::index

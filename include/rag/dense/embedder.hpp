@@ -18,6 +18,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "rag/core/concepts.hpp"
@@ -26,25 +27,47 @@
 namespace rag::dense {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HttpTransport — the injectable network seam. A single POST primitive.
+// HttpTransport — the injectable network seam.
+//
+// A single POST primitive, but rich enough for every hosted backend: custom
+// headers carry Bearer auth (OpenAI, TEI, Cohere) and `tls` requests an
+// encrypted connection. The default transport speaks plaintext HTTP/1.1 for
+// localhost model servers; for TLS endpoints inject a transport backed by your
+// own TLS stack — that is exactly why the seam exists.
 // ─────────────────────────────────────────────────────────────────────────────
 struct HttpResponse {
     int         status = 0;
     std::string body;
 };
 
+struct HttpRequest {
+    std::string_view host;
+    std::uint16_t    port = 80;
+    std::string_view path;
+    std::string_view body;                                   // JSON payload
+    std::vector<std::pair<std::string, std::string>> headers; // extra headers
+    bool             tls     = false;                        // https
+    std::chrono::milliseconds timeout{30'000};
+};
+
 struct HttpTransport {
     virtual ~HttpTransport() = default;
-    // POST `body` (with Content-Type application/json) to http://host:port/path.
-    // Returns the response, or an Error (transport_error / unavailable) on
-    // failure. Must be thread-safe for concurrent embed() calls.
-    [[nodiscard]] virtual Result<HttpResponse>
+
+    // The rich primitive every backend uses. Must be thread-safe for concurrent
+    // embed()/rerank() calls.
+    [[nodiscard]] virtual Result<HttpResponse> post(const HttpRequest& req) const = 0;
+
+    // Back-compat convenience: plaintext JSON POST with no extra headers.
+    [[nodiscard]] Result<HttpResponse>
     post_json(std::string_view host, std::uint16_t port, std::string_view path,
-              std::string_view body, std::chrono::milliseconds timeout) const = 0;
+              std::string_view body, std::chrono::milliseconds timeout) const {
+        return post(HttpRequest{host, port, path, body, {}, false, timeout});
+    }
 };
 
 // The library's default transport (blocking POSIX/Winsock sockets, plaintext
 // HTTP/1.1 — intended for localhost model servers like Ollama / llama.cpp).
+// A `tls=true` request against this transport fails with Errc::unavailable.
 [[nodiscard]] std::shared_ptr<HttpTransport> default_http_transport();
 
 // ─────────────────────────────────────────────────────────────────────────────

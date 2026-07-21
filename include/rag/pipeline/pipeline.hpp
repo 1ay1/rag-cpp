@@ -95,6 +95,37 @@ public:
     Result<Context> process(Context ctx) const override;
 };
 
+// Pseudo-Relevance Feedback (RM3-lite): run an initial retrieval, harvest the
+// top terms from the top-`fb_docs` chunks, append the best `fb_terms` to the
+// query, and let the NEXT retrieve stage use the expanded query. Classic recall
+// booster for under-specified queries. Insert BEFORE HybridRetrieveStage.
+struct ExpandConfig {
+    std::size_t fb_docs  = 5;    // pseudo-relevant docs to mine
+    std::size_t fb_terms = 8;    // expansion terms to add
+    std::size_t probe_k  = 20;   // initial probe depth
+};
+class PrfExpandStage final : public RetrievalStage {
+public:
+    explicit PrfExpandStage(ExpandConfig cfg = {}) : cfg_(cfg) {}
+    std::string_view name() const noexcept override { return "prf_expand"; }
+    Result<Context> process(Context ctx) const override;
+private:
+    ExpandConfig cfg_;
+};
+
+// Parent-document stitch (small-to-big): after ranking on fine chunks, merge
+// adjacent chunks from the SAME document that both survived into the result, so
+// the caller gets coherent, de-fragmented context windows. Insert AFTER rerank,
+// BEFORE top-k.
+class ParentStitchStage final : public RetrievalStage {
+public:
+    explicit ParentStitchStage(std::size_t max_gap = 1) : max_gap_(max_gap) {}
+    std::string_view name() const noexcept override { return "parent_stitch"; }
+    Result<Context> process(Context ctx) const override;
+private:
+    std::size_t max_gap_;   // merge chunks whose line ranges are within this gap
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Pipeline — an ordered sequence of stages.
 // ─────────────────────────────────────────────────────────────────────────────

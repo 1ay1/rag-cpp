@@ -2,23 +2,23 @@
 
 **A type-theoretic, production-grade retrieval (RAG) engine in modern C++23.**
 
-One static library. No vector-DB dependency. Hybrid lexical + dense retrieval,
-HNSW ANN, reciprocal rank fusion, a composable stage pipeline, graceful
-degradation, and on-disk persistence — built on a foundation that makes illegal
-states unrepresentable.
+One library. No vector-DB dependency. Hybrid lexical + dense retrieval, HNSW
+ANN with filtered search, cross-encoder reranking, pluggable embedders, a
+composable stage pipeline, source loaders (files / HTML / PDF / code), a stable
+versioned on-disk format, and a C ABI for Python/Rust/Go — on a foundation that
+makes illegal states unrepresentable.
 
 ```cpp
 #include <rag/rag.hpp>
 
 rag::Engine engine;
 engine.with_embedder(rag::dense::AnyEmbedder{
-    rag::dense::OllamaEmbedder{{.model = "nomic-embed-text"}}});  // or HashEmbedder (no network)
+    rag::dense::OllamaEmbedder{{.model = "nomic-embed-text"}}});   // or Hash / OpenAI / llama.cpp
 
 engine.add("intro.md", "rag-cpp fuses BM25 with dense vector search...");
 engine.build();
 
-auto results = engine.search("how does hybrid retrieval work?", 5);
-for (auto& r : *results)
+for (auto& r : *engine.search("how does hybrid retrieval work?", 5))
     std::printf("[%.3f] %s\n", r.score.get(), r.uri.c_str());
 ```
 
@@ -26,45 +26,49 @@ for (auto& r : *results)
 
 The library treats the type system as a proof assistant:
 
-- **Strong types (newtype pattern).** `DocId`, `ChunkId`, `TermId` are phantom-
-  tagged `StrongId`s — nominally distinct even though all wrap `uint32`. You
-  cannot pass a `DocId` where a `ChunkId` is wanted. `Score` and `Similarity`
-  are distinct float newtypes.
-- **Total functions.** Every fallible operation returns `Result<T> =
-  std::expected<T, Error>`; no exceptions for control flow. Errors are a closed
-  sum type (`Errc`).
+- **Strong / phantom types.** `DocId`, `ChunkId`, `TermId` are nominally
+  distinct even though all wrap `uint32` — you cannot pass one where another is
+  wanted. `Score` and `Similarity` are distinct float newtypes.
+- **Total functions.** Every fallible op returns `Result<T> = std::expected<T,
+  Error>`; no exceptions for control flow. Errors are a closed `Errc` sum type.
 - **Structural interfaces via concepts.** `Embedder`, `Retriever`, `Ranker`,
-  `Tokenizer` are C++20 concepts — plug in a new backend by matching a shape,
-  no inheritance, no vtable on the hot path. Runtime polymorphism (for
-  config-assembled pipelines) is provided separately via type-erased `AnyX`
-  adapters, so the generic and dynamic paths stay cleanly separated.
-- **Algebraic domain model.** Product types (`Document`, `Chunk`) and sum types
-  (`Errc`, fusion strategy) describe the domain precisely.
+  `Reranker`, `Tokenizer` are concepts — plug in a backend by matching a shape,
+  zero vtables on the hot path. Runtime polymorphism (config-assembled
+  pipelines) rides separate type-erased `AnyX` adapters.
 
-## What's inside
+## Features
 
-| Layer | Component |
-|---|---|
-| **core** | strong types, `Result`, concepts, `Document`/`Chunk` records |
-| **text** | Unicode-lite tokenizer, full Porter stemmer, stopwords, semantic line-aligned chunker with heading-breadcrumb *contextual retrieval* |
-| **lexical** | Okapi **BM25** over an inverted index (smoothed idf, binary serialization) |
-| **dense** | `Embedder` concept + injectable `HttpTransport` seam; **Ollama** / **OpenAI**-compatible / deterministic **Hash** embedders; SIMD (AVX2 / NEON / scalar) dot, cosine, sign-packing, Hamming |
-| **index** | **HNSW** ANN (Malkov & Yashunin 2016) with **Matryoshka truncation** + **binary quantization**; `Corpus` (hybrid store, incremental ingest, persistence) |
-| **fusion** | **Reciprocal Rank Fusion** (weighted) + **Relative Score Fusion** |
-| **pipeline** | composable `RetrievalStage` funnel: hybrid retrieve → filter → feature rerank → top-k; deterministic lexical-coverage reranker |
-| **engine** | one-call facade: `add` → `build` → `search` |
+### Retrieval
+- **Hybrid** BM25 (Okapi, smoothed idf) + dense cosine, fused with **RRF**
+  (weighted) or **Relative Score Fusion**.
+- **HNSW** ANN (Malkov & Yashunin) with **Matryoshka truncation** + **binary
+  quantization**, and **filtered-HNSW**: a metadata predicate pushed *into* the
+  graph walk (pre-filter) so selective filters still return k results.
+- **Cross-encoder reranking** as a first-class stage — TEI `/rerank`,
+  Cohere/Jina `/v1/rerank`, or any in-process scorer.
+- **Query expansion** (RM3-lite PRF) and **parent-document stitching**
+  (small-to-big) pipeline stages.
 
-## Design principles
+### Embedders (pluggable)
+`Ollama` · `OpenAI`-compatible (+ **Together**, **TEI** presets) · `llama.cpp`
+server · deterministic local `Hash` (no network). Decorators: `RetryingEmbedder`
+(exponential backoff), `FallbackEmbedder` (primary → secondary). All behind an
+injectable **`HttpTransport`** seam — bring your own TLS/gRPC/mock.
 
-1. **No hot-path dependency on the network.** The only external I/O is the
-   embedding call, behind an injectable `HttpTransport`. Ships a socket-based
-   default; inject your own (TLS stack, gRPC, mock) for anything else.
-2. **Graceful degradation.** If the embedder is offline, hybrid search falls
-   back to pure BM25 — the query still returns results.
-3. **Everything is serializable.** BM25 and HNSW have versioned binary formats;
-   a `Corpus` round-trips to a single file. Re-opening never rebuilds.
-4. **Deterministic by default.** The `HashEmbedder` needs no network, so tests,
-   CI, and offline smoke runs are fully reproducible.
+### Source loaders
+Filesystem directory walker (include/exclude globs) · HTML → text · PDF (via
+`pdftotext`) · **code-aware chunker** that splits on function/class boundaries
+for C-like, Python, Ruby, Go, and Rust.
+
+### Persistence
+A **stable, versioned, CRC-checked `.ragdb` container** (documented in
+[`FORMAT.md`](FORMAT.md)) — a public contract, not an internal cache. Reopening
+never rebuilds.
+
+### C API / bindings
+A flat opaque-handle C ABI ([`include/rag/c/rag.h`](include/rag/c/rag.h)) drives
+the whole engine from any language. See [`examples/ragcpp.py`](examples/ragcpp.py)
+for ctypes bindings; Rust `bindgen` / Go `cgo` work the same way.
 
 ## Build
 
@@ -73,31 +77,27 @@ Requires a C++23 compiler (GCC 13+, Clang 17+) and CMake 3.24+.
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build          # 14 test cases
-./build/examples/ragcpp_quickstart
-./build/bench/ragcpp_bench 5000 # ablation + latency harness
+ctest --test-dir build                     # C++ + C-API suites
+./build/examples/ragcpp_full_pipeline      # the maximal funnel
+./build/bench/ragcpp_bench 5000            # ablation + latency
 ```
 
-The only dependency (nlohmann/json) is fetched automatically via
-`FetchContent`.
+For the shared library (Python/Rust FFI): `-DBUILD_SHARED_LIBS=ON`. The only
+dependency (nlohmann/json) is fetched via `FetchContent`.
 
 ## Performance (5000 chunks, Apple M-series, NEON)
 
 ```
-embed+build:   3733 ms   (one-time)
-hybrid query:  2.1 ms/query
-bm25 only:     0.18 ms/query
-dense (HNSW):  0.14 ms/query
+embed+build:   ~3.7 s    (one-time)
+hybrid query:  ~2.1 ms/query
+bm25 only:     ~0.18 ms/query
+dense (HNSW):  ~0.14 ms/query
 ```
 
-## Roadmap
+## Documentation
 
-- Cross-encoder reranker stage (bge-reranker via the transport seam)
-- Query expansion (PRF/RM3) and parent-document stitching stages
-- GraphRAG-lite (link graph + community summaries)
-- Learned per-passage priors from click/use feedback
-- PDF / HTML source loaders
-- C API + Python bindings
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — layers, seams, invariants.
+- [`FORMAT.md`](FORMAT.md) — the `.ragdb` on-disk contract.
 
 ## License
 

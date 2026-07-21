@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace rag::pipeline {
@@ -19,9 +20,12 @@ Result<Context> HybridRetrieveStage::process(Context ctx) const {
     auto lex = corpus.lexical_search(ctx.query, cfg_.candidate_k);
     lists.push_back({std::move(lex), cfg_.bm25_weight});
 
-    // Dense (degrade gracefully if unavailable/offline).
+    // Dense (degrade gracefully if unavailable/offline). The metadata filter is
+    // pushed into the ANN walk as a PRE-filter so a selective predicate still
+    // returns a full candidate pool.
     if (corpus.has_embedder()) {
-        auto dense = corpus.dense_search(ctx.query, cfg_.candidate_k);
+        auto dense = ctx.filter ? corpus.dense_search(ctx.query, cfg_.candidate_k, ctx.filter)
+                                : corpus.dense_search(ctx.query, cfg_.candidate_k);
         if (dense) lists.push_back({std::move(*dense), cfg_.dense_weight});
         else ctx.trace.push_back(std::string("dense unavailable: ") + std::string(to_string(dense.error().code)));
     }
@@ -58,6 +62,75 @@ Result<Context> RerankStage::process(Context ctx) const {
 // ── TopKStage ────────────────────────────────────────────────────────────────
 Result<Context> TopKStage::process(Context ctx) const {
     if (ctx.candidates.size() > ctx.k) ctx.candidates.resize(ctx.k);
+    return ctx;
+}
+
+// ── PrfExpandStage (RM3-lite pseudo-relevance feedback) ──────────────────────
+Result<Context> PrfExpandStage::process(Context ctx) const {
+    if (!ctx.corpus) return ctx;
+    // Initial probe on the raw query (lexical is enough to seed expansion).
+    auto probe = ctx.corpus->lexical_search(ctx.query, cfg_.probe_k);
+    if (probe.empty()) return ctx;
+
+    // Mine term frequencies from the top pseudo-relevant chunks, minus the
+    // terms already in the query (avoid double-weighting).
+    auto q_terms = ctx.corpus->tokenizer().tokenize(ctx.query);
+    std::unordered_set<std::string> qset(q_terms.begin(), q_terms.end());
+    std::unordered_map<std::string, int> freq;
+    std::size_t used = std::min(cfg_.fb_docs, probe.size());
+    for (std::size_t i = 0; i < used; ++i) {
+        const Chunk* ch = ctx.corpus->chunk(probe[i].chunk);
+        if (!ch) continue;
+        for (auto& t : ctx.corpus->tokenizer().tokenize(ch->indexed_text()))
+            if (!qset.contains(t)) ++freq[t];
+    }
+    if (freq.empty()) return ctx;
+
+    // Pick the top expansion terms by frequency.
+    std::vector<std::pair<std::string,int>> ranked(freq.begin(), freq.end());
+    std::partial_sort(ranked.begin(),
+        ranked.begin() + static_cast<std::ptrdiff_t>(std::min(cfg_.fb_terms, ranked.size())),
+        ranked.end(), [](auto& a, auto& b){ return a.second > b.second; });
+
+    std::string expanded = ctx.query;
+    std::size_t added = 0;
+    for (auto& [term, f] : ranked) {
+        if (added >= cfg_.fb_terms) break;
+        expanded += ' '; expanded += term; ++added;
+    }
+    ctx.query = expanded;
+    ctx.trace.push_back("prf: +" + std::to_string(added) + " terms");
+    return ctx;
+}
+
+// ── ParentStitchStage (small-to-big) ─────────────────────────────────────────
+Result<Context> ParentStitchStage::process(Context ctx) const {
+    if (!ctx.corpus || ctx.candidates.size() < 2) return ctx;
+    // Group surviving candidates by document, keeping best score per group and
+    // dropping a chunk that is adjacent-or-overlapping a higher-ranked sibling
+    // (its content is already represented by the neighbour we keep).
+    std::vector<Hit> kept;
+    std::vector<char> dropped(ctx.candidates.size(), 0);
+
+    for (std::size_t i = 0; i < ctx.candidates.size(); ++i) {
+        if (dropped[i]) continue;
+        const Chunk* ci = ctx.corpus->chunk(ctx.candidates[i].chunk);
+        if (!ci) { kept.push_back(ctx.candidates[i]); continue; }
+        for (std::size_t j = i + 1; j < ctx.candidates.size(); ++j) {
+            if (dropped[j]) continue;
+            const Chunk* cj = ctx.corpus->chunk(ctx.candidates[j].chunk);
+            if (!cj || cj->doc.get() != ci->doc.get()) continue;
+            // Adjacent if line ranges are within max_gap of each other.
+            std::uint32_t gap = (cj->start_line > ci->end_line)
+                              ? cj->start_line - ci->end_line
+                              : (ci->start_line > cj->end_line ? ci->start_line - cj->end_line : 0);
+            if (gap <= max_gap_) dropped[j] = 1;   // fold lower-ranked neighbour away
+        }
+        kept.push_back(ctx.candidates[i]);
+    }
+    std::size_t merged = ctx.candidates.size() - kept.size();
+    ctx.candidates = std::move(kept);
+    if (merged) ctx.trace.push_back("stitch: merged " + std::to_string(merged) + " adjacent");
     return ctx;
 }
 
