@@ -12,6 +12,9 @@
 
 #include <rag/rag.hpp>
 #include <rag/rcp/rcp.hpp>
+#include <rag/sparse/splade.hpp>
+#include <rag/late/colbert.hpp>
+#include <rag/rerank/reranker.hpp>
 
 namespace {
 struct Case { std::string name; std::function<void()> fn; };
@@ -36,6 +39,20 @@ rag::Engine make_engine() {
           {{"lang", "fr"}, {"topic", "biology"}});
     e.build();
     return e;
+}
+
+// A handler wired with all the real advanced components, mirroring the server.
+rag::rcp::Options full_opts(rag::Engine& e) {
+    auto o = rag::rcp::Options{}.with_index(true).with_graph().with_memory()
+                 .filter_on("topic").filter_on("lang")
+                 .with_colbert(rag::late::hashed_token_embedder(32))
+                 .with_reranker(rag::rerank::AnyReranker{rag::rerank::ScoreFnReranker{
+                     [](std::string_view q, std::string_view p) {
+                         return p.find(q) != std::string_view::npos ? 1.0f : 0.0f; }}})
+                 .with_generator([](std::string_view) -> rag::Result<std::vector<std::string>> {
+                     return std::vector<std::string>{"alpha", "beta"}; });
+    if (auto sp = rag::sparse::SpladeIndex::build(e.corpus()); sp) o.with_splade(std::move(*sp));
+    return o;
 }
 } // namespace
 
@@ -174,6 +191,97 @@ TEST(rcp_index_add_is_upsert_not_duplicate) {
     auto del2 = h.index_delete(Json{{"ids", Json::array({"doc://dup"})}});
     REQUIRE(del2.has_value());
     CHECK((*del2)["deleted"].get<int>() == 0);   // idempotent
+}
+
+TEST(rcp_full_surface_capabilities) {
+    using namespace rag::rcp;
+    auto engine = make_engine();
+    EngineHandler h{engine, full_opts(engine)};
+    auto c = h.capabilities();
+    CHECK(c.rerank.has_value());
+    CHECK(c.transform.has_value());
+    CHECK(c.sparse_embed.has_value());
+    CHECK(c.multi_vector.has_value());
+    CHECK(c.graph.has_value());
+    CHECK(c.memory.has_value());
+    // retrieve advertises rerank + rewrite because the components exist
+    REQUIRE(c.retrieve.has_value());
+    CHECK((*c.retrieve).contains("rerank"));
+    CHECK((*c.retrieve).contains("rewrite"));
+    // sparse mode is advertised only because SPLADE is attached
+    bool has_sparse_mode = false;
+    for (const auto& m : (*c.retrieve)["modes"]) if (m == "sparse") has_sparse_mode = true;
+    CHECK(has_sparse_mode);
+}
+
+TEST(rcp_native_rerank) {
+    using namespace rag::rcp;
+    auto engine = make_engine();
+    EngineHandler h{engine, full_opts(engine)};
+    auto r = h.rerank(Json{{"query", "paris"},
+                           {"documents", Json::array({"nothing here", "paris is nice"})}});
+    REQUIRE(r.has_value());
+    REQUIRE((*r)["results"].is_array());
+    CHECK((*r)["results"][0]["index"].get<int>() == 1);   // matching doc ranked first
+    CHECK((*r)["results"][0]["score"].get<double>() >= (*r)["results"][1]["score"].get<double>());
+}
+
+TEST(rcp_native_transform) {
+    using namespace rag::rcp;
+    auto engine = make_engine();
+    EngineHandler h{engine, full_opts(engine)};
+    auto r = h.transform(Json{{"query", "x"}, {"method", "multi-query"}});
+    REQUIRE(r.has_value());
+    CHECK((*r)["queries"].size() == 2);
+}
+
+TEST(rcp_embed_sparse_and_multi) {
+    using namespace rag::rcp;
+    auto engine = make_engine();
+    EngineHandler h{engine, full_opts(engine)};
+    auto s = h.embed_sparse(Json{{"texts", Json::array({"nearest neighbour"})}, {"kind", "query"}});
+    REQUIRE(s.has_value());
+    REQUIRE((*s)["sparse"].is_array());
+    CHECK((*s)["sparse"][0]["indices"].size() == (*s)["sparse"][0]["values"].size());
+
+    auto m = h.embed_multi(Json{{"inputs", Json::array({"vector search"})}});
+    REQUIRE(m.has_value());
+    CHECK((*m)["dimension"].get<int>() == 32);
+    CHECK((*m)["matrices"][0].size() >= 1);   // one row per token
+}
+
+TEST(rcp_retrieve_sparse_mode_and_rewrite) {
+    using namespace rag::rcp;
+    auto engine = make_engine();
+    EngineHandler h{engine, full_opts(engine)};
+    auto sp = h.retrieve(Json{{"query", "paris tower"}, {"k", 2}, {"mode", "sparse"}});
+    REQUIRE(sp.has_value());
+    CHECK((*sp)["usage"]["mode"] == "sparse");
+    auto rw = h.retrieve(Json{{"query", "plants"}, {"k", 2}, {"rewrite", "multi-query"}});
+    REQUIRE(rw.has_value());
+    CHECK(std::string((*rw)["usage"]["mode"]).rfind("hybrid+", 0) == 0);
+}
+
+TEST(rcp_retrieve_sparse_mode_rejected_without_splade) {
+    using namespace rag::rcp;
+    auto engine = make_engine();
+    EngineHandler h{engine, Options{}};   // no SPLADE
+    auto r = h.retrieve(Json{{"query", "x"}, {"k", 2}, {"mode", "sparse"}});
+    REQUIRE(!r.has_value());
+    CHECK(r.error().code == ::rcp::errc::OptionUnsupported);
+}
+
+TEST(rcp_memory_build_and_recall) {
+    using namespace rag::rcp;
+    auto engine = make_engine();
+    EngineHandler h{engine, full_opts(engine)};
+    auto b = h.memory_build(Json::object());
+    REQUIRE(b.has_value());
+    CHECK((*b)["memoryId"] == "graph");
+    auto rc = h.memory_recall(Json{{"query", "retrieval"}, {"n", 3}});
+    REQUIRE(rc.has_value());
+    REQUIRE((*rc)["clues"].is_array());
+    CHECK((*rc)["clues"][0]["query"] == "retrieval");
 }
 
 int main() {

@@ -45,6 +45,11 @@ public:
     ServerBuilder& with_index(bool writable) { opts_.with_index(writable); return *this; }
     ServerBuilder& with_graph(bool on = true) { opts_.with_graph(on); return *this; }
     ServerBuilder& with_feedback(bool on = true) { opts_.with_feedback(on); return *this; }
+    ServerBuilder& with_memory(bool on = true) { opts_.with_memory(on); return *this; }
+    ServerBuilder& with_reranker(rag::rerank::AnyReranker r) { opts_.with_reranker(std::move(r)); return *this; }
+    ServerBuilder& with_splade(rag::sparse::SpladeIndex s)   { opts_.with_splade(std::move(s)); return *this; }
+    ServerBuilder& with_colbert(rag::late::TokenEmbedder e)  { opts_.with_colbert(std::move(e)); return *this; }
+    ServerBuilder& with_generator(rag::query::Generator g)   { opts_.with_generator(std::move(g)); return *this; }
     ServerBuilder& filter_on(std::string field, std::string type = "keyword") {
         opts_.filter_on(std::move(field), std::move(type)); return *this;
     }
@@ -53,7 +58,7 @@ public:
     // Method-override hooks — each REPLACES the built-in mapping for that method
     // and, where relevant, advertises the corresponding capability.
     ServerBuilder& on_retrieve(std::function<Result(const Json&)> f) { hooks_.retrieve = std::move(f); return *this; }
-    ServerBuilder& on_rerank(std::function<Result(const Json&)> f)   { hooks_.rerank = std::move(f); opts_.enable_rerank = true; return *this; }
+    ServerBuilder& on_rerank(std::function<Result(const Json&)> f)   { hooks_.rerank = std::move(f); return *this; }
     ServerBuilder& on_embed(std::function<Result(const Json&)> f)    { hooks_.embed = std::move(f); return *this; }
     ServerBuilder& on_graph(std::function<Result(const Json&)> f)    { hooks_.graph = std::move(f); opts_.enable_graph = true; return *this; }
     ServerBuilder& on_transform(std::function<Result(const Json&)> f){ hooks_.transform = std::move(f); return *this; }

@@ -175,24 +175,35 @@ int main() {
 ```
 
 Need more surface? The fluent `ServerBuilder` advertises exactly the
-capabilities you turn on, and any method can be overridden with a host hook
-(an external reranker, an LLM query rewriter, a policy-scoped retrieve) without
-subclassing:
+capabilities you turn on. Because rag-cpp already *has* the machinery, you
+attach the engine's own advanced components and the matching RCP methods light
+up **natively** — no host glue:
 
 ```cpp
 rag::rcp::ServerBuilder(engine)
     .named("docs", "1.0")
-    .with_index(/*writable=*/true)            // index/add + index/delete (upsert)
-    .filter_on("lang", "keyword")            // §8 metadata filtering
-    .on_rerank(my_cross_encoder)             // add a capability the base lacks
+    .with_index(/*writable=*/true)                 // index/add + index/delete (upsert)
+    .with_graph().with_memory()                    // GraphRAG + HippoRAG-style memory
+    .with_splade(rag::sparse::SpladeIndex::build(engine.corpus()).value())
+    .with_colbert(rag::late::hashed_token_embedder(64))   // embed/multi + colbert rerank
+    .with_reranker(my_cross_encoder)               // rerank + retrieve.rerank
+    .with_generator(my_llm)                        // query/transform + retrieve.rewrite (HyDE)
+    .filter_on("lang", "keyword")                  // §8 metadata filtering
     .serve_http(8000);
 ```
 
 The engine is held by **reference** — the host keeps ingesting/persisting
-through its own handle while the server reads the same live corpus. Capabilities
-are advertised honestly (e.g. `embed` only when an embedder is attached), the
-funnel invariant `candidateK ≥ topN ≥ k` is wire-enforced, and every hit carries
-a citation for grounded generation.
+through its own handle while the server reads the same live corpus. Every
+capability is advertised **honestly**: `embed` only with an embedder, `sparse`
+mode + `embed/sparse` only with a SPLADE index, `rerank`/`transform` only when a
+reranker/generator is attached. The funnel invariant `candidateK ≥ topN ≥ k` is
+wire-enforced, and every hit carries a citation for grounded generation.
+
+The bundled `ragcpp_rcp_server` demo wires **all twelve RCP methods** to real
+engine machinery — hybrid/dense/sparse `retrieve`, cross-encoder + ColBERT
+`rerank`, HyDE/multi-query `query/transform`, `embed`/`embed/sparse`/`embed/multi`,
+GraphRAG `graph`, `index/add`+`index/delete`, and `memory/build`+`memory/recall`
+over the community graph.
 
 Build and certify:
 
