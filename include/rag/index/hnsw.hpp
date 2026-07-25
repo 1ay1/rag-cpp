@@ -234,11 +234,15 @@ private:
                  std::uint32_t entry, int layer, std::size_t ef) const;
     void connect(std::uint32_t node, int layer, std::vector<std::uint32_t> neighbours);
 
-    // Score `cands` against `nv` and sort best-first into `out`, computing each
-    // dot product exactly once. Shared by connect() and connect_locked().
-    void score_and_sort(std::span<const float> nv,
+    // Score `cands` against node `n` and sort best-first into `out`, computing
+    // each similarity exactly once. Shared by connect() and connect_locked().
+    void score_and_sort(std::uint32_t node,
                         const std::vector<std::uint32_t>& cands,
                         std::vector<std::pair<float, std::uint32_t>>& out) const;
+
+    // Similarity between two indexed nodes, on the same scale score_and_sort
+    // produced (SQ8 integer or float dot, whichever is in use).
+    [[nodiscard]] float sim_nodes(std::uint32_t a, std::uint32_t b) const;
 
     // connect() variant used during a concurrent build: takes the per-node
     // spinlocks before mutating adjacency.

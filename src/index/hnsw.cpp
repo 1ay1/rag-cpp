@@ -75,10 +75,11 @@ void HnswIndex::seal() const {
         }
     }
 
-    // Quantize every vector once, here, so the walk never pays for it. Binary
-    // mode has its own (coarser) code and matryoshka wants a float prefix, so
-    // SQ8 is skipped for both rather than layering approximations.
-    if (!cfg_.binary && cfg_.matryoshka_dim == 0 && dim_ > 0) {
+    // Quantize every vector once, here, so the walk never pays for it. Skipped
+    // when build_batch already did it. Binary mode has its own (coarser) code
+    // and matryoshka wants a float prefix, so SQ8 is skipped for both rather
+    // than layering approximations.
+    if (q8_.size() != n * dim_ && !cfg_.binary && cfg_.matryoshka_dim == 0 && dim_ > 0) {
         q8_.resize(n * dim_);
         for (std::size_t i = 0; i < n; ++i)
             dense::quantize_sq8(vec_at(i),
@@ -221,24 +222,43 @@ select_neighbours_heuristic(const std::vector<std::pair<float, std::uint32_t>>& 
 // std::sort with a comparator that calls dot() — recomputes each vector's
 // similarity O(log n) times: at ef_construction=200 that is ~3000 dot products
 // where 200 suffice, and it dominated build time before this was hoisted.
-void HnswIndex::score_and_sort(std::span<const float> nv,
+//
+// `node` names the vector being linked so the SQ8 rows can be used when
+// available: neighbour selection only ORDERS candidates, and the graph it
+// produces is rebuilt-equivalent under an error of ~1/127 (verified by the
+// recall gates), so it gets the same 4× bandwidth saving as the walk.
+void HnswIndex::score_and_sort(std::uint32_t node,
                                const std::vector<std::uint32_t>& cands,
                                std::vector<std::pair<float, std::uint32_t>>& out) const {
     out.clear();
     out.reserve(cands.size());
-    for (std::uint32_t c : cands) out.emplace_back(dense::dot(nv, vec_at(c)), c);
+    if (!q8_.empty()) {
+        const std::int8_t* a = q8_at(node);
+        for (std::uint32_t c : cands)
+            out.emplace_back(static_cast<float>(dense::dot_sq8(a, q8_at(c), dim_)), c);
+    } else {
+        const std::span<const float> nv = vec_at(node);
+        for (std::uint32_t c : cands) out.emplace_back(dense::dot(nv, vec_at(c)), c);
+    }
     std::sort(out.begin(), out.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
 }
 
+// Similarity between two INDEXED nodes, used by the diversity heuristic.
+// Matches whatever scale score_and_sort produced, so the two are comparable.
+float HnswIndex::sim_nodes(std::uint32_t a, std::uint32_t b) const {
+    if (!q8_.empty())
+        return static_cast<float>(dense::dot_sq8(q8_at(a), q8_at(b), dim_));
+    return dense::dot(vec_at(a), vec_at(b));
+}
+
 void HnswIndex::connect(std::uint32_t node, int layer, std::vector<std::uint32_t> neighbours) {
     const std::size_t maxM = (layer == 0) ? cfg_.M * 2 : cfg_.M;
-    const std::span<const float> nv = vec_at(node);
     std::vector<std::pair<float, std::uint32_t>> scored;
-    score_and_sort(nv, neighbours, scored);
+    score_and_sort(node, neighbours, scored);
     auto& L = nodes_[node].links[static_cast<std::size_t>(layer)];
     L = select_neighbours_heuristic(scored, maxM,
-            [&](std::uint32_t a, std::uint32_t b) { return dense::dot(vec_at(a), vec_at(b)); });
+            [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); });
 
     // Add back-links, pruning each neighbour to its own maxM with the same
     // heuristic so the reverse edges stay diverse too.
@@ -246,9 +266,9 @@ void HnswIndex::connect(std::uint32_t node, int layer, std::vector<std::uint32_t
         auto& NL = nodes_[nb].links[static_cast<std::size_t>(layer)];
         if (std::find(NL.begin(), NL.end(), node) == NL.end()) NL.push_back(node);
         if (NL.size() > maxM) {
-            score_and_sort(vec_at(nb), NL, scored);
+            score_and_sort(nb, NL, scored);
             NL = select_neighbours_heuristic(scored, maxM,
-                    [&](std::uint32_t a, std::uint32_t b) { return dense::dot(vec_at(a), vec_at(b)); });
+                    [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); });
         }
     }
 }
@@ -258,15 +278,14 @@ void HnswIndex::connect_locked(std::uint32_t node, int layer,
                                std::vector<NodeLock>& locks) {
     const std::size_t maxM = (layer == 0) ? cfg_.M * 2 : cfg_.M;
     const std::size_t L    = static_cast<std::size_t>(layer);
-    const std::span<const float> nv = vec_at(node);
 
     // Rank candidates by similarity to `node`, then apply the diversity
     // heuristic. This read-only scoring needs no locks: vectors are immutable
-    // after staging and the arena never reallocates during phase 2.
+    // after staging and neither arena reallocates during phase 2.
     std::vector<std::pair<float, std::uint32_t>> scored;
-    score_and_sort(nv, neighbours, scored);
+    score_and_sort(node, neighbours, scored);
     auto keep = select_neighbours_heuristic(scored, maxM,
-            [&](std::uint32_t a, std::uint32_t b) { return dense::dot(vec_at(a), vec_at(b)); });
+            [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); });
 
     {   // Publish this node's own adjacency. Written in place (capacity was
         // reserved to maxM+1 at staging) so the buffer address never changes
@@ -291,9 +310,9 @@ void HnswIndex::connect_locked(std::uint32_t node, int layer,
         // Prune outside the lock — scoring maxM+1 candidates against each other
         // is O(M²) dot products, far too long to hold a spinlock that readers
         // and other writers are contending for.
-        score_and_sort(vec_at(nb), snapshot, scored);
+        score_and_sort(nb, snapshot, scored);
         auto pruned = select_neighbours_heuristic(scored, maxM,
-                [&](std::uint32_t a, std::uint32_t b) { return dense::dot(vec_at(a), vec_at(b)); });
+                [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); });
         locks[nb].lock();
         auto& NL2 = nodes_[nb].links[L];
         // Re-check under the lock: another thread may have pruned already, and
@@ -345,6 +364,24 @@ void HnswIndex::build_batch(std::size_t n,
     const std::size_t total = nodes_.size();
     if (total == base) return;
 
+    // Quantize every staged vector NOW, before any linking runs. The build is
+    // the same memory-bound graph walk as a query, only ~n×ef times over, so it
+    // benefits from SQ8 exactly as search does — and doing it here (rather than
+    // in seal(), after the fact) means the ef_construction-wide walks that
+    // dominate build time read int8 instead of float32.
+    //
+    // Safe to publish before phase 2 for the same reason `store_` is: the
+    // buffer is sized once and never reallocated while linking threads hold
+    // pointers into it.
+    if (!cfg_.binary && cfg_.matryoshka_dim == 0 && dim_ > 0) {
+        q8_.resize(total * dim_);
+        util::parallel_for(total - base, [&](std::size_t i) {
+            const std::size_t node = base + i;
+            dense::quantize_sq8(vec_at(node),
+                                std::span<std::int8_t>(q8_.data() + node * dim_, dim_));
+        });
+    }
+
     // Seed the graph with the first node if the index was empty.
     std::size_t start = base;
     if (max_layer_ < 0) {
@@ -366,19 +403,24 @@ void HnswIndex::build_batch(std::size_t n,
 
         std::span<const float>         q  = vec_at(ordinal);
         std::span<const std::uint64_t> qb = nodes_[ordinal].bits;
+        // This node's own SQ8 row doubles as the quantized query for its walk.
+        std::span<const std::int8_t>   q8 =
+            q8_.empty() ? std::span<const std::int8_t>{}
+                        : std::span<const std::int8_t>(q8_at(ordinal), dim_);
 
         int top;
         std::uint32_t cur;
         { std::lock_guard lk(entry_mu); top = max_layer_; cur = entry_; }
 
+        std::vector<std::uint32_t> hop;
         for (int lc = top; lc > level; --lc) {
-            auto r = search_layer(q, qb, cur, lc, 1);
-            if (!r.empty()) cur = r.front();
+            search_layer_into(q, qb, q8, cur, lc, 1, hop);
+            if (!hop.empty()) cur = hop.front();
         }
         for (int lc = std::min(level, top); lc >= 0; --lc) {
-            auto neighbours = search_layer(q, qb, cur, lc, cfg_.ef_construction);
-            if (!neighbours.empty()) cur = neighbours.front();
-            connect_locked(ordinal, lc, std::move(neighbours), locks);
+            search_layer_into(q, qb, q8, cur, lc, cfg_.ef_construction, hop);
+            if (!hop.empty()) cur = hop.front();
+            connect_locked(ordinal, lc, hop, locks);
         }
 
         if (level > top) {
