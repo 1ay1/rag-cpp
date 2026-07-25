@@ -98,6 +98,23 @@ private:
     std::vector<std::uint32_t> dense_len_;
     std::uint32_t              max_doc_ = 0;
 
+    // ── Precomputed posting weights ─────────────────────────────────
+    // A posting's BM25 contribution is
+    //     idf(t) * tf*(k1+1) / (tf + k1*(1 - b + b*dl/avgdl))
+    // and every factor except idf(t) depends only on (tf, dl), both fixed at
+    // index time. Recomputing it per query meant a float DIVISION for each of
+    // the ~80k postings a query touches on a large corpus — work whose answer
+    // never changes between queries.
+    //
+    // finalize() therefore evaluates the tf/dl half once into a flat array laid
+    // out to mirror `postings_` term-by-term, leaving the query's inner loop a
+    // single multiply-add over a sequential float stream. Kept separate from
+    // the Posting struct (rather than widening it) so the SERIALIZED format is
+    // untouched: this is derived data, rebuilt by finalize() on load.
+    std::vector<float> pw_;
+    // term -> [begin,end) range into pw_, aligned with that term's postings.
+    std::unordered_map<std::string, std::pair<std::uint32_t, std::uint32_t>> pw_span_;
+
     double  total_len_ = 0.0;
     float   avgdl_     = 0.0f;
     bool    finalized_ = false;

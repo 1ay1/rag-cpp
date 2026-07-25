@@ -48,6 +48,37 @@ void Bm25Index::finalize() {
         dense_len_.assign(static_cast<std::size_t>(max_doc_) + 1, 0);
         for (const auto& [d, l] : doc_len_) dense_len_[d] = l;
     }
+
+    // Evaluate the query-independent half of every posting's score once.
+    {
+        const float avgdl = avgdl_ > 0 ? avgdl_ : 1.0f;
+        const float k1 = params_.k1, b = params_.b;
+        const float inv_avgdl = 1.0f / avgdl;
+
+        std::size_t total = 0;
+        for (const auto& [term, plist] : postings_) total += plist.size();
+        pw_.resize(total);
+        pw_span_.clear();
+        pw_span_.reserve(postings_.size());
+
+        std::uint32_t cursor = 0;
+        for (const auto& [term, plist] : postings_) {
+            const std::uint32_t begin = cursor;
+            for (const auto& p : plist) {
+                float dl = avgdl;
+                if (!dense_len_.empty() && p.doc < dense_len_.size()) {
+                    if (const std::uint32_t raw = dense_len_[p.doc]) dl = static_cast<float>(raw);
+                } else if (auto it = doc_len_.find(p.doc); it != doc_len_.end()) {
+                    dl = static_cast<float>(it->second);
+                }
+                const float f   = static_cast<float>(p.tf);
+                const float num = f * (k1 + 1.0f);
+                const float den = f + k1 * (1.0f - b + b * dl * inv_avgdl);
+                pw_[cursor++] = den > 0.0f ? num / den : 0.0f;
+            }
+            pw_span_.emplace(term, std::pair{begin, cursor});
+        }
+    }
     finalized_ = true;
 }
 
@@ -127,6 +158,44 @@ std::vector<Hit> Bm25Index::search(std::string_view query, std::size_t k) const 
     const float avgdl = avgdl_ > 0 ? avgdl_ : 1.0f;
     const float k1 = params_.k1, b = params_.b;
     const float inv_avgdl = 1.0f / avgdl;
+
+    // Fast path: dense ordinals + precomputed weights. Per posting this is one
+    // multiply-add over two sequential streams (the posting's doc id, and its
+    // precomputed weight) — no division, no doc-length lookup, no hashing.
+    if (!dense_len_.empty() && !pw_.empty()) {
+        std::vector<float>         acc(dense_len_.size(), 0.0f);
+        std::vector<std::uint32_t> touched;
+        touched.reserve(1024);
+
+        for (const auto& term : q_terms) {
+            auto pit = postings_.find(term);
+            if (pit == postings_.end()) continue;
+            auto sit = pw_span_.find(term);
+            if (sit == pw_span_.end()) continue;
+            const auto& plist = pit->second;
+            const float term_idf = idf(plist.size());
+            const float* w = pw_.data() + sit->second.first;
+
+            const std::size_t m = plist.size();
+            for (std::size_t i = 0; i < m; ++i) {
+                const std::uint32_t d = plist[i].doc;
+                if (d >= acc.size()) continue;
+                if (acc[d] == 0.0f) touched.push_back(d);
+                acc[d] += term_idf * w[i];
+            }
+        }
+
+        std::vector<Hit> hits;
+        hits.reserve(touched.size());
+        for (std::uint32_t d : touched) hits.push_back(Hit{ChunkId{d}, Score{acc[d]}});
+
+        const std::size_t kk = std::min(k, hits.size());
+        std::partial_sort(hits.begin(), hits.begin() + static_cast<std::ptrdiff_t>(kk),
+                          hits.end(),
+                          [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
+        hits.resize(kk);
+        return hits;
+    }
 
     // Fast path: dense ordinals. Accumulate into a flat array and track which
     // slots were touched, so we neither hash per posting nor scan the whole

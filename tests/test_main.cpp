@@ -711,6 +711,68 @@ TEST(tokenizer_stem_cache_matches_direct_stemming) {
     }
 }
 
+// ─── BM25 precomputed weights are exact ─────────────────────────
+//
+// finalize() precomputes the (tf, dl)-dependent half of every posting's score
+// so the query loop is a multiply-add instead of a division. That is only a
+// speedup if it is arithmetically identical to scoring from scratch — and it
+// is derived data, so it must also be rebuilt correctly on deserialize.
+TEST(bm25_precomputed_weights_match_direct_scoring) {
+    static const char* w[] = {"alpha","beta","gamma","delta","epsilon","zeta",
+                              "eta","theta","iota","kappa","lambda","sigma"};
+    std::mt19937 rng(9);
+    std::uniform_int_distribution<int> pick(0, 11);
+
+    rag::lexical::Bm25Index idx;
+    constexpr int N = 800;
+    for (int i = 0; i < N; ++i) {
+        std::string s;
+        const int len = 5 + (i % 30);      // varied doc lengths => varied dl term
+        for (int j = 0; j < len; ++j) { s += w[pick(rng)]; s += ' '; }
+        idx.add(static_cast<std::uint32_t>(i), s);
+    }
+    idx.finalize();
+
+    // search() must agree with score_doc(), which computes the formula directly.
+    std::size_t compared = 0, mismatches = 0;
+    for (int q = 0; q < 60; ++q) {
+        std::string qs;
+        for (int j = 0; j < 1 + (q % 4); ++j) { qs += w[pick(rng)]; qs += ' '; }
+        const auto terms = idx.tokenizer().tokenize(qs);
+
+        for (const auto& h : idx.search(qs, 20)) {
+            ++compared;
+            if (std::fabs(h.score.get() - idx.score_doc(terms, h.chunk.get())) > 1e-4f)
+                ++mismatches;
+        }
+    }
+    CHECK(compared > 100);
+    CHECK_EQ(mismatches, std::size_t{0});
+
+    // The weights are NOT serialized (they are derived); deserialize must
+    // rebuild them, so scores have to survive a round-trip bit-for-bit.
+    auto blob = idx.serialize();
+    auto back = rag::lexical::Bm25Index::deserialize(blob);
+    REQUIRE(back.has_value());
+
+    std::size_t rt_compared = 0, rt_diff = 0;
+    for (int q = 0; q < 40; ++q) {
+        std::string qs;
+        for (int j = 0; j < 3; ++j) { qs += w[pick(rng)]; qs += ' '; }
+        auto a = idx.search(qs, 10);
+        auto b = back->search(qs, 10);
+        REQUIRE(a.size() == b.size());
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            ++rt_compared;
+            if (a[i].chunk.get() != b[i].chunk.get() ||
+                std::fabs(a[i].score.get() - b[i].score.get()) > 1e-5f)
+                ++rt_diff;
+        }
+    }
+    CHECK(rt_compared > 50);
+    CHECK_EQ(rt_diff, std::size_t{0});
+}
+
 // ─── Persistence container round-trip ──────────────────────────────────
 TEST(container_roundtrip_and_crc) {
     rag::store::Container c;
