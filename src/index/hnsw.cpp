@@ -25,7 +25,8 @@ int HnswIndex::random_level() {
 }
 
 float HnswIndex::sim(std::size_t node, std::span<const float> q,
-                     std::span<const std::uint64_t> q_bits) const {
+                     std::span<const std::uint64_t> q_bits,
+                     std::span<const std::int8_t> q8) const {
     const Node& nd = nodes_[node];
     if (cfg_.binary && !q_bits.empty() && !nd.bits.empty()) {
         // Approximate similarity from Hamming distance over sign codes:
@@ -33,13 +34,71 @@ float HnswIndex::sim(std::size_t node, std::span<const float> q,
         std::uint32_t h = dense::hamming(nd.bits, q_bits);
         return 1.0f - 2.0f * static_cast<float>(h) / static_cast<float>(dim_);
     }
+    // SQ8 fast path: 4× fewer bytes per candidate, which on a memory-bound walk
+    // is close to 4× less waiting. Enabled only when the caller supplies a
+    // quantized query AND the index is sealed (q8_ is built there) — passed
+    // explicitly rather than stashed in scratch so a build-time walk can never
+    // pick up a stale query left behind by a previous search on this thread.
+    // The result only ORDERS candidates; search() rescores on exact floats.
+    if (!q8.empty() && !q8_.empty())
+        return static_cast<float>(dense::dot_sq8(q8_at(node), q8.data(), dim_))
+             * dense::kSq8Scale;
+
     std::size_t d = cfg_.matryoshka_dim > 0 ? std::min(cfg_.matryoshka_dim, dim_) : dim_;
     return dense::dot(std::span(store_.data() + node * dim_, d), std::span(q.data(), d));
+}
+
+void HnswIndex::seal() const {
+    if (sealed_ || nodes_.empty()) return;
+    std::size_t layers = 0;
+    for (const auto& nd : nodes_) layers = std::max(layers, nd.links.size());
+    if (layers == 0) return;
+
+    const std::size_t n = nodes_.size();
+    csr_off_.assign(layers, {});
+    csr_nbr_.assign(layers, {});
+    for (std::size_t L = 0; L < layers; ++L) {
+        auto& off = csr_off_[L];
+        off.assign(n + 1, 0);
+        // Pass 1: degree per node -> exclusive prefix sum.
+        for (std::size_t i = 0; i < n; ++i)
+            off[i + 1] = static_cast<std::uint32_t>(
+                L < nodes_[i].links.size() ? nodes_[i].links[L].size() : 0);
+        for (std::size_t i = 0; i < n; ++i) off[i + 1] += off[i];
+        // Pass 2: copy the ids into the flat block.
+        auto& nbr = csr_nbr_[L];
+        nbr.resize(off[n]);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (L >= nodes_[i].links.size()) continue;
+            const auto& src = nodes_[i].links[L];
+            std::copy(src.begin(), src.end(), nbr.begin() + off[i]);
+        }
+    }
+
+    // Quantize every vector once, here, so the walk never pays for it. Binary
+    // mode has its own (coarser) code and matryoshka wants a float prefix, so
+    // SQ8 is skipped for both rather than layering approximations.
+    if (!cfg_.binary && cfg_.matryoshka_dim == 0 && dim_ > 0) {
+        q8_.resize(n * dim_);
+        for (std::size_t i = 0; i < n; ++i)
+            dense::quantize_sq8(vec_at(i),
+                                std::span<std::int8_t>(q8_.data() + i * dim_, dim_));
+    }
+    sealed_ = true;
 }
 
 std::vector<std::uint32_t>
 HnswIndex::search_layer(std::span<const float> q, std::span<const std::uint64_t> q_bits,
                         std::uint32_t entry, int layer, std::size_t ef) const {
+    std::vector<std::uint32_t> out;
+    search_layer_into(q, q_bits, {}, entry, layer, ef, out);
+    return out;
+}
+
+void HnswIndex::search_layer_into(std::span<const float> q, std::span<const std::uint64_t> q_bits,
+                                  std::span<const std::int8_t> q8,
+                                  std::uint32_t entry, int layer, std::size_t ef,
+                                  std::vector<std::uint32_t>& out) const {
     // Two heaps over (similarity, node):
     //   cand   — max-heap by sim: the frontier, best-first expansion order.
     //   result — min-heap by sim: the running top-ef; its root is the WEAKEST
@@ -57,15 +116,8 @@ HnswIndex::search_layer(std::span<const float> q, std::span<const std::uint64_t>
     auto& result = sc.result;
 
     const std::size_t L = static_cast<std::size_t>(layer);
-    // A node only participates in `layer` if it was assigned that many levels.
-    // During a CONCURRENT build another thread may publish a taller entry point
-    // before its adjacency is filled in, so every links[] access is guarded.
-    auto links_at = [this, L](std::uint32_t n) -> const std::vector<std::uint32_t>* {
-        const auto& lk = nodes_[n].links;
-        return L < lk.size() ? &lk[L] : nullptr;
-    };
 
-    float s0 = sim(entry, q, q_bits);
+    float s0 = sim(entry, q, q_bits, q8);
     (void)sc.mark(entry);
     cand.push_back({s0, entry});
     result.push_back({s0, entry});
@@ -76,17 +128,26 @@ HnswIndex::search_layer(std::span<const float> q, std::span<const std::uint64_t>
         cand.pop_back();
         if (!result.empty() && csim < result.front().first && result.size() >= ef) break;
 
-        const std::vector<std::uint32_t>* links = links_at(cnode);
-        if (!links) continue;
+        // One span, one bounds check, contiguous ids — see the CSR note in the
+        // header. During a concurrent build another thread may publish a taller
+        // entry point before its adjacency is filled, so an empty span here is
+        // normal rather than exceptional.
+        const std::span<const std::uint32_t> links = neighbours(cnode, L);
+        if (links.empty()) continue;
+
         // Prefetch the neighbour payloads we are about to score: the graph walk
         // is pointer-chasing and this hides most of the miss latency.
-        for (std::uint32_t nb : *links)
-            if (nb < nodes_.size()) __builtin_prefetch(store_.data() + nb * dim_, 0, 1);
+        if (!q8_.empty())
+            for (std::uint32_t nb : links)
+                if (nb < nodes_.size()) __builtin_prefetch(q8_.data() + nb * dim_, 0, 1);
+        else
+            for (std::uint32_t nb : links)
+                if (nb < nodes_.size()) __builtin_prefetch(store_.data() + nb * dim_, 0, 1);
 
-        for (std::uint32_t nb : *links) {
+        for (std::uint32_t nb : links) {
             if (nb >= nodes_.size()) continue;
             if (!sc.mark(nb)) continue;
-            float s = sim(nb, q, q_bits);
+            float s = sim(nb, q, q_bits, q8);
             if (result.size() < ef) {
                 result.push_back({s, nb});
                 std::push_heap(result.begin(), result.end(), far_less);
@@ -105,10 +166,9 @@ HnswIndex::search_layer(std::span<const float> q, std::span<const std::uint64_t>
     // Drain the min-heap: sort_heap leaves it descending by similarity, which
     // is exactly the best-first order callers expect.
     std::sort_heap(result.begin(), result.end(), far_less);
-    std::vector<std::uint32_t> out;
+    out.clear();
     out.reserve(result.size());
     for (const auto& [s, n] : result) out.push_back(n);
-    return out;
 }
 
 namespace {
@@ -248,6 +308,7 @@ void HnswIndex::build_batch(std::size_t n,
                             const std::function<std::span<const float>(std::size_t)>& vec_at_fn,
                             const std::function<std::uint32_t(std::size_t)>& id_at) {
     if (n == 0) return;
+    unseal();   // the graph is about to change
 
     // ── Phase 1 (serial): stage every node. ─────────────────────────────
     // Vectors, sign codes and levels are fixed here so that phase 2 never
@@ -325,11 +386,17 @@ void HnswIndex::build_batch(std::size_t n,
             if (level > max_layer_) { max_layer_ = level; entry_ = ordinal; }
         }
     });
+
+    // The graph is final: freeze the adjacency into CSR so every subsequent
+    // query walks contiguous memory. Done once here rather than lazily on
+    // first search, so query latency has no cold-start cliff.
+    seal();
 }
 
 void HnswIndex::add(std::uint32_t id, std::span<const float> vec) {
     if (dim_ == 0) dim_ = vec.size();
     if (vec.size() != dim_ || dim_ == 0) return; // dimension mismatch: ignore
+    unseal();   // incremental insert invalidates the frozen adjacency
 
     // Re-adding a tombstoned id resurrects it (incremental upsert).
     deleted_.erase(id);
@@ -369,32 +436,54 @@ void HnswIndex::add(std::uint32_t id, std::span<const float> vec) {
 
 std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k) const {
     if (nodes_.empty() || dim_ == 0) return {};
-    std::vector<float> q(query.begin(), query.end());
-    if (q.size() != dim_) q.resize(dim_, 0.0f);
-    dense::normalize(q);
+    seal();     // memoized: no-op on every query after the first
+
+    // The query vector is the ONE unavoidable allocation per search (it must be
+    // normalized, and the caller's span is const), so it comes from thread-local
+    // scratch too rather than a fresh heap block per query.
+    Scratch& sc = scratch();
+    sc.query.assign(query.begin(), query.end());
+    if (sc.query.size() != dim_) sc.query.resize(dim_, 0.0f);
+    dense::normalize(sc.query);
+    const std::vector<float>& q = sc.query;
+    // Quantize the query once per search; passed explicitly into the walk.
+    std::span<const std::int8_t> q8;
+    if (!q8_.empty() && !cfg_.binary) {
+        sc.query_q8.resize(dim_);
+        dense::quantize_sq8(q, sc.query_q8);
+        q8 = sc.query_q8;
+    }
     std::vector<std::uint64_t> qb;
     if (cfg_.binary) qb = dense::pack_signs(q);
 
+    auto& hop = sc.hop;
     std::uint32_t cur = entry_;
     for (int lc = max_layer_; lc > 0; --lc) {
-        auto r = search_layer(q, qb, cur, lc, 1);
-        if (!r.empty()) cur = r.front();
+        search_layer_into(q, qb, q8, cur, lc, 1, hop);
+        if (!hop.empty()) cur = hop.front();
     }
     std::size_t ef = std::max(cfg_.ef_search, k);
-    auto cand = search_layer(q, qb, cur, 0, ef);
+    search_layer_into(q, qb, q8, cur, 0, ef, hop);
 
     // Rescore candidates on the FULL float vector (exact cosine) — corrects any
     // approximation introduced by matryoshka/binary during the walk.
     std::vector<Hit> hits;
-    hits.reserve(cand.size());
-    for (std::uint32_t node : cand) {
+    hits.reserve(hop.size());
+    for (std::uint32_t node : hop) {
         if (!deleted_.empty() && deleted_.count(nodes_[node].id)) continue;
         float s = dense::dot(vec_at(node), q);
         hits.push_back(Hit{ChunkId{nodes_[node].id}, Score{s}});
     }
-    std::sort(hits.begin(), hits.end(),
-        [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
-    if (hits.size() > k) hits.resize(k);
+    // Only the top k are needed, and k ≪ ef: partial_sort touches O(n log k)
+    // rather than sorting the whole candidate pool.
+    if (hits.size() > k) {
+        std::partial_sort(hits.begin(), hits.begin() + k, hits.end(),
+            [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
+        hits.resize(k);
+    } else {
+        std::sort(hits.begin(), hits.end(),
+            [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
+    }
     return hits;
 }
 

@@ -532,6 +532,96 @@ TEST(term_coverage_matches_retokenization) {
     CHECK_EQ(mismatches, std::size_t{0});
 }
 
+// ─── SQ8 quantization ────────────────────────────────────────
+TEST(sq8_dot_approximates_float_dot) {
+    std::mt19937 rng(4);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    // Sweep dims that do and don't divide the SIMD block size, so the tail
+    // handling in dot_sq8 is exercised too.
+    for (std::size_t dim : {7u, 16u, 31u, 64u, 100u, 256u}) {
+        double worst = 0.0;
+        for (int trial = 0; trial < 40; ++trial) {
+            std::vector<float> a(dim), b(dim);
+            for (auto& x : a) x = g(rng);
+            for (auto& x : b) x = g(rng);
+            rag::dense::normalize(a);
+            rag::dense::normalize(b);
+
+            std::vector<std::int8_t> qa(dim), qb(dim);
+            rag::dense::quantize_sq8(a, qa);
+            rag::dense::quantize_sq8(b, qb);
+
+            const float exact = rag::dense::dot(a, b);
+            const float approx =
+                static_cast<float>(rag::dense::dot_sq8(qa.data(), qb.data(), dim))
+                * rag::dense::kSq8Scale;
+            worst = std::max(worst, static_cast<double>(std::fabs(exact - approx)));
+        }
+        // Each component carries at most 1/254 of quantization error; summed
+        // over unit vectors the dot error stays far below 0.02 in practice.
+        CHECK(worst < 0.02);
+    }
+}
+
+TEST(sq8_walk_preserves_recall) {
+    // The SQ8 store is used to ORDER candidates during the graph walk while
+    // the reported top-k is rescored on exact floats. That is only a legitimate
+    // trade if recall is untouched, so gate it: on realistic clustered geometry
+    // at a dimension large enough that the walk is genuinely memory-bound,
+    // recall@10 must stay near-perfect.
+    constexpr std::size_t n = 3000, dim = 128, nc = 40, nq = 100, k = 10;
+    std::mt19937 rng(21);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+
+    std::vector<std::vector<float>> cent(nc, std::vector<float>(dim));
+    for (auto& c : cent) { for (auto& x : c) x = g(rng); rag::dense::normalize(c); }
+
+    std::vector<float> data(n * dim);
+    std::uniform_int_distribution<std::size_t> pick(0, nc - 1);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& c = cent[pick(rng)];
+        for (std::size_t d = 0; d < dim; ++d) data[i * dim + d] = c[d] + 0.06f * g(rng);
+        rag::dense::normalize(std::span<float>(data.data() + i * dim, dim));
+    }
+
+    rag::index::HnswIndex idx{rag::index::HnswConfig{}};
+    idx.build_batch(n,
+        [&](std::size_t i) { return std::span<const float>(data.data() + i * dim, dim); },
+        [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+
+    double hit = 0;
+    for (std::size_t q = 0; q < nq; ++q) {
+        std::vector<float> qv(dim);
+        const auto& c = cent[pick(rng)];
+        for (std::size_t d = 0; d < dim; ++d) qv[d] = c[d] + 0.06f * g(rng);
+        rag::dense::normalize(qv);
+
+        std::vector<std::pair<float, std::uint32_t>> exact;
+        exact.reserve(n);
+        for (std::size_t i = 0; i < n; ++i)
+            exact.emplace_back(
+                rag::dense::dot(std::span<const float>(data.data() + i * dim, dim), qv),
+                static_cast<std::uint32_t>(i));
+        std::partial_sort(exact.begin(), exact.begin() + k, exact.end(),
+                          [](auto& a, auto& b) { return a.first > b.first; });
+
+        for (const auto& h : idx.search(qv, k))
+            for (std::size_t j = 0; j < k; ++j)
+                if (exact[j].second == h.chunk.get()) { hit += 1; break; }
+    }
+    const double recall = hit / (nq * k);
+    CHECK(recall > 0.95);
+
+    // And the scores handed back must be EXACT cosines, not quantized ones:
+    // SQ8 is a traversal accelerator, never a scoring approximation.
+    std::vector<float> qv(data.begin(), data.begin() + dim);
+    auto hits = idx.search(qv, 3);
+    REQUIRE(!hits.empty());
+    const float exact_self =
+        rag::dense::dot(std::span<const float>(data.data(), dim), qv);
+    CHECK(std::fabs(hits[0].score.get() - exact_self) < 1e-5f);
+}
+
 // ─── Persistence container round-trip ──────────────────────────────────
 TEST(container_roundtrip_and_crc) {
     rag::store::Container c;

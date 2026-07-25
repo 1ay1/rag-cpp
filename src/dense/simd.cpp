@@ -119,6 +119,66 @@ void normalize(std::span<float> v) noexcept {
     for (float& x : v) x *= inv;
 }
 
+// ─── SQ8 ───────────────────────────────────────────────────────────────
+void quantize_sq8(std::span<const float> v, std::span<std::int8_t> out) noexcept {
+    const std::size_t n = v.size() < out.size() ? v.size() : out.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        // Round-to-nearest, then clamp: a component slightly outside [-1,1]
+        // (numerical drift in normalize) must not wrap around.
+        float s = v[i] * 127.0f;
+        s = s < -127.0f ? -127.0f : (s > 127.0f ? 127.0f : s);
+        out[i] = static_cast<std::int8_t>(s < 0 ? s - 0.5f : s + 0.5f);
+    }
+}
+
+std::int32_t dot_sq8(const std::int8_t* a, const std::int8_t* b, std::size_t n) noexcept {
+#if defined(RAGCPP_NEON)
+    {
+        // Widening multiply-accumulate: 16 int8 lanes per iteration, accumulated
+        // into int32 so nothing can overflow (worst case 127*127*dim ≪ 2^31).
+        int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
+        std::size_t i = 0;
+        for (; i + 16 <= n; i += 16) {
+            const int8x16_t va = vld1q_s8(a + i);
+            const int8x16_t vb = vld1q_s8(b + i);
+            int16x8_t p0 = vmull_s8(vget_low_s8(va),  vget_low_s8(vb));
+            int16x8_t p1 = vmull_s8(vget_high_s8(va), vget_high_s8(vb));
+            acc0 = vpadalq_s16(acc0, p0);
+            acc1 = vpadalq_s16(acc1, p1);
+        }
+        std::int32_t sum = vaddvq_s32(vaddq_s32(acc0, acc1));
+        for (; i < n; ++i)
+            sum += static_cast<std::int32_t>(a[i]) * static_cast<std::int32_t>(b[i]);
+        return sum;
+    }
+#elif defined(RAGCPP_X86)
+    if (has_avx2()) {
+        __m256i acc = _mm256_setzero_si256();
+        std::size_t i = 0;
+        for (; i + 32 <= n; i += 32) {
+            const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+            const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+            // Sign-extend to int16 and multiply-add pairs into int32.
+            const __m256i alo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
+            const __m256i blo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
+            const __m256i ahi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
+            const __m256i bhi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(alo, blo));
+            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(ahi, bhi));
+        }
+        alignas(32) std::int32_t buf[8];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(buf), acc);
+        std::int32_t sum = buf[0]+buf[1]+buf[2]+buf[3]+buf[4]+buf[5]+buf[6]+buf[7];
+        for (; i < n; ++i) sum += static_cast<std::int32_t>(a[i]) * static_cast<std::int32_t>(b[i]);
+        return sum;
+    }
+#endif
+    std::int32_t s = 0;
+    for (std::size_t i = 0; i < n; ++i)
+        s += static_cast<std::int32_t>(a[i]) * static_cast<std::int32_t>(b[i]);
+    return s;
+}
+
 float cosine(std::span<const float> a, std::span<const float> b) noexcept {
     float na = std::sqrt(dot(a, a));
     float nb = std::sqrt(dot(b, b));

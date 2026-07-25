@@ -139,8 +139,56 @@ private:
     // reallocates while readers hold spans into it. Do not push into store_
     // from a parallel phase.
     std::vector<float> store_;
+
+    // ── SQ8 mirror of `store_` ──────────────────────────────────────
+    // The walk is memory-bound: it touches ~1100 random vectors per query, and
+    // at 256 dims each is 1 KiB, so past cache it is a DRAM-latency benchmark
+    // (measured 46 ns/distance at dim=32 vs 236 ns at dim=512 on the same graph
+    // shape). q8_ holds the same vectors as int8, a 4× smaller footprint that
+    // keeps 4× more of the corpus resident and moves 4× fewer bytes per hop.
+    //
+    // It is used ONLY to order candidates during traversal. The final top-k is
+    // always rescored against the exact float vectors in `store_`, so SQ8
+    // affects which candidates are considered, never the scores reported — and
+    // the graph is robust to that: neighbour ordering barely changes under an
+    // error of ~1/127, and the ef-sized pool absorbs what does.
+    //
+    // Built by seal() alongside the CSR, dropped by unseal().
+    mutable std::vector<std::int8_t> q8_;
+
+    // ── Sealed adjacency (CSR) ────────────────────────────────────
+    // `nodes_[n].links[L]` is a vector-of-vectors: reaching one neighbour list
+    // costs two dependent loads (node header, then the layer's heap block) and
+    // scatters the graph across the allocator. That is fine while BUILDING,
+    // where lists are mutated constantly — but a finished index is read-only,
+    // and the walk is the hottest loop in the library.
+    //
+    // So once the graph stops changing we seal it into compressed-sparse-row
+    // form: all of layer L's neighbour ids for every node, contiguous, indexed
+    // by an offset table. One load gets the offsets, one gets the ids, and
+    // consecutive neighbours share cache lines. `seal()` builds it; any
+    // mutation (add/remove/build_batch) drops it via unseal().
+    //
+    // Layout: csr_off_[L] has size()+1 entries; node n's layer-L neighbours are
+    // csr_nbr_[L][csr_off_[L][n] .. csr_off_[L][n+1]).
+    //
+    // Mutable because sealing is pure memoization of `nodes_[].links`, not
+    // observable state: a sealed and an unsealed index answer every query
+    // identically. That lets the const search path seal on demand, so a caller
+    // who inserts incrementally pays for it ONCE on the next query rather than
+    // once per insert (which would make incremental add quadratic).
+    mutable std::vector<std::vector<std::uint32_t>> csr_off_;
+    mutable std::vector<std::vector<std::uint32_t>> csr_nbr_;
+    mutable bool sealed_ = false;
+
     std::unordered_set<std::uint32_t> deleted_;  // tombstoned ids (soft-delete)
     mutable std::mt19937_64 rng_{cfg_.seed};
+
+    // Build the CSR mirror of `nodes_[].links`. Idempotent; cheap relative to
+    // the build that produced the graph (one pass to count, one to fill).
+    void seal() const;
+    // Drop the CSR mirror because the graph is about to change.
+    void unseal() noexcept { sealed_ = false; csr_off_.clear(); csr_nbr_.clear(); q8_.clear(); }
 
     [[nodiscard]] std::span<const float> vec_at(std::size_t n) const noexcept {
         return {store_.data() + n * dim_, dim_};
@@ -148,10 +196,39 @@ private:
     [[nodiscard]] std::span<float> vec_at(std::size_t n) noexcept {
         return {store_.data() + n * dim_, dim_};
     }
+    [[nodiscard]] const std::int8_t* q8_at(std::size_t n) const noexcept {
+        return q8_.data() + n * dim_;
+    }
 
     [[nodiscard]] int  random_level();
+    // `q8` is the SQ8-quantized query, or empty to score on exact floats.
     [[nodiscard]] float sim(std::size_t node_a, std::span<const float> q,
-                            std::span<const std::uint64_t> q_bits) const;
+                            std::span<const std::uint64_t> q_bits,
+                            std::span<const std::int8_t> q8 = {}) const;
+
+    // Neighbours of `n` in layer `L`, or {} if it does not reach that layer.
+    // Reads the sealed CSR when available and falls back to the mutable
+    // vector-of-vectors during a build.
+    [[nodiscard]] std::span<const std::uint32_t>
+    neighbours(std::uint32_t n, std::size_t L) const noexcept {
+        if (sealed_) {
+            if (L >= csr_off_.size()) return {};
+            const auto& off = csr_off_[L];
+            if (n + 1 >= off.size()) return {};
+            return {csr_nbr_[L].data() + off[n], off[n + 1] - off[n]};
+        }
+        const auto& lk = nodes_[n].links;
+        if (L >= lk.size()) return {};
+        return {lk[L].data(), lk[L].size()};
+    }
+
+    // search_layer writes its result into caller-provided scratch instead of
+    // returning a fresh vector: at ef_search=64 the return allocation was a
+    // per-query malloc/free pair on the hottest path in the library.
+    void search_layer_into(std::span<const float> q, std::span<const std::uint64_t> q_bits,
+                           std::span<const std::int8_t> q8,
+                           std::uint32_t entry, int layer, std::size_t ef,
+                           std::vector<std::uint32_t>& out) const;
     [[nodiscard]] std::vector<std::uint32_t>
     search_layer(std::span<const float> q, std::span<const std::uint64_t> q_bits,
                  std::uint32_t entry, int layer, std::size_t ef) const;
@@ -181,6 +258,9 @@ private:
         std::uint32_t             epoch = 0;
         std::vector<std::pair<float, std::uint32_t>> cand;    // max-heap by sim
         std::vector<std::pair<float, std::uint32_t>> result;  // min-heap by sim
+        std::vector<std::uint32_t> hop;                       // search_layer output reuse
+        std::vector<float>         query;                     // normalized query vector
+        std::vector<std::int8_t>   query_q8;                  // SQ8 of the same
 
         void reset(std::size_t n) {
             if (visit_epoch.size() < n) visit_epoch.assign(n, 0);
