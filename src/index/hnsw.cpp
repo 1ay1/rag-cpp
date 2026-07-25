@@ -26,7 +26,8 @@ int HnswIndex::random_level() {
 
 float HnswIndex::sim(std::size_t node, std::span<const float> q,
                      std::span<const std::uint64_t> q_bits,
-                     std::span<const std::int8_t> q8) const {
+                     std::span<const std::int8_t> q8,
+                     std::span<const float> adc) const {
     const Node& nd = nodes_[node];
     if (cfg_.binary && !q_bits.empty() && !nd.bits.empty()) {
         // Approximate similarity from Hamming distance over sign codes:
@@ -34,6 +35,11 @@ float HnswIndex::sim(std::size_t node, std::span<const float> q,
         std::uint32_t h = dense::hamming(nd.bits, q_bits);
         return 1.0f - 2.0f * static_cast<float>(h) / static_cast<float>(dim_);
     }
+    // PQ fast path: m bytes per candidate (m ≪ dim), scored by m table lookups.
+    // Checked before SQ8 because it is the coarser, cheaper rung — if the
+    // caller asked for PQ they asked for the smaller footprint.
+    if (!adc.empty() && !pq_codes_.empty())
+        return pq_.adc_score(std::span<const std::uint8_t>(pq_at(node), pq_m_), adc);
     // SQ8 fast path: 4× fewer bytes per candidate, which on a memory-bound walk
     // is close to 4× less waiting. Enabled only when the caller supplies a
     // quantized query AND the index is sealed (q8_ is built there) — passed
@@ -75,29 +81,139 @@ void HnswIndex::seal() const {
         }
     }
 
+    // PQ codec, when requested. Trained here rather than in build_batch so it
+    // also covers incrementally-added vectors, and because it needs the whole
+    // (finished) arena to train on.
+    const bool want_pq = cfg_.pq_codes > 0 && !cfg_.binary && cfg_.matryoshka_dim == 0
+                      && dim_ > 0 && cfg_.pq_codes <= dim_ && dim_ % cfg_.pq_codes == 0;
+    if (want_pq && pq_codes_.size() != n * cfg_.pq_codes && !floats_dropped_) {
+        // Train on a bounded sample: k-means cost is linear in the sample size
+        // and the codebook converges long before the whole corpus is needed,
+        // so a 100k-vector cap keeps sealing a large index from becoming the
+        // dominant cost of building it.
+        constexpr std::size_t kMaxTrain = 100'000;
+        const std::size_t ntrain = std::min(n, kMaxTrain);
+        auto pq = ProductQuantizer::train_flat(
+            std::span<const float>(store_.data(), ntrain * dim_), ntrain, dim_,
+            PqConfig{.m = cfg_.pq_codes, .ksub = 256, .iters = 15, .seed = cfg_.seed});
+        if (pq) {
+            pq_   = std::move(*pq);
+            pq_m_ = cfg_.pq_codes;
+            pq_codes_.resize(n * pq_m_);
+            pq_.encode_flat(std::span<const float>(store_.data(), n * dim_), n, pq_codes_);
+        }
+        // On training failure pq_codes_ stays empty and the walk simply falls
+        // back to SQ8 — a worse footprint, never a wrong answer.
+    }
+
     // Quantize every vector once, here, so the walk never pays for it. Skipped
     // when build_batch already did it. Binary mode has its own (coarser) code
     // and matryoshka wants a float prefix, so SQ8 is skipped for both rather
     // than layering approximations.
-    if (q8_.size() != n * dim_ && !cfg_.binary && cfg_.matryoshka_dim == 0 && dim_ > 0) {
+    //
+    // With PQ driving the walk, SQ8 changes role: it is no longer the walk
+    // codec but the RESCORE codec. Those two jobs want opposite things — the
+    // walk wants the fewest bytes it can order candidates with, the rescore
+    // wants the most precision it can afford — and serving both from one
+    // representation is what made pure-PQ recall collapse. So keep SQ8 only
+    // when it is actually needed for rescoring (i.e. the floats are going
+    // away); otherwise it would be dead weight the walk never reads.
+    const bool pq_active   = !pq_codes_.empty();
+    const bool need_sq8    = !cfg_.binary && cfg_.matryoshka_dim == 0 && dim_ > 0
+                          && (!pq_active || cfg_.drop_floats);
+    if (need_sq8 && q8_.size() != n * dim_ && !store_.empty()) {
         q8_.resize(n * dim_);
         for (std::size_t i = 0; i < n; ++i)
             dense::quantize_sq8(vec_at(i),
                                 std::span<std::int8_t>(q8_.data() + i * dim_, dim_));
+    } else if (!need_sq8 && !q8_.empty()) {
+        q8_.clear();
+        q8_.shrink_to_fit();
+    }
+
+    // Release the exact vectors if the caller opted in. Requires SOMETHING to
+    // have replaced them — dropping the floats with no codec would empty the
+    // index — so this is a no-op under binary/matryoshka, where neither mirror
+    // is built.
+    if (cfg_.drop_floats && !floats_dropped_ && (!q8_.empty() || !pq_codes_.empty())) {
+        store_.clear();
+        store_.shrink_to_fit();
+        floats_dropped_ = true;
+    }
+
+    // Release the per-node adjacency: the CSR built above is a complete,
+    // authoritative copy of it, so keeping both doubles the cost of the graph
+    // for nothing. That is worth more than it sounds — once vectors are
+    // compressed the adjacency IS the index (at pq_codes=32 the codes are 32
+    // B/vector against ~310 B of adjacency), so this halves the dominant term.
+    // unseal() restores it from the CSR if the graph is ever mutated again.
+    for (auto& nd : nodes_) {
+        nd.links.clear();
+        nd.links.shrink_to_fit();
     }
     sealed_ = true;
+}
+
+void HnswIndex::unpack_links() const {
+    if (!sealed_ || csr_off_.empty()) return;
+    const std::size_t n = nodes_.size();
+    for (std::size_t i = 0; i < n; ++i) {
+        // Highest layer this node actually reaches, so the restored shape
+        // matches what the build produced rather than padding every node to
+        // the tallest one.
+        std::size_t top = 0;
+        for (std::size_t L = 0; L < csr_off_.size(); ++L) {
+            const auto& off = csr_off_[L];
+            if (i + 1 < off.size() && off[i + 1] > off[i]) top = L + 1;
+        }
+        nodes_[i].links.assign(top, {});
+        for (std::size_t L = 0; L < top; ++L) {
+            const auto& off = csr_off_[L];
+            if (i + 1 >= off.size()) continue;
+            nodes_[i].links[L].assign(csr_nbr_[L].begin() + off[i],
+                                      csr_nbr_[L].begin() + off[i + 1]);
+        }
+    }
+}
+
+// The final-ranking score for one candidate. Walks a precision ladder and
+// takes the most accurate rung still available:
+//
+//   floats  — exact cosine; always present unless drop_floats was set
+//   SQ8     — ~1/127 per component; enough to reproduce the exact top-k order
+//             almost always (measured: 1.000 of the true top-10 land in the
+//             SQ8 top-32 on 50k vectors)
+//   PQ      — reconstruction from m centroids; the walk codec, far too coarse
+//             to decide the FINAL order (it puts only ~0.53 of the true top-10
+//             in its own top-10), and used only if nothing better survives
+//
+// Keeping this ladder distinct from the WALK codec is the whole trick: the
+// walk wants minimum bytes, the rescore wants maximum precision, and using one
+// representation for both is what collapses recall.
+float HnswIndex::rescore(std::uint32_t node, const std::vector<float>& q,
+                         std::span<const std::int8_t> q8, Scratch& sc) const {
+    if (!store_.empty()) return dense::dot(vec_at(node), q);
+    if (!q8_.empty() && !q8.empty())
+        return static_cast<float>(dense::dot_sq8(q8_at(node), q8.data(), dim_))
+             * dense::kSq8Scale;
+    if (!pq_codes_.empty()) {
+        pq_.decode_into(std::span<const std::uint8_t>(pq_at(node), pq_m_), sc.recon);
+        return dense::dot(sc.recon, q);
+    }
+    return 0.0f;
 }
 
 std::vector<std::uint32_t>
 HnswIndex::search_layer(std::span<const float> q, std::span<const std::uint64_t> q_bits,
                         std::uint32_t entry, int layer, std::size_t ef) const {
     std::vector<std::uint32_t> out;
-    search_layer_into(q, q_bits, {}, entry, layer, ef, out);
+    search_layer_into(q, q_bits, {}, {}, entry, layer, ef, out);
     return out;
 }
 
 void HnswIndex::search_layer_into(std::span<const float> q, std::span<const std::uint64_t> q_bits,
                                   std::span<const std::int8_t> q8,
+                                  std::span<const float> adc,
                                   std::uint32_t entry, int layer, std::size_t ef,
                                   std::vector<std::uint32_t>& out) const {
     // Two heaps over (similarity, node):
@@ -118,7 +234,7 @@ void HnswIndex::search_layer_into(std::span<const float> q, std::span<const std:
 
     const std::size_t L = static_cast<std::size_t>(layer);
 
-    float s0 = sim(entry, q, q_bits, q8);
+    float s0 = sim(entry, q, q_bits, q8, adc);
     (void)sc.mark(entry);
     cand.push_back({s0, entry});
     result.push_back({s0, entry});
@@ -137,8 +253,13 @@ void HnswIndex::search_layer_into(std::span<const float> q, std::span<const std:
         if (links.empty()) continue;
 
         // Prefetch the neighbour payloads we are about to score: the graph walk
-        // is pointer-chasing and this hides most of the miss latency.
-        if (!q8_.empty())
+        // is pointer-chasing and this hides most of the miss latency. Prefetch
+        // whichever representation sim() will actually read, in the same order
+        // it checks them.
+        if (!pq_codes_.empty() && !adc.empty())
+            for (std::uint32_t nb : links)
+                if (nb < nodes_.size()) __builtin_prefetch(pq_codes_.data() + nb * pq_m_, 0, 1);
+        else if (!q8_.empty())
             for (std::uint32_t nb : links)
                 if (nb < nodes_.size()) __builtin_prefetch(q8_.data() + nb * dim_, 0, 1);
         else
@@ -148,7 +269,7 @@ void HnswIndex::search_layer_into(std::span<const float> q, std::span<const std:
         for (std::uint32_t nb : links) {
             if (nb >= nodes_.size()) continue;
             if (!sc.mark(nb)) continue;
-            float s = sim(nb, q, q_bits, q8);
+            float s = sim(nb, q, q_bits, q8, adc);
             if (result.size() < ef) {
                 result.push_back({s, nb});
                 std::push_heap(result.begin(), result.end(), far_less);
@@ -414,11 +535,13 @@ void HnswIndex::build_batch(std::size_t n,
 
         std::vector<std::uint32_t> hop;
         for (int lc = top; lc > level; --lc) {
-            search_layer_into(q, qb, q8, cur, lc, 1, hop);
+            // No ADC during construction: PQ is trained in seal(), after the
+            // graph exists, so the build always walks on SQ8/floats.
+            search_layer_into(q, qb, q8, {}, cur, lc, 1, hop);
             if (!hop.empty()) cur = hop.front();
         }
         for (int lc = std::min(level, top); lc >= 0; --lc) {
-            search_layer_into(q, qb, q8, cur, lc, cfg_.ef_construction, hop);
+            search_layer_into(q, qb, q8, {}, cur, lc, cfg_.ef_construction, hop);
             if (!hop.empty()) cur = hop.front();
             connect_locked(ordinal, lc, hop, locks);
         }
@@ -495,26 +618,36 @@ std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k) 
         dense::quantize_sq8(q, sc.query_q8);
         q8 = sc.query_q8;
     }
+    // Likewise the PQ lookup table: built once per query (m·256 dot products of
+    // dsub floats), then every candidate costs m lookups instead of a dot
+    // product over dim floats.
+    std::span<const float> adc;
+    if (!pq_codes_.empty() && !cfg_.binary) {
+        sc.adc = pq_.adc_table(q);
+        adc = sc.adc;
+    }
     std::vector<std::uint64_t> qb;
     if (cfg_.binary) qb = dense::pack_signs(q);
 
     auto& hop = sc.hop;
     std::uint32_t cur = entry_;
     for (int lc = max_layer_; lc > 0; --lc) {
-        search_layer_into(q, qb, q8, cur, lc, 1, hop);
+        search_layer_into(q, qb, q8, adc, cur, lc, 1, hop);
         if (!hop.empty()) cur = hop.front();
     }
     std::size_t ef = std::max(cfg_.ef_search, k);
-    search_layer_into(q, qb, q8, cur, 0, ef, hop);
+    search_layer_into(q, qb, q8, adc, cur, 0, ef, hop);
 
     // Rescore candidates on the FULL float vector (exact cosine) — corrects any
-    // approximation introduced by matryoshka/binary during the walk.
+    // approximation introduced by matryoshka/binary/SQ8/PQ during the walk.
+    // With the floats dropped, fall back to the most precise representation
+    // still present: SQ8 (~1/127 per component) before a PQ reconstruction,
+    // which is far coarser and would otherwise decide the final ranking.
     std::vector<Hit> hits;
     hits.reserve(hop.size());
     for (std::uint32_t node : hop) {
         if (!deleted_.empty() && deleted_.count(nodes_[node].id)) continue;
-        float s = dense::dot(vec_at(node), q);
-        hits.push_back(Hit{ChunkId{nodes_[node].id}, Score{s}});
+        hits.push_back(Hit{ChunkId{nodes_[node].id}, Score{rescore(node, q, q8, sc)}});
     }
     // Only the top k are needed, and k ≪ ef: partial_sort touches O(n log k)
     // rather than sorting the whole candidate pool.
@@ -559,38 +692,63 @@ std::vector<Hit> HnswIndex::search_filtered(std::span<const float> query, std::s
                                             const AllowFn& allow, float ef_boost) const {
     if (!allow) return search(query, k);
     if (nodes_.empty() || dim_ == 0) return {};
-    std::vector<float> q(query.begin(), query.end());
-    if (q.size() != dim_) q.resize(dim_, 0.0f);
-    dense::normalize(q);
+    seal();
+
+    // Same scratch/quantization protocol as search(): the filtered path was
+    // walking on raw floats with a freshly allocated query vector, so a
+    // metadata-filtered query paid several times the latency of an unfiltered
+    // one for no reason — the filter applies at rescore, not during the walk.
+    Scratch& sc = scratch();
+    sc.query.assign(query.begin(), query.end());
+    if (sc.query.size() != dim_) sc.query.resize(dim_, 0.0f);
+    dense::normalize(sc.query);
+    const std::vector<float>& q = sc.query;
+
+    std::span<const std::int8_t> q8;
+    if (!q8_.empty() && !cfg_.binary) {
+        sc.query_q8.resize(dim_);
+        dense::quantize_sq8(q, sc.query_q8);
+        q8 = sc.query_q8;
+    }
+    std::span<const float> adc;
+    if (!pq_codes_.empty() && !cfg_.binary) {
+        sc.adc = pq_.adc_table(q);
+        adc = sc.adc;
+    }
     std::vector<std::uint64_t> qb;
     if (cfg_.binary) qb = dense::pack_signs(q);
 
     // Descend the upper layers greedily (unfiltered — pure navigation).
+    auto& hop = sc.hop;
     std::uint32_t cur = entry_;
     for (int lc = max_layer_; lc > 0; --lc) {
-        auto r = search_layer(q, qb, cur, lc, 1);
-        if (!r.empty()) cur = r.front();
+        search_layer_into(q, qb, q8, adc, cur, lc, 1, hop);
+        if (!hop.empty()) cur = hop.front();
     }
     // Widen the base-layer beam so a selective filter still yields k results.
     std::size_t ef = static_cast<std::size_t>(
         std::max<float>(static_cast<float>(std::max(cfg_.ef_search, k)) * std::max(1.0f, ef_boost),
                         static_cast<float>(k)));
     ef = std::min(ef, nodes_.size());
-    auto cand = search_layer(q, qb, cur, 0, ef);
+    search_layer_into(q, qb, q8, adc, cur, 0, ef, hop);
 
     // Rescore on the full vector, keeping only ALLOWED candidates.
     std::vector<Hit> hits;
-    hits.reserve(cand.size());
-    for (std::uint32_t node : cand) {
+    hits.reserve(hop.size());
+    for (std::uint32_t node : hop) {
         std::uint32_t id = nodes_[node].id;
         if (!allow(id)) continue;
         if (!deleted_.empty() && deleted_.count(id)) continue;
-        float s = dense::dot(vec_at(node), q);
-        hits.push_back(Hit{ChunkId{id}, Score{s}});
+        hits.push_back(Hit{ChunkId{id}, Score{rescore(node, q, q8, sc)}});
     }
-    std::sort(hits.begin(), hits.end(),
-        [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
-    if (hits.size() > k) hits.resize(k);
+    if (hits.size() > k) {
+        std::partial_sort(hits.begin(), hits.begin() + k, hits.end(),
+            [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
+        hits.resize(k);
+    } else {
+        std::sort(hits.begin(), hits.end(),
+            [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
+    }
     return hits;
 }
 
@@ -599,7 +757,11 @@ std::vector<Hit> HnswIndex::search_filtered(std::span<const float> query, std::s
 // ─────────────────────────────────────────────────────────────────────────────
 namespace {
 constexpr std::uint32_t kMagic   = 0x31574E48; // "HNW1"
-constexpr std::uint32_t kVersion = 1;
+// v2: the config is written FIELD BY FIELD instead of memcpy'ing the struct,
+// and PQ state is persisted. Blindly memcpy'ing HnswConfig meant that adding
+// any tuning knob silently changed the blob layout and invalidated every index
+// on disk with nothing but a length mismatch to show for it.
+constexpr std::uint32_t kVersion = 2;
 template <class T> void put(std::string& o, const T& v) {
     static_assert(std::is_trivially_copyable_v<T>);
     const char* p = reinterpret_cast<const char*>(&v); o.append(p, p + sizeof(T));
@@ -608,24 +770,74 @@ template <class T> bool get(std::string_view& in, T& v) {
     if (in.size() < sizeof(T)) return false;
     std::memcpy(&v, in.data(), sizeof(T)); in.remove_prefix(sizeof(T)); return true;
 }
+
+void put_cfg(std::string& o, const HnswConfig& c) {
+    put<std::uint64_t>(o, c.M);
+    put<std::uint64_t>(o, c.ef_construction);
+    put<std::uint64_t>(o, c.ef_search);
+    put<float>(o, c.ml);
+    put<std::uint64_t>(o, c.matryoshka_dim);
+    put<std::uint8_t>(o, c.binary ? 1 : 0);
+    put<std::uint64_t>(o, c.pq_codes);
+    put<std::uint8_t>(o, c.drop_floats ? 1 : 0);
+    put<std::uint64_t>(o, c.seed);
+}
+
+bool get_cfg(std::string_view& in, HnswConfig& c) {
+    std::uint64_t m, efc, efs, mat, pqc, seed;
+    float ml;
+    std::uint8_t bin, drop;
+    if (!get(in, m) || !get(in, efc) || !get(in, efs) || !get(in, ml) || !get(in, mat)
+        || !get(in, bin) || !get(in, pqc) || !get(in, drop) || !get(in, seed))
+        return false;
+    c.M = m; c.ef_construction = efc; c.ef_search = efs; c.ml = ml;
+    c.matryoshka_dim = mat; c.binary = bin != 0;
+    c.pq_codes = pqc; c.drop_floats = drop != 0; c.seed = seed;
+    return true;
+}
 } // namespace
 
 std::string HnswIndex::serialize() const {
+    // The wire format is per-node link lists, but a sealed index keeps its
+    // adjacency only in CSR form, so materialize it first. Cheap relative to
+    // writing the blob, and it keeps the format independent of which internal
+    // representation happens to be live.
+    if (sealed_) unpack_links();
+
     std::string o;
     put(o, kMagic); put(o, kVersion);
-    put(o, cfg_);
+    put_cfg(o, cfg_);
     put<std::uint64_t>(o, dim_);
     put<std::int32_t>(o, max_layer_);
     put(o, entry_);
     put<std::uint32_t>(o, static_cast<std::uint32_t>(nodes_.size()));
+
+    // When the floats were dropped the PQ codes ARE the vectors, so they must
+    // be persisted or the index would reload empty. A flag rather than an
+    // implied state, so deserialize() never has to guess.
+    const bool store_pq = floats_dropped_ && !pq_codes_.empty();
+    put<std::uint8_t>(o, store_pq ? 1 : 0);
+    if (store_pq) {
+        std::string pqblob = pq_.serialize();
+        put<std::uint64_t>(o, pqblob.size());
+        o.append(pqblob);
+        put<std::uint64_t>(o, pq_m_);
+        put<std::uint64_t>(o, pq_codes_.size());
+        o.append(reinterpret_cast<const char*>(pq_codes_.data()), pq_codes_.size());
+    }
+
     for (std::size_t i = 0; i < nodes_.size(); ++i) {
         const auto& nd = nodes_[i];
         put(o, nd.id);
-        // Wire format is unchanged (per-node length + payload) even though the
-        // in-memory layout is now one arena: the blob stays readable by any
-        // build, and dim_ is already in the header for the fast path.
-        put<std::uint32_t>(o, static_cast<std::uint32_t>(dim_));
-        o.append(reinterpret_cast<const char*>(store_.data() + i * dim_), dim_ * sizeof(float));
+        // Wire format keeps the per-node length + payload shape even though the
+        // in-memory layout is one arena: the blob stays self-describing, and
+        // dim_ is already in the header for the fast path. With the floats
+        // dropped the payload is zero-length and the codes above carry the
+        // vectors instead.
+        const std::uint32_t vlen = store_pq ? 0u : static_cast<std::uint32_t>(dim_);
+        put<std::uint32_t>(o, vlen);
+        if (vlen)
+            o.append(reinterpret_cast<const char*>(store_.data() + i * dim_), dim_ * sizeof(float));
         put<std::uint32_t>(o, static_cast<std::uint32_t>(nd.links.size()));
         for (const auto& layer : nd.links) {
             put<std::uint32_t>(o, static_cast<std::uint32_t>(layer.size()));
@@ -640,25 +852,50 @@ Result<HnswIndex> HnswIndex::deserialize(std::string_view in) {
     std::uint32_t magic, version;
     if (!get(in, magic) || magic != kMagic)       return fail<HnswIndex>(Errc::corrupt_index, "hnsw magic");
     if (!get(in, version) || version != kVersion)  return fail<HnswIndex>(Errc::corrupt_index, "hnsw version");
-    if (!get(in, idx.cfg_)) return fail<HnswIndex>(Errc::corrupt_index, "cfg");
+    if (!get_cfg(in, idx.cfg_)) return fail<HnswIndex>(Errc::corrupt_index, "cfg");
     std::uint64_t dim; std::int32_t maxl; std::uint32_t entry, ncount;
     if (!get(in, dim) || !get(in, maxl) || !get(in, entry) || !get(in, ncount))
         return fail<HnswIndex>(Errc::corrupt_index, "header");
     idx.dim_ = dim; idx.max_layer_ = maxl; idx.entry_ = entry;
     idx.nodes_.resize(ncount);
-    idx.store_.assign(static_cast<std::size_t>(ncount) * idx.dim_, 0.0f);
+
+    std::uint8_t store_pq = 0;
+    if (!get(in, store_pq)) return fail<HnswIndex>(Errc::corrupt_index, "pq flag");
+    if (store_pq) {
+        std::uint64_t blen;
+        if (!get(in, blen) || in.size() < blen) return fail<HnswIndex>(Errc::corrupt_index, "pq blob");
+        auto pq = ProductQuantizer::deserialize(in.substr(0, blen));
+        if (!pq) return std::unexpected(pq.error());
+        idx.pq_ = std::move(*pq);
+        in.remove_prefix(blen);
+        std::uint64_t pm, clen;
+        if (!get(in, pm) || !get(in, clen) || in.size() < clen)
+            return fail<HnswIndex>(Errc::corrupt_index, "pq codes");
+        idx.pq_m_ = pm;
+        idx.pq_codes_.assign(in.begin(), in.begin() + clen);
+        in.remove_prefix(clen);
+        // The floats are genuinely absent from the blob; reconstruct-on-rescore
+        // is the contract this index was saved with.
+        idx.floats_dropped_ = true;
+    } else {
+        idx.store_.assign(static_cast<std::size_t>(ncount) * idx.dim_, 0.0f);
+    }
+
     for (std::uint32_t i = 0; i < ncount; ++i) {
         auto& nd = idx.nodes_[i];
         std::uint32_t vlen;
         if (!get(in, nd.id) || !get(in, vlen)) return fail<HnswIndex>(Errc::corrupt_index, "node");
-        if (vlen != idx.dim_) return fail<HnswIndex>(Errc::corrupt_index, "vec dim");
-        if (in.size() < vlen * sizeof(float)) return fail<HnswIndex>(Errc::corrupt_index, "vec");
-        std::memcpy(idx.store_.data() + static_cast<std::size_t>(i) * idx.dim_,
-                    in.data(), vlen * sizeof(float));
-        in.remove_prefix(vlen * sizeof(float));
-        if (idx.cfg_.binary)
-            nd.bits = dense::pack_signs(
-                std::span<const float>(idx.store_.data() + static_cast<std::size_t>(i) * idx.dim_, idx.dim_));
+        if (vlen) {
+            if (vlen != idx.dim_) return fail<HnswIndex>(Errc::corrupt_index, "vec dim");
+            if (in.size() < vlen * sizeof(float)) return fail<HnswIndex>(Errc::corrupt_index, "vec");
+            std::memcpy(idx.store_.data() + static_cast<std::size_t>(i) * idx.dim_,
+                        in.data(), vlen * sizeof(float));
+            in.remove_prefix(vlen * sizeof(float));
+            if (idx.cfg_.binary)
+                nd.bits = dense::pack_signs(
+                    std::span<const float>(idx.store_.data() + static_cast<std::size_t>(i) * idx.dim_,
+                                           idx.dim_));
+        }
         std::uint32_t nlayers;
         if (!get(in, nlayers)) return fail<HnswIndex>(Errc::corrupt_index, "nlayers");
         nd.links.resize(nlayers);

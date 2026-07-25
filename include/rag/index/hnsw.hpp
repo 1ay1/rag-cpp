@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "rag/core/types.hpp"
+#include "rag/index/pq.hpp"
 
 namespace rag::index {
 
@@ -42,6 +43,48 @@ struct HnswConfig {
     float       ml              = 0.0f;  // level multiplier; 0 => 1/ln(M)
     std::size_t matryoshka_dim  = 0;     // >0: walk on this leading-dim prefix
     bool        binary          = false; // 1-bit sign codes for the walk
+    // >0: walk on Product Quantization codes of this many bytes per vector
+    // (must divide dim). PQ splits a vector into m subspaces and stores each as
+    // one byte (its nearest of 256 centroids), so a vector costs m bytes
+    // regardless of dim, and a candidate is scored by m table lookups.
+    //
+    // MEASURED (100k vectors, dim=256, realistic decaying-spectrum geometry,
+    // recall@10 vs exact brute force, all with drop_floats):
+    //
+    //   config             recall@10   us/query   bytes/vector
+    //   sq8 only              0.941       63          460
+    //   pq_codes=32 ef=64     0.896       70          492
+    //   pq_codes=32 ef=128    0.936      110          492
+    //   pq_codes=16 ef=64     0.635       54          476
+    //
+    // Read that carefully before enabling this: at 100k vectors PQ LOSES to
+    // plain SQ8 on every axis. The reason is structural — PQ codes are too
+    // coarse to rank the final top-k (they place only ~0.53 of the true top-10
+    // in their own top-10), so the SQ8 mirror must be kept anyway to rescore
+    // with, and the PQ codes are then ADDITIVE on top of it.
+    //
+    // PQ only starts paying when the SQ8 mirror itself no longer fits in RAM,
+    // i.e. when dim*n dwarfs everything else. At dim=256 the crossover is far
+    // past 10M vectors; below that, prefer `drop_floats` alone.
+    //
+    // As with SQ8, codes only ORDER the walk; the returned top-k is rescored
+    // on the most precise representation still resident, so scores stay exact
+    // unless drop_floats removed the floats.
+    std::size_t pq_codes        = 0;
+    // Discard the exact float arena once a compressed representation exists,
+    // keeping only the codes. Works with or without PQ:
+    //
+    //   drop_floats + SQ8  — 1 byte/dim. SQ8 is accurate enough (~1/127 per
+    //     component) that it reproduces the exact ranking almost always, so
+    //     this is close to a free 3× memory saving.
+    //   drop_floats + PQ   — m bytes/vector for the walk, SQ8 retained for the
+    //     rescore. Only worthwhile if SQ8 is ALSO too big to keep, since PQ
+    //     codes are additive on top of it.
+    //
+    // The cost is that reported scores become approximate: with no exact
+    // vectors left there is nothing to rescore against. Off by default —
+    // exactness first.
+    bool        drop_floats     = false;
     std::uint64_t seed          = 0x9E3779B97F4A7C15ull;
 };
 
@@ -96,6 +139,41 @@ public:
 
     [[nodiscard]] std::size_t size()      const noexcept { return nodes_.size(); }
     [[nodiscard]] std::size_t dimension() const noexcept { return dim_; }
+
+    // Bytes of heap actually held by the index, broken down by component.
+    // Reported rather than inferred: process RSS cannot measure a release (the
+    // allocator may not return pages, and peak-RSS counters never go down), so
+    // it is the wrong instrument for judging whether a compression setting paid
+    // off — and the breakdown matters because which term dominates flips once
+    // the vectors are compressed.
+    struct MemoryUse {
+        std::size_t vectors = 0;   // float arena
+        std::size_t sq8     = 0;   // SQ8 mirror
+        std::size_t pq      = 0;   // PQ codes + codebook
+        std::size_t links   = 0;   // mutable vector-of-vectors adjacency
+        std::size_t csr     = 0;   // sealed CSR adjacency
+        std::size_t nodes   = 0;   // node headers
+        [[nodiscard]] std::size_t total() const noexcept {
+            return vectors + sq8 + pq + links + csr + nodes;
+        }
+    };
+
+    [[nodiscard]] MemoryUse memory_use() const noexcept {
+        MemoryUse u;
+        u.vectors = store_.capacity() * sizeof(float);
+        u.sq8     = q8_.capacity() * sizeof(std::int8_t);
+        u.pq      = pq_codes_.capacity();
+        for (const auto& off : csr_off_) u.csr += off.capacity() * sizeof(std::uint32_t);
+        for (const auto& nbr : csr_nbr_) u.csr += nbr.capacity() * sizeof(std::uint32_t);
+        for (const auto& nd : nodes_) {
+            u.nodes += sizeof(Node) + nd.bits.capacity() * sizeof(std::uint64_t);
+            for (const auto& layer : nd.links)
+                u.links += sizeof(layer) + layer.capacity() * sizeof(std::uint32_t);
+        }
+        return u;
+    }
+
+    [[nodiscard]] std::size_t memory_bytes() const noexcept { return memory_use().total(); }
     [[nodiscard]] const HnswConfig& config() const noexcept { return cfg_; }
 
     [[nodiscard]] std::string serialize() const;
@@ -130,7 +208,9 @@ private:
     std::size_t   dim_       = 0;
     int           max_layer_ = -1;
     std::uint32_t entry_     = 0;
-    std::vector<Node> nodes_;                 // index == internal node ordinal
+    // `mutable` because seal()/unseal() move the adjacency between the CSR and
+    // per-node representations, which is a physical layout change only.
+    mutable std::vector<Node> nodes_;          // index == internal node ordinal
     // Flat vector arena: node k's unit-normalized vector is
     // store_[k*dim_ .. k*dim_+dim_). Sized in lockstep with nodes_.
     //
@@ -138,7 +218,11 @@ private:
     // its final size) before any linking thread starts, so `store_` never
     // reallocates while readers hold spans into it. Do not push into store_
     // from a parallel phase.
-    std::vector<float> store_;
+    //
+    // `mutable` only so that seal() — which is const and memoized off the query
+    // path — can release it under drop_floats. That is a change of physical
+    // representation, not of the index's logical contents.
+    mutable std::vector<float> store_;
 
     // ── SQ8 mirror of `store_` ──────────────────────────────────────
     // The walk is memory-bound: it touches ~1100 random vectors per query, and
@@ -155,6 +239,23 @@ private:
     //
     // Built by seal() alongside the CSR, dropped by unseal().
     mutable std::vector<std::int8_t> q8_;
+
+    // ── PQ walk codec (optional, cfg_.pq_codes > 0) ──────────────────────
+    // A third, coarser rung of the same ladder as q8_: where SQ8 spends one
+    // byte per DIMENSION, PQ spends one byte per SUBSPACE, so a vector costs
+    // pq_m_ bytes regardless of dim. Same contract as SQ8 — it orders the walk
+    // and never the reported scores (unless drop_floats discards the exact
+    // vectors, in which case the rescore falls back to reconstructions).
+    //
+    // Trained and encoded by seal(); dropped by unseal() only when the floats
+    // survive — if they were dropped, the codes ARE the index and rebuilding
+    // them is impossible.
+    mutable ProductQuantizer         pq_;
+    mutable std::vector<std::uint8_t> pq_codes_;
+    mutable std::size_t              pq_m_ = 0;
+    // True once the float arena has been released; store_ is then empty and
+    // exact rescoring is no longer available.
+    mutable bool                     floats_dropped_ = false;
 
     // ── Sealed adjacency (CSR) ────────────────────────────────────
     // `nodes_[n].links[L]` is a vector-of-vectors: reaching one neighbour list
@@ -188,7 +289,33 @@ private:
     // the build that produced the graph (one pass to count, one to fill).
     void seal() const;
     // Drop the CSR mirror because the graph is about to change.
-    void unseal() noexcept { sealed_ = false; csr_off_.clear(); csr_nbr_.clear(); q8_.clear(); }
+    void unseal() noexcept {
+        if (!sealed_) return;
+        // The mutable adjacency was released at seal time, so restore it from
+        // the CSR before anything tries to mutate it.
+        unpack_links();
+        sealed_ = false;
+        csr_off_.clear();
+        csr_off_.shrink_to_fit();
+        csr_nbr_.clear();
+        csr_nbr_.shrink_to_fit();
+        q8_.clear();
+        q8_.shrink_to_fit();
+        // Only discard PQ state when it can be rebuilt. With the floats gone
+        // the codes are the only copy of the vectors, so clearing them here
+        // would silently empty the index.
+        if (!floats_dropped_) {
+            pq_codes_.clear();
+            pq_codes_.shrink_to_fit();
+            pq_m_ = 0;
+            pq_ = {};
+        }
+    }
+
+    // Rebuild nodes_[].links from the sealed CSR. The inverse of the release
+    // that seal() performs; used by unseal() and by serialize(), which writes
+    // the per-node link lists.
+    void unpack_links() const;
 
     [[nodiscard]] std::span<const float> vec_at(std::size_t n) const noexcept {
         return {store_.data() + n * dim_, dim_};
@@ -199,12 +326,17 @@ private:
     [[nodiscard]] const std::int8_t* q8_at(std::size_t n) const noexcept {
         return q8_.data() + n * dim_;
     }
+    [[nodiscard]] const std::uint8_t* pq_at(std::size_t n) const noexcept {
+        return pq_codes_.data() + n * pq_m_;
+    }
 
     [[nodiscard]] int  random_level();
     // `q8` is the SQ8-quantized query, or empty to score on exact floats.
+    // `adc` is the PQ lookup table for the query, or empty for no PQ.
     [[nodiscard]] float sim(std::size_t node_a, std::span<const float> q,
                             std::span<const std::uint64_t> q_bits,
-                            std::span<const std::int8_t> q8 = {}) const;
+                            std::span<const std::int8_t> q8 = {},
+                            std::span<const float> adc = {}) const;
 
     // Neighbours of `n` in layer `L`, or {} if it does not reach that layer.
     // Reads the sealed CSR when available and falls back to the mutable
@@ -227,6 +359,7 @@ private:
     // per-query malloc/free pair on the hottest path in the library.
     void search_layer_into(std::span<const float> q, std::span<const std::uint64_t> q_bits,
                            std::span<const std::int8_t> q8,
+                           std::span<const float> adc,
                            std::uint32_t entry, int layer, std::size_t ef,
                            std::vector<std::uint32_t>& out) const;
     [[nodiscard]] std::vector<std::uint32_t>
@@ -265,6 +398,8 @@ private:
         std::vector<std::uint32_t> hop;                       // search_layer output reuse
         std::vector<float>         query;                     // normalized query vector
         std::vector<std::int8_t>   query_q8;                  // SQ8 of the same
+        std::vector<float>         adc;                       // PQ lookup table for the same
+        std::vector<float>         recon;                     // PQ reconstruction buffer
 
         void reset(std::size_t n) {
             if (visit_epoch.size() < n) visit_epoch.assign(n, 0);
@@ -287,6 +422,12 @@ private:
         static thread_local Scratch s;
         return s;
     }
+
+    // Final-ranking score for one candidate, on the most precise
+    // representation still resident. Declared after Scratch because it takes
+    // one. See the definition for the precision ladder.
+    [[nodiscard]] float rescore(std::uint32_t node, const std::vector<float>& q,
+                                std::span<const std::int8_t> q8, Scratch& sc) const;
 };
 
 } // namespace rag::index

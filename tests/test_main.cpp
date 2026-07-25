@@ -622,6 +622,191 @@ TEST(sq8_walk_preserves_recall) {
     CHECK(std::fabs(hits[0].score.get() - exact_self) < 1e-5f);
 }
 
+// ─── Compressed-residency: dropping the exact vectors ─────────────
+//
+// `drop_floats` releases the float arena and leaves the index resident only in
+// its quantized mirror(s). That is a real memory/accuracy trade, so pin BOTH
+// halves of it: the memory must actually go away, and recall must survive.
+TEST(drop_floats_shrinks_index_and_preserves_recall) {
+    constexpr std::size_t n = 3000, dim = 128, nc = 40, nq = 100, k = 10;
+    std::mt19937 rng(21);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+
+    std::vector<std::vector<float>> cent(nc, std::vector<float>(dim));
+    for (auto& c : cent) { for (auto& x : c) x = g(rng); rag::dense::normalize(c); }
+
+    std::vector<float> data(n * dim);
+    std::uniform_int_distribution<std::size_t> pick(0, nc - 1);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& c = cent[pick(rng)];
+        for (std::size_t d = 0; d < dim; ++d) data[i * dim + d] = c[d] + 0.06f * g(rng);
+        rag::dense::normalize(std::span<float>(data.data() + i * dim, dim));
+    }
+    auto vec = [&](std::size_t i) { return std::span<const float>(data.data() + i * dim, dim); };
+    auto id  = [&](std::size_t i) { return static_cast<std::uint32_t>(i); };
+
+    std::vector<std::vector<float>> qs(nq, std::vector<float>(dim));
+    for (auto& qv : qs) {
+        const auto& c = cent[pick(rng)];
+        for (std::size_t d = 0; d < dim; ++d) qv[d] = c[d] + 0.06f * g(rng);
+        rag::dense::normalize(qv);
+    }
+
+    auto recall_of = [&](rag::index::HnswIndex& idx) {
+        double hit = 0;
+        for (const auto& qv : qs) {
+            std::vector<std::pair<float, std::uint32_t>> exact;
+            exact.reserve(n);
+            for (std::size_t i = 0; i < n; ++i)
+                exact.emplace_back(rag::dense::dot(vec(i), qv), static_cast<std::uint32_t>(i));
+            std::partial_sort(exact.begin(), exact.begin() + k, exact.end(),
+                              [](auto& a, auto& b) { return a.first > b.first; });
+            for (const auto& h : idx.search(qv, k))
+                for (std::size_t j = 0; j < k; ++j)
+                    if (exact[j].second == h.chunk.get()) { hit += 1; break; }
+        }
+        return hit / (nq * k);
+    };
+
+    rag::index::HnswIndex base{rag::index::HnswConfig{}};
+    base.build_batch(n, vec, id);
+    (void)base.search(qs[0], k);                 // force seal()
+    const double base_recall = recall_of(base);
+    const std::size_t base_bytes = base.memory_bytes();
+
+    rag::index::HnswIndex lean{rag::index::HnswConfig{.drop_floats = true}};
+    lean.build_batch(n, vec, id);
+    (void)lean.search(qs[0], k);
+    const double lean_recall = recall_of(lean);
+
+    // The float arena is 4 bytes/dim and the SQ8 mirror that replaces it is 1,
+    // so the index must get materially smaller — not merely not-bigger.
+    CHECK(lean.memory_bytes() < base_bytes);
+    CHECK(lean.memory_use().vectors == 0);
+    CHECK(lean.memory_use().sq8 > 0);
+    // SQ8 resolves ~1/127 per component, which is far finer than the gaps
+    // between neighbouring documents, so ranking barely moves.
+    CHECK(lean_recall > 0.90);
+    CHECK(base_recall > 0.95);
+}
+
+// ─── PQ codes drive the walk without deciding the answer ──────────
+//
+// With pq_codes set, traversal scores candidates from m-byte codes. The
+// guarantee is the same one SQ8 makes: codes ORDER the walk, and the reported
+// top-k is still rescored on the most precise representation available. If the
+// floats are kept, that means the scores must remain EXACT.
+TEST(pq_walk_preserves_exact_scores) {
+    constexpr std::size_t n = 2500, dim = 64, nc = 30;
+    std::mt19937 rng(9);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+
+    std::vector<std::vector<float>> cent(nc, std::vector<float>(dim));
+    for (auto& c : cent) { for (auto& x : c) x = g(rng); rag::dense::normalize(c); }
+
+    std::vector<float> data(n * dim);
+    std::uniform_int_distribution<std::size_t> pick(0, nc - 1);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& c = cent[pick(rng)];
+        for (std::size_t d = 0; d < dim; ++d) data[i * dim + d] = c[d] + 0.06f * g(rng);
+        rag::dense::normalize(std::span<float>(data.data() + i * dim, dim));
+    }
+
+    rag::index::HnswIndex idx{rag::index::HnswConfig{.pq_codes = 16}};
+    idx.build_batch(n,
+        [&](std::size_t i) { return std::span<const float>(data.data() + i * dim, dim); },
+        [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+
+    std::vector<float> qv(data.begin(), data.begin() + dim);
+    auto hits = idx.search(qv, 5);
+    REQUIRE(!hits.empty());
+    // Every returned score is a true cosine against the stored vector, even
+    // though the walk that found it never looked at a float.
+    for (const auto& h : hits) {
+        const float exact = rag::dense::dot(
+            std::span<const float>(data.data() + h.chunk.get() * dim, dim), qv);
+        CHECK(std::fabs(h.score.get() - exact) < 1e-5f);
+    }
+    // And the PQ codes must actually be resident, or this tested nothing.
+    CHECK(idx.memory_use().pq > 0);
+}
+
+// ─── Sealing frees the duplicate adjacency ────────────────────────
+//
+// A sealed index holds its graph in CSR form only; the per-node link vectors
+// it was built from are released. They are restored on demand, so mutating a
+// sealed index must still work — that round trip is what this pins.
+TEST(sealed_index_releases_link_duplicate_and_survives_mutation) {
+    constexpr std::size_t n = 2500, dim = 32;
+    std::mt19937 rng(11);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    std::vector<float> data(n * dim);
+    for (auto& x : data) x = g(rng);
+    for (std::size_t i = 0; i < n; ++i)
+        rag::dense::normalize(std::span<float>(data.data() + i * dim, dim));
+    auto vec = [&](std::size_t i) { return std::span<const float>(data.data() + i * dim, dim); };
+
+    rag::index::HnswIndex idx{rag::index::HnswConfig{}};
+    idx.build_batch(n, vec, [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+
+    std::vector<float> qv(data.begin(), data.begin() + dim);
+    auto before = idx.search(qv, 5);
+    REQUIRE(!before.empty());
+
+    // Sealed: the graph lives in the CSR, and the vector-of-vectors is gone.
+    CHECK(idx.memory_use().csr > 0);
+    CHECK(idx.memory_use().links == 0);
+
+    // Adding unseals, which must rebuild the mutable adjacency from the CSR.
+    // If unpack_links() were wrong, the graph would lose edges here and the
+    // previously-found neighbours would stop being reachable.
+    std::vector<float> extra(dim, 0.0f);
+    extra[0] = 1.0f;
+    idx.add(static_cast<std::uint32_t>(n), extra);
+    CHECK(idx.memory_use().links > 0);
+
+    auto after = idx.search(qv, 5);
+    REQUIRE(!after.empty());
+    CHECK(after[0].chunk.get() == before[0].chunk.get());
+    CHECK(std::fabs(after[0].score.get() - before[0].score.get()) < 1e-5f);
+}
+
+// ─── The index blob round-trips through the sealed representation ──
+//
+// serialize() writes per-node link lists, but a sealed index no longer stores
+// them in that shape. Saving a queried (hence sealed) index must therefore
+// still produce a blob that reloads identically.
+TEST(sealed_index_serializes_and_reloads_identically) {
+    constexpr std::size_t n = 1200, dim = 32;
+    std::mt19937 rng(13);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    std::vector<float> data(n * dim);
+    for (auto& x : data) x = g(rng);
+    for (std::size_t i = 0; i < n; ++i)
+        rag::dense::normalize(std::span<float>(data.data() + i * dim, dim));
+
+    rag::index::HnswIndex idx{rag::index::HnswConfig{}};
+    idx.build_batch(n,
+        [&](std::size_t i) { return std::span<const float>(data.data() + i * dim, dim); },
+        [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+
+    std::vector<float> qv(data.begin(), data.begin() + dim);
+    auto want = idx.search(qv, 10);          // seals the index
+    REQUIRE(!want.empty());
+
+    auto blob = idx.serialize();             // ... and must survive being sealed
+    auto back = rag::index::HnswIndex::deserialize(blob);
+    REQUIRE(back.has_value());
+    CHECK(back->size() == idx.size());
+
+    auto got = back->search(qv, 10);
+    REQUIRE(got.size() == want.size());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        CHECK(got[i].chunk.get() == want[i].chunk.get());
+        CHECK(std::fabs(got[i].score.get() - want[i].score.get()) < 1e-6f);
+    }
+}
+
 // ─── Concurrent hybrid retrieval is deterministic ─────────────────
 //
 // HybridRetrieveStage runs the lexical and dense retrievers concurrently

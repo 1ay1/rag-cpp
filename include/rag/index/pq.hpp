@@ -43,11 +43,38 @@ public:
     [[nodiscard]] static Result<ProductQuantizer>
     train(std::span<const Vector> data, PqConfig cfg = {});
 
+    // Train from a FLAT row-major arena (`n` rows of `dim` floats) without
+    // materializing a vector-of-vectors. This is the form every caller inside
+    // the library already has — HnswIndex::store_ is exactly this layout — and
+    // it avoids copying the whole corpus just to hand it over.
+    //
+    // The m subspaces are independent k-means problems, so they are solved
+    // across all cores.
+    [[nodiscard]] static Result<ProductQuantizer>
+    train_flat(std::span<const float> data, std::size_t n, std::size_t dim, PqConfig cfg = {});
+
     // Encode one vector to its m-byte code (nearest centroid per subspace).
     [[nodiscard]] std::vector<std::uint8_t> encode(std::span<const float> v) const;
 
+    // Encode into caller-provided storage (exactly m bytes). The hot form when
+    // encoding a whole corpus: no per-vector allocation.
+    void encode_into(std::span<const float> v, std::span<std::uint8_t> out) const noexcept;
+
+    // Encode `n` rows of a flat arena into a flat `n*m` code block, in parallel.
+    void encode_flat(std::span<const float> data, std::size_t n,
+                     std::span<std::uint8_t> out) const;
+
+    [[nodiscard]] std::size_t m() const noexcept { return cfg_.m; }
+    [[nodiscard]] std::size_t dim() const noexcept { return dim_; }
+    [[nodiscard]] bool empty() const noexcept { return centroids_.empty(); }
+
     // Approximate reconstruction from a code (centroid concatenation).
     [[nodiscard]] Vector decode(std::span<const std::uint8_t> code) const;
+
+    // Reconstruct into caller-provided storage, resizing it to dim. Used on the
+    // rescore path when the exact vectors have been dropped, where a fresh
+    // Vector per candidate would be an allocation per hit.
+    void decode_into(std::span<const std::uint8_t> code, std::vector<float>& out) const;
 
     // Build the ADC lookup table for a query: ksub·m floats of (q_sub·centroid).
     [[nodiscard]] std::vector<float> adc_table(std::span<const float> query) const;
