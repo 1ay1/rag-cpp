@@ -44,6 +44,11 @@ public:
     // recall after incremental adds.
     void finalize();
 
+    // True once finalize() has run and no add() has invalidated it since.
+    // Lets a caller (Corpus) skip the work when it is already up to date, and
+    // do it lazily on the read path when it is not.
+    [[nodiscard]] bool finalized() const noexcept { return finalized_; }
+
     // Top-k by BM25. Returns hits sorted by descending score.
     [[nodiscard]] std::vector<Hit> search(std::string_view query, std::size_t k) const;
 

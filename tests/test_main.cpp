@@ -426,6 +426,58 @@ TEST(parallel_embedding_propagates_backend_failure) {
     CHECK(r.error().code == rag::Errc::unavailable);
 }
 
+// ─── Lazy meta relink / bm25 finalize ────────────────────────────
+//
+// add_document() used to relink every chunk's borrowed meta pointer and
+// re-finalize BM25 on EVERY insert — both O(corpus), so bulk ingest was
+// quadratic. Both are now deferred. The contract that must survive that:
+// a caller who never calls build() still sees correct metadata and correct
+// lexical scores, because the read paths repair on demand.
+TEST(metadata_survives_reallocation_without_build) {
+    rag::index::Corpus c;
+    // Enough documents to force several reallocations of docs_.
+    constexpr std::size_t kDocs = 300;
+    for (std::size_t i = 0; i < kDocs; ++i)
+        c.add_document("d" + std::to_string(i) + ".md",
+                       "body of document " + std::to_string(i),
+                       {{"idx", std::to_string(i)}});
+
+    // No build() call: every chunk must still resolve to ITS OWN document's
+    // metadata, not a dangling or shifted pointer.
+    REQUIRE(c.chunk_count() >= kDocs);
+    std::size_t checked = 0;
+    for (std::size_t i = 0; i < c.chunk_count(); ++i) {
+        const auto* ch = c.chunk(rag::ChunkId{static_cast<std::uint32_t>(i)});
+        REQUIRE(ch);
+        REQUIRE(ch->meta);
+        auto it = ch->meta->find("idx");
+        REQUIRE(it != ch->meta->end());
+        if (it->second != std::to_string(ch->doc.get())) {
+            CHECK_EQ(it->second, std::to_string(ch->doc.get()));
+            return;
+        }
+        ++checked;
+    }
+    CHECK(checked == c.chunk_count());
+}
+
+TEST(lexical_search_works_without_explicit_build) {
+    rag::index::Corpus c;
+    for (std::size_t i = 0; i < 50; ++i)
+        c.add_document("d" + std::to_string(i), "filler text about vectors and indexes");
+    c.add_document("needle.md", "quokka marsupial photogenic");
+
+    // Never built: bm25 must be finalized lazily on the read path, and the
+    // distinctive document must win.
+    auto hits = c.lexical_search("quokka", 3);
+    REQUIRE(!hits.empty());
+    const auto* ch = c.chunk(hits[0].chunk);
+    REQUIRE(ch);
+    const auto* d = c.document(ch->doc);
+    REQUIRE(d);
+    CHECK_EQ(d->uri, std::string("needle.md"));
+}
+
 // ─── Persistence container round-trip ──────────────────────────────────
 TEST(container_roundtrip_and_crc) {
     rag::store::Container c;

@@ -105,7 +105,7 @@ public:
     [[nodiscard]] SearchResult    resolve(const Hit& h) const;
     [[nodiscard]] std::size_t     chunk_count()    const noexcept { return chunks_.size(); }
     [[nodiscard]] std::size_t     document_count() const noexcept { return docs_.size(); }
-    [[nodiscard]] const std::vector<Chunk>& chunks() const noexcept { return chunks_; }
+    [[nodiscard]] const std::vector<Chunk>& chunks() const { ensure_linked(); return chunks_; }
     [[nodiscard]] const text::Tokenizer& tokenizer() const noexcept { return bm25_.tokenizer(); }
 
     // Apply a metadata filter, returning the ids that pass (for pre/post-filter).
@@ -123,9 +123,19 @@ private:
     lexical::Bm25Index                bm25_{cfg_.bm25, cfg_.tokenize};
     std::optional<HnswIndex>          hnsw_;
     bool                              dirty_ = false;
+    // A chunk borrows a pointer to its document's metadata, and add_document()
+    // may reallocate `docs_`. Rather than relink every chunk on every add (O(n)
+    // per document — quadratic ingest), we mark the pointers stale and repair
+    // them lazily, before any accessor can hand one out. Mutable + const
+    // ensure_linked() because this is memoization, not observable state.
+    mutable bool                      meta_stale_ = false;
     std::unordered_set<std::uint32_t> deleted_docs_;   // tombstoned DocId values
 
     [[nodiscard]] Result<void> embed_pending();
+
+    // Repair borrowed meta pointers if a preceding add_document() invalidated
+    // them. Called by every read path that can expose a Chunk.
+    void ensure_linked() const;
 
     // Re-point every chunk's borrowed `meta` at the current `docs_` storage.
     void relink_meta();

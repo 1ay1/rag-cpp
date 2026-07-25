@@ -30,7 +30,9 @@ void Corpus::move_from(Corpus&& o) {
     bm25_      = std::move(o.bm25_);
     hnsw_      = std::move(o.hnsw_);
     dirty_     = o.dirty_;
+    deleted_docs_ = std::move(o.deleted_docs_);
     relink_meta();   // borrowed pointers now point at OUR docs_ storage
+    meta_stale_ = false;
 }
 
 Result<DocId> Corpus::add_document(std::string uri, std::string text, Metadata meta, std::string title) {
@@ -48,11 +50,25 @@ Result<DocId> Corpus::add_document(std::string uri, std::string text, Metadata m
         bm25_.add(cid.get(), ch.indexed_text());
         chunks_.push_back(std::move(ch));
     }
-    // docs_.push_back above may have reallocated; re-link ALL chunk meta ptrs.
-    relink_meta();
-    bm25_.finalize();
-    dirty_ = true;
+    // NOTE: this used to relink_meta() and bm25_.finalize() here — both O(total
+    // corpus), per document, which made bulk ingest quadratic (it dominated a
+    // 20k-document build at ~1.8s). Neither is needed until something READS:
+    //   • chunk meta pointers are borrowed into docs_, which push_back above may
+    //     have reallocated — so they are relinked lazily in ensure_linked(),
+    //     driven by the `meta_stale_` flag, before any accessor hands one out;
+    //   • bm25 idf/avgdl are pure functions of the accumulated counts, so
+    //     finalize() is idempotent and only has to run before a query.
+    // build() does both; the read paths do them on demand for callers who
+    // query without an explicit build().
+    meta_stale_ = true;
+    dirty_      = true;
     return did;
+}
+
+void Corpus::ensure_linked() const {
+    if (!meta_stale_) return;
+    const_cast<Corpus*>(this)->relink_meta();
+    meta_stale_ = false;
 }
 
 Result<void> Corpus::embed_pending() {
@@ -108,6 +124,7 @@ Result<void> Corpus::embed_pending() {
 }
 
 Result<void> Corpus::build() {
+    ensure_linked();
     bm25_.finalize();
     if (embedder_) {
         if (auto r = embed_pending(); !r) return r;  // degrade: propagate, caller may ignore
@@ -133,6 +150,11 @@ Result<void> Corpus::build() {
 }
 
 std::vector<Hit> Corpus::lexical_search(std::string_view query, std::size_t k) const {
+    // add_document() no longer finalizes on every insert (that was quadratic);
+    // a caller may therefore query without an intervening build(). finalize()
+    // is idempotent and pure in the accumulated counts, so bringing it up to
+    // date here is both cheap and correct.
+    if (!bm25_.finalized()) const_cast<Corpus*>(this)->bm25_.finalize();
     if (deleted_docs_.empty()) return bm25_.search(query, k);
     // Over-fetch, then drop tombstoned chunks and truncate to k.
     auto hits = bm25_.search(query, k + deleted_docs_.size() * 2 + k);
@@ -148,6 +170,7 @@ std::vector<Hit> Corpus::lexical_search(std::string_view query, std::size_t k) c
 }
 
 Result<void> Corpus::remove_document(DocId id) {
+    ensure_linked();
     if (id.get() >= docs_.size() || deleted_docs_.count(id.get()))
         return fail<void>(Errc::not_found, "remove_document: unknown or already-deleted id");
     deleted_docs_.insert(id.get());
@@ -176,6 +199,7 @@ Result<Vector> Corpus::embed_text(const std::string& text) const {
 Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_t k,
                                               const MetaFilter& filter) const {
     if (!embedder_) return fail<std::vector<Hit>>(Errc::unavailable, "no embedder");
+    ensure_linked();     // the allow-predicate below dereferences chunk->meta
     auto qv = embedder_->embed_one(std::string(query));
     if (!qv) return std::unexpected(qv.error());
     dense::normalize(*qv);
@@ -228,6 +252,7 @@ Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_
 }
 
 const Chunk* Corpus::chunk(ChunkId id) const {
+    ensure_linked();
     return id.get() < chunks_.size() ? &chunks_[id.get()] : nullptr;
 }
 const Document* Corpus::document(DocId id) const {
@@ -266,6 +291,7 @@ bool Corpus::passes(ChunkId id, const MetaFilter& f) const {
 // BM25 (inverted index), HNSW (ANN graph). CRC-verified on load.
 // ─────────────────────────────────────────────────────────────────────────────
 Result<void> Corpus::save(const std::string& path) const {
+    ensure_linked();
     store::Container c;
     std::uint32_t flags = 0;
 
@@ -374,6 +400,7 @@ Result<Corpus> Corpus::load(const std::string& path) {
     }
     // Link all chunk meta pointers now that docs_ and chunks_ are populated.
     c.relink_meta();
+    c.meta_stale_ = false;
 
     // EMBD (parallel to CHNK).
     if (const std::string* emb = cont->get(store::Tag::embed)) {
