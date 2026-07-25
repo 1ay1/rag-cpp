@@ -50,18 +50,30 @@ Result<Context> HybridRetrieveStage::process(Context ctx) const {
         do_lexical();
     }
 
-    lists.push_back({std::move(lex), cfg_.bm25_weight});
+    // Declare each retriever's THEORETICAL score bounds rather than letting
+    // fusion infer them from the candidate set (see fuse.hpp). BM25 has a true
+    // floor of 0 and no natural ceiling; cosine over unit vectors is bounded
+    // in [-1,1] at both ends.
+    lists.push_back(fusion::bm25_list(std::move(lex), cfg_.bm25_weight));
 
     if (run_dense) {
         // Degrade gracefully if the embedder is unavailable/offline.
-        if (dense) lists.push_back({std::move(*dense), cfg_.dense_weight});
+        if (dense) lists.push_back(fusion::cosine_list(std::move(*dense), cfg_.dense_weight));
         else ctx.trace.push_back(std::string("dense unavailable: ") + std::string(to_string(dense.error().code)));
     }
 
     std::span<const fusion::RankedList> sp(lists);
-    ctx.candidates = (cfg_.fusion == HybridRetrieveConfig::Fusion::rrf)
-                   ? fusion::rrf(sp, cfg_.rrf, cfg_.candidate_k)
-                   : fusion::rsf(sp, cfg_.candidate_k);
+    switch (cfg_.fusion) {
+        case HybridRetrieveConfig::Fusion::rrf:
+            ctx.candidates = fusion::rrf(sp, cfg_.rrf, cfg_.candidate_k);
+            break;
+        case HybridRetrieveConfig::Fusion::rsf:
+            ctx.candidates = fusion::rsf(sp, cfg_.candidate_k);
+            break;
+        case HybridRetrieveConfig::Fusion::convex:
+            ctx.candidates = fusion::convex_combination(sp, cfg_.convex, cfg_.candidate_k);
+            break;
+    }
     ctx.trace.push_back("hybrid: " + std::to_string(ctx.candidates.size()) + " candidates");
     return ctx;
 }
@@ -223,9 +235,11 @@ Result<void> feature_rerank(std::string_view query, std::vector<Hit>& cands,
 }
 } // namespace
 
-Pipeline Pipeline::standard() {
+Pipeline Pipeline::standard() { return standard_with(HybridRetrieveConfig{}); }
+
+Pipeline Pipeline::standard_with(HybridRetrieveConfig cfg) {
     Pipeline p;
-    p.add(std::make_shared<HybridRetrieveStage>())
+    p.add(std::make_shared<HybridRetrieveStage>(std::move(cfg)))
      .add(std::make_shared<FilterStage>())
      .add(std::make_shared<RerankStage>("feature_rerank", feature_rerank))
      .add(std::make_shared<TopKStage>());

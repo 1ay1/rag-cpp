@@ -284,6 +284,73 @@ TEST(rcp_memory_build_and_recall) {
     CHECK((*rc)["clues"][0]["query"] == "retrieval");
 }
 
+// ─── Fusion negotiation (§6.1 / §16.3) ───────────────────────────
+//
+// `scoreFloor` is the piece of metadata that lets a CLIENT fuse this server
+// with another by convex combination instead of falling back to rank-only RRF.
+// It has to be advertised, and it has to be right: rag-cpp scores dense hits as
+// cosines over unit-normalized vectors, so the floor is exactly -1.
+TEST(rcp_advertises_fusion_methods_and_score_floor) {
+    using namespace rag::rcp;
+    auto engine = make_engine();
+    EngineHandler h{engine, full_opts(engine)};
+    auto caps = h.capabilities();
+    REQUIRE(caps.retrieve.has_value());
+    const auto& r = *caps.retrieve;
+
+    REQUIRE(r.contains("fusion"));
+    bool has_convex = false, has_rrf = false;
+    for (const auto& m : r["fusion"]) {
+        if (m == "convex") has_convex = true;
+        if (m == "rrf")    has_rrf = true;
+    }
+    CHECK(has_convex);
+    CHECK(has_rrf);   // RRF must stay available: it is the universal fallback
+
+    REQUIRE(r.contains("scoreFloor"));
+    CHECK(r["scoreFloor"].get<double>() == -1.0);
+    CHECK(r["scoreScale"] == "cosine");
+}
+
+// A client may select a fusion strategy per request. All advertised methods
+// must actually run and return well-formed results.
+TEST(rcp_retrieve_honours_requested_fusion) {
+    using namespace rag::rcp;
+    auto engine = make_engine();
+    EngineHandler h{engine, full_opts(engine)};
+
+    for (const char* method : {"convex", "rrf", "weighted"}) {
+        auto res = h.retrieve(Json{{"query", "retrieval"}, {"k", 3},
+                                   {"mode", "hybrid"},
+                                   {"fusion", {{"method", method}}}});
+        REQUIRE(res.has_value());
+        REQUIRE((*res)["hits"].is_array());
+        CHECK(!(*res)["hits"].empty());
+    }
+
+    // alpha is accepted and bounded.
+    auto ok = h.retrieve(Json{{"query", "retrieval"}, {"k", 3},
+                              {"fusion", {{"method", "convex"}, {"alpha", 0.25}}}});
+    REQUIRE(ok.has_value());
+}
+
+// An unimplementable request must be refused rather than silently downgraded:
+// a client that asked for a specific ranking policy and got a different one has
+// no way to know its results are not what it configured.
+TEST(rcp_retrieve_rejects_unknown_fusion) {
+    using namespace rag::rcp;
+    auto engine = make_engine();
+    EngineHandler h{engine, full_opts(engine)};
+
+    auto bad = h.retrieve(Json{{"query", "retrieval"}, {"k", 3},
+                               {"fusion", {{"method", "borda"}}}});
+    CHECK(!bad.has_value());
+
+    auto bad_alpha = h.retrieve(Json{{"query", "retrieval"}, {"k", 3},
+                                     {"fusion", {{"method", "convex"}, {"alpha", 1.5}}}});
+    CHECK(!bad_alpha.has_value());
+}
+
 int main() {
     std::printf("running %zu rcp integration tests\n", registry().size());
     for (auto& c : registry()) { g_current = c.name; c.fn(); }

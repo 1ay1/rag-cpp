@@ -150,6 +150,15 @@ public:
             std::vector<std::string> modes = {"dense", "hybrid"};
             if (opts_.splade) modes.push_back("sparse");
             c.with_retrieve(opts_.max_k, std::move(modes), {"text"});
+            // rag-cpp fuses by convex combination (TM2C2) by default and can
+            // also do plain RRF, so declare both rather than accepting the
+            // SDK's RRF-only baseline.
+            c.with_fusion({"convex", "rrf", "weighted"});
+            // Dense scores are cosines over unit-normalized vectors, so the
+            // theoretical floor is exactly -1. Advertising it is what allows a
+            // CLIENT fusing rag-cpp with other engines to use convex
+            // combination instead of falling back to rank-only RRF (§16.3).
+            c.with_score_scale("cosine", -1.0);
             // Advertise the rewrite methods retrieve.rewrite can drive (§7.7).
             if (opts_.generator || hooks_.transform)
                 (*c.retrieve)["rewrite"] = Json::array({"hyde", "multi-query"});
@@ -252,6 +261,32 @@ public:
             raw = std::move(*r);
         } else {
             // hybrid: the standard pipeline (dense+sparse fused, filtered).
+            //
+            // A per-request fusion choice runs on a locally-built pipeline
+            // rather than mutating the shared Engine — the handler is used
+            // concurrently, so reconfiguring shared state per request would be
+            // a data race and would leak one client's ranking policy into
+            // another's results.
+            if (rp.fusion_method) {
+                rag::pipeline::HybridRetrieveConfig hc{};
+                if (*rp.fusion_method == "rrf")
+                    hc.fusion = rag::pipeline::HybridRetrieveConfig::Fusion::rrf;
+                else if (*rp.fusion_method == "weighted")
+                    hc.fusion = rag::pipeline::HybridRetrieveConfig::Fusion::rsf;
+                else
+                    hc.fusion = rag::pipeline::HybridRetrieveConfig::Fusion::convex;
+                if (rp.fusion_rrf_k) hc.rrf.k = static_cast<float>(*rp.fusion_rrf_k);
+                if (rp.fusion_alpha) hc.convex.alpha = static_cast<float>(*rp.fusion_alpha);
+                if (rp.candidate_k) hc.candidate_k = *rp.candidate_k;
+
+                auto pipe = rag::pipeline::Pipeline::standard_with(hc);
+                auto hits = pipe.run(engine_.corpus(), rp.query, want, filter);
+                if (!hits) return std::unexpected(to_wire(hits.error()));
+                std::vector<rag::SearchResult> res;
+                res.reserve(hits->size());
+                for (const auto& h : *hits) res.push_back(engine_.corpus().resolve(h));
+                return finish_retrieve(res, rp, effective_mode, want);
+            }
             auto r = engine_.search(rp.query, want, filter);
             if (!r) return std::unexpected(to_wire(r.error()));
             std::vector<rag::SearchResult> res = std::move(*r);

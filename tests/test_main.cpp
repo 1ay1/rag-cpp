@@ -159,6 +159,91 @@ TEST(rrf_fuses_lists) {
     CHECK_EQ(fused[0].chunk.get(), 2u);
 }
 
+// ─── Convex combination (TM2C2) ───────────────────────────────────
+//
+// The property that distinguishes theoretical from empirical min-max: under
+// EMPIRICAL normalization the worst document in a list is pinned to 0 no
+// matter how good it actually was, so a list of uniformly excellent results
+// and a list of uniformly terrible ones normalize identically. Anchoring the
+// minimum to a value the scoring function guarantees keeps that information.
+TEST(convex_combination_uses_theoretical_floor_not_observed) {
+    using namespace rag;
+
+    // One retriever, two queries. In both, the SPREAD is identical (0.1) but
+    // the absolute quality is very different.
+    auto strong = fusion::bm25_list({Hit{ChunkId{1}, Score{9.0f}},
+                                     Hit{ChunkId{2}, Score{8.9f}}});
+    auto weak   = fusion::bm25_list({Hit{ChunkId{1}, Score{0.2f}},
+                                     Hit{ChunkId{2}, Score{0.1f}}});
+
+    std::vector<fusion::RankedList> s{strong};
+    std::vector<fusion::RankedList> w{weak};
+    auto fs = fusion::convex_combination(s);
+    auto fw = fusion::convex_combination(w);
+    REQUIRE(fs.size() == 2);
+    REQUIRE(fw.size() == 2);
+
+    // With a theoretical floor of 0, the second document keeps its relative
+    // standing: 8.9/9.0 stays near the top, 0.1/0.2 does not.
+    CHECK(fs[1].score.get() > 0.9f);
+    CHECK(fw[1].score.get() < 0.6f);
+
+    // Empirical min-max erases exactly that distinction: both lists collapse
+    // to {1, 0}. This is the failure TM2C2 is designed around.
+    auto rs = fusion::rsf(s);
+    auto rw = fusion::rsf(w);
+    CHECK(std::fabs(rs[1].score.get() - rw[1].score.get()) < 1e-6f);
+}
+
+// α must actually move the balance between the two retrievers, and in the
+// documented direction: alpha_list is the index α weights.
+TEST(convex_combination_alpha_shifts_balance) {
+    using namespace rag;
+    // Disjoint lists so each document's fused score comes from exactly one
+    // retriever, making the weighting directly observable.
+    std::vector<fusion::RankedList> lists{
+        fusion::bm25_list({Hit{ChunkId{1}, Score{10.0f}}}),      // lexical
+        fusion::cosine_list({Hit{ChunkId{2}, Score{1.0f}}})};    // dense
+
+    auto dense_heavy = fusion::convex_combination(
+        lists, fusion::ConvexParams{.alpha = 0.9f, .alpha_list = 1});
+    auto lex_heavy = fusion::convex_combination(
+        lists, fusion::ConvexParams{.alpha = 0.1f, .alpha_list = 1});
+
+    REQUIRE(dense_heavy.size() == 2);
+    REQUIRE(lex_heavy.size() == 2);
+    CHECK_EQ(dense_heavy[0].chunk.get(), 2u);   // α on the dense list wins
+    CHECK_EQ(lex_heavy[0].chunk.get(), 1u);     // (1-α) on lexical wins
+}
+
+// A document found by BOTH retrievers should outrank one found by a single
+// retriever at comparable strength — the basic reason to fuse at all.
+TEST(convex_combination_rewards_agreement) {
+    using namespace rag;
+    std::vector<fusion::RankedList> lists{
+        fusion::bm25_list({Hit{ChunkId{1}, Score{9.0f}}, Hit{ChunkId{2}, Score{9.0f}}}),
+        fusion::cosine_list({Hit{ChunkId{2}, Score{0.9f}}, Hit{ChunkId{3}, Score{0.9f}}})};
+    auto fused = fusion::convex_combination(lists, fusion::ConvexParams{.alpha = 0.5f});
+    REQUIRE(!fused.empty());
+    CHECK_EQ(fused[0].chunk.get(), 2u);   // the only doc both retrievers found
+}
+
+// Fusion must be deterministic: it accumulates into a hash map, so ties have
+// to be broken explicitly or result order drifts with allocation addresses.
+TEST(convex_combination_is_deterministic_under_ties) {
+    using namespace rag;
+    std::vector<fusion::RankedList> lists{
+        fusion::bm25_list({Hit{ChunkId{7}, Score{5.0f}}, Hit{ChunkId{3}, Score{5.0f}},
+                           Hit{ChunkId{9}, Score{5.0f}}, Hit{ChunkId{1}, Score{5.0f}}})};
+    auto a = fusion::convex_combination(lists);
+    for (int i = 0; i < 20; ++i) {
+        auto b = fusion::convex_combination(lists);
+        REQUIRE(a.size() == b.size());
+        for (std::size_t j = 0; j < a.size(); ++j)
+            CHECK_EQ(a[j].chunk.get(), b[j].chunk.get());
+    }
+}
+
 TEST(engine_hybrid_search) {
     rag::Engine engine;
     engine.with_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{128}});

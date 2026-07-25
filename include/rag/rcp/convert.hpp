@@ -50,6 +50,11 @@ struct RetrieveParams {
     bool                     include_vectors = false;
     bool                     rerank_requested = false;
     std::size_t              rerank_top_n     = 0;
+    // retrieve.fusion (§7.7 / §16.3). Absent => the server's configured default,
+    // which for rag-cpp is convex combination.
+    std::optional<std::string> fusion_method;   // rrf | weighted | convex
+    std::optional<double>      fusion_rrf_k;
+    std::optional<double>      fusion_alpha;
     Json                     filter = Json(nullptr);  // raw tree; compiled later
 };
 
@@ -87,6 +92,30 @@ parse_retrieve(const Json& p, std::size_t max_k) {
     }
     if (p.contains("candidateK") && p["candidateK"].is_number_integer())
         r.candidate_k = p["candidateK"].get<std::size_t>();
+    // retrieve.fusion (§16.3). Validated here rather than silently ignored: a
+    // client that asks for a strategy we do not implement should be told so,
+    // not quietly served a different ranking.
+    if (p.contains("fusion") && p["fusion"].is_object()) {
+        const auto& f = p["fusion"];
+        if (f.contains("method") && f["method"].is_string()) {
+            auto m = f["method"].get<std::string>();
+            if (m != "rrf" && m != "weighted" && m != "convex")
+                return wire_fail(::rcp::errc::InvalidParams,
+                                 "fusion.method must be rrf|weighted|convex",
+                                 Json{{"field", "fusion.method"}, {"option", m}});
+            r.fusion_method = std::move(m);
+        }
+        if (f.contains("rrfK") && f["rrfK"].is_number())
+            r.fusion_rrf_k = f["rrfK"].get<double>();
+        if (f.contains("alpha") && f["alpha"].is_number()) {
+            double a = f["alpha"].get<double>();
+            if (a < 0.0 || a > 1.0)
+                return wire_fail(::rcp::errc::InvalidParams,
+                                 "fusion.alpha must be in [0,1]",
+                                 Json{{"field", "fusion.alpha"}});
+            r.fusion_alpha = a;
+        }
+    }
     if (p.contains("minScore") && p["minScore"].is_number())
         r.min_score = p["minScore"].get<double>();
     if (p.contains("tokenBudget") && p["tokenBudget"].is_number_integer())
