@@ -27,12 +27,20 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FetchContent)
 
-FetchContent_Declare(nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
-    GIT_SHALLOW    TRUE)
-set(JSON_BuildTests OFF CACHE INTERNAL "")
-FetchContent_MakeAvailable(nlohmann_json)
+# Prefer a system/installed nlohmann_json so the exported package can simply
+# find_dependency(nlohmann_json). Only vendor it via FetchContent when absent;
+# in that case we add it to our own export set so install(EXPORT) stays valid.
+find_package(nlohmann_json 3.11 QUIET)
+if(NOT nlohmann_json_FOUND)
+    FetchContent_Declare(nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG        v3.11.3
+        GIT_SHALLOW    TRUE)
+    set(JSON_BuildTests OFF CACHE INTERNAL "")
+    set(JSON_Install ON CACHE INTERNAL "")   # so it can join our export set
+    FetchContent_MakeAvailable(nlohmann_json)
+    set(RAGCPP_VENDORED_JSON ON)
+endif()
 
 file(GLOB_RECURSE RAGCPP_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
@@ -131,7 +139,49 @@ if(RAGCPP_BUILD_CLI)
 endif()
 
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+# Install the library and headers, and export a relocatable CMake package so a
+# downstream project can simply:
+#     find_package(ragcpp CONFIG REQUIRED)
+#     target_link_libraries(app PRIVATE ragcpp::ragcpp)
 install(TARGETS ragcpp EXPORT ragcppTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# An alias so in-tree consumers (add_subdirectory) and installed consumers
+# (find_package) both spell the target the same way: ragcpp::ragcpp.
+if(NOT TARGET ragcpp::ragcpp)
+    add_library(ragcpp::ragcpp ALIAS ragcpp)
+endif()
+
+set(RAGCPP_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/ragcpp)
+
+install(EXPORT ragcppTargets
+    FILE ragcppTargets.cmake
+    NAMESPACE ragcpp::
+    DESTINATION ${RAGCPP_INSTALL_CMAKEDIR})
+
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ragcppConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/ragcppConfig.cmake
+    INSTALL_DESTINATION ${RAGCPP_INSTALL_CMAKEDIR})
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/ragcppConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/ragcppConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/ragcppConfigVersion.cmake
+    DESTINATION ${RAGCPP_INSTALL_CMAKEDIR})
+
+# Make the build tree itself find_package-able (no install step needed for
+# superbuilds / FetchContent consumers that point CMAKE_PREFIX_PATH here).
+export(EXPORT ragcppTargets
+    FILE ${CMAKE_CURRENT_BINARY_DIR}/ragcppTargets.cmake
+    NAMESPACE ragcpp::)

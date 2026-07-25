@@ -27,6 +27,23 @@ public:
     explicit Engine(index::CorpusConfig cfg)
         : corpus_(std::move(cfg)), pipeline_(pipeline::Pipeline::standard()) {}
 
+    // Adopt an already-built Corpus (e.g. one just loaded from disk). The Engine
+    // takes ownership; the standard pipeline is attached. This is the seam that
+    // lets a saved index become a live, searchable/servable Engine with no
+    // re-indexing.
+    explicit Engine(index::Corpus corpus)
+        : corpus_(std::move(corpus)), pipeline_(pipeline::Pipeline::standard()) {}
+
+    // Open a persisted `.ragdb` container directly into an Engine. Total: the
+    // load error propagates rather than throwing.
+    //   auto eng = rag::Engine::open("docs.ragdb");
+    //   if (eng) for (auto& r : *eng->search("...", 5)) { ... }
+    [[nodiscard]] static Result<Engine> open(const std::string& path) {
+        auto c = index::Corpus::load(path);
+        if (!c) return std::unexpected(c.error());
+        return Engine{std::move(*c)};
+    }
+
     // Attach a dense embedder (enables hybrid). Fluent.
     Engine& with_embedder(dense::AnyEmbedder e) { corpus_.set_embedder(std::move(e)); return *this; }
     Engine& with_pipeline(pipeline::Pipeline p) { pipeline_ = std::move(p); return *this; }

@@ -2,12 +2,14 @@
 //
 //   ragcpp index  <dir> <out.ragdb> [--glob=*.md] [--semantic]
 //   ragcpp query  <db.ragdb> "<query>" [-k N] [--mmr]
+//   ragcpp serve  <db.ragdb> [--http PORT] [--write] [--graph]
 //   ragcpp eval   <beir-dir> [--split=test]
 //   ragcpp info   <db.ragdb>
 //
-// A thin driver over the library so you can build and search a corpus without
-// writing a line of C++. Lexical/BM25 by default (no model, no network); attach
-// an embedder in code for hybrid.
+// A thin driver over the library so you can build, search, and SERVE a corpus
+// without writing a line of C++. Lexical/BM25 by default (no model, no
+// network); attach an embedder in code for hybrid. `serve` brings up a
+// conformant RCP/1 endpoint (github.com/1ay1/rcp) over stdio or HTTP.
 
 #include <cstdio>
 #include <cstring>
@@ -16,6 +18,9 @@
 #include <vector>
 
 #include <rag/rag.hpp>
+#if RAGCPP_WITH_RCP
+#include <rag/rcp/rcp.hpp>
+#endif
 
 namespace {
 
@@ -25,6 +30,7 @@ int usage() {
         "usage:\n"
         "  ragcpp index <dir> <out.ragdb> [--glob=PATTERN] [--semantic]\n"
         "  ragcpp query <db.ragdb> \"<query>\" [-k N] [--mmr]\n"
+        "  ragcpp serve <db.ragdb> [--http PORT] [--write] [--graph]\n"
         "  ragcpp eval  <beir-dir> [--split=test]\n"
         "  ragcpp info  <db.ragdb>\n");
     return 2;
@@ -98,6 +104,43 @@ int cmd_eval(const std::vector<std::string>& args) {
     return 0;
 }
 
+#if RAGCPP_WITH_RCP
+// Bring up an RCP/1 server backed by a saved corpus. stdio by default (the
+// convention for editor / agent integration); `--http PORT` for loopback HTTP.
+// `--write` advertises a writable index; `--graph` advertises GraphRAG.
+int cmd_serve(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    auto engine = rag::Engine::open(args[0]);
+    if (!engine) { std::printf("open error: %s\n", engine.error().message.c_str()); return 1; }
+
+    // Resolve --http PORT (space-separated) and boolean feature flags.
+    int http_port = -1;
+    for (std::size_t i = 1; i < args.size(); ++i)
+        if (args[i] == "--http" && i + 1 < args.size()) http_port = std::stoi(args[i + 1]);
+
+    rag::rcp::Options opts;
+    opts.named("ragcpp", "1.0");
+    if (flag(args, "--write")) opts.with_index(true);
+    if (flag(args, "--graph")) opts.with_graph(true);
+
+    if (http_port > 0) {
+        std::fprintf(stderr, "ragcpp: RCP/1 server on http://127.0.0.1:%d  (corpus: %s)\n",
+                     http_port, args[0].c_str());
+        auto r = rag::rcp::serve_http(*engine, static_cast<std::uint16_t>(http_port), std::move(opts));
+        if (!r) { std::printf("serve error: %s\n", r.error().message.c_str()); return 1; }
+        return 0;
+    }
+    std::fprintf(stderr, "ragcpp: RCP/1 server on stdio  (corpus: %s)\n", args[0].c_str());
+    rag::rcp::serve_stdio(*engine, std::move(opts));
+    return 0;
+}
+#else
+int cmd_serve(const std::vector<std::string>&) {
+    std::printf("serve: rebuild with -DRAGCPP_WITH_RCP=ON to enable the RCP/1 server\n");
+    return 1;
+}
+#endif
+
 int cmd_info(const std::vector<std::string>& args) {
     if (args.empty()) return usage();
     auto corpus = rag::index::Corpus::load(args[0]);
@@ -116,6 +159,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> args(argv + 2, argv + argc);
     if (cmd == "index") return cmd_index(args);
     if (cmd == "query") return cmd_query(args);
+    if (cmd == "serve") return cmd_serve(args);
     if (cmd == "eval")  return cmd_eval(args);
     if (cmd == "info")  return cmd_info(args);
     return usage();

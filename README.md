@@ -145,14 +145,40 @@ dependency (nlohmann/json) is fetched via `FetchContent`.
 
 ## CLI
 
-The `ragcpp` binary builds and searches a corpus with no code:
+The `ragcpp` binary builds, searches, and **serves** a corpus with no code:
 
 ```sh
 ragcpp index ./docs corpus.ragdb      # walk a directory, chunk, index, save
 ragcpp info  corpus.ragdb             # document/chunk counts
 ragcpp query corpus.ragdb "my question" -k 5 --mmr
+ragcpp serve corpus.ragdb             # a conformant RCP/1 server over stdio
+ragcpp serve corpus.ragdb --http 8000 --write --graph   # HTTP + writable index + GraphRAG
 ragcpp eval  ./nfcorpus --split=test  # BEIR metrics
 ```
+
+`ragcpp serve` opens a saved `.ragdb` and brings up an [RCP/1](https://github.com/1ay1/rcp)
+endpoint with **zero C++** — L2-certified, driveable by any RCP client. `--write`
+advertises a writable index (`index/add`+`index/delete` with upsert); `--graph`
+advertises GraphRAG local/global search.
+
+## Use rag-cpp as a library
+
+rag-cpp installs a relocatable CMake package, so consuming it from another
+project is one `find_package` away — the dependency on nlohmann/json is resolved
+for you:
+
+```cmake
+find_package(ragcpp CONFIG REQUIRED)
+target_link_libraries(app PRIVATE ragcpp::ragcpp)
+```
+
+```sh
+cmake --install build --prefix /usr/local     # or any prefix on CMAKE_PREFIX_PATH
+```
+
+Or vendor it directly with FetchContent / `add_subdirectory` — the same
+`ragcpp::ragcpp` target name works in-tree and installed.
+
 
 ## Serve over RCP (the Retrieval Context Protocol)
 

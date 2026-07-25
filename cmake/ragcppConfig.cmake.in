@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+# ragcppConfig.cmake — the find_package(ragcpp CONFIG) entry point.
+#
+# Re-establishes rag-cpp's public dependencies before importing the targets, so
+# a downstream `target_link_libraries(app PRIVATE ragcpp::ragcpp)` resolves
+# cleanly. rag-cpp PUBLIC-links nlohmann_json (headers appear in its public API).
+
+include(CMakeFindDependencyMacro)
+find_dependency(nlohmann_json)
+
+include("${CMAKE_CURRENT_LIST_DIR}/ragcppTargets.cmake")
+
+check_required_components(ragcpp)
