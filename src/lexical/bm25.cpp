@@ -37,6 +37,17 @@ std::size_t Bm25Index::add(std::uint32_t id, std::string_view text) {
 void Bm25Index::finalize() {
     avgdl_ = doc_len_.empty() ? 0.0f
            : static_cast<float>(total_len_ / static_cast<double>(doc_len_.size()));
+
+    // Materialize the dense doc-length mirror. Worth it only when ordinals are
+    // actually dense (a corpus assigns them contiguously); if the id space is
+    // sparse we skip it and scoring keeps using the hash map.
+    dense_len_.clear();
+    max_doc_ = 0;
+    for (const auto& [d, _] : doc_len_) max_doc_ = std::max(max_doc_, d);
+    if (!doc_len_.empty() && static_cast<std::size_t>(max_doc_) < doc_len_.size() * 2) {
+        dense_len_.assign(static_cast<std::size_t>(max_doc_) + 1, 0);
+        for (const auto& [d, l] : doc_len_) dense_len_[d] = l;
+    }
     finalized_ = true;
 }
 
@@ -79,8 +90,46 @@ std::vector<Hit> Bm25Index::search(std::string_view query, std::size_t k) const 
 
     const float avgdl = avgdl_ > 0 ? avgdl_ : 1.0f;
     const float k1 = params_.k1, b = params_.b;
+    const float inv_avgdl = 1.0f / avgdl;
 
-    // Accumulate scores via a document-at-a-time-ish scan over query postings.
+    // Fast path: dense ordinals. Accumulate into a flat array and track which
+    // slots were touched, so we neither hash per posting nor scan the whole
+    // corpus afterwards. This is the inner loop of every lexical query.
+    if (!dense_len_.empty()) {
+        std::vector<float>         acc(dense_len_.size(), 0.0f);
+        std::vector<std::uint32_t> touched;
+        touched.reserve(1024);
+
+        for (const auto& term : q_terms) {
+            auto pit = postings_.find(term);
+            if (pit == postings_.end()) continue;
+            const auto& plist = pit->second;
+            const float term_idf = idf(plist.size());
+            for (const auto& p : plist) {
+                if (p.doc >= acc.size()) continue;
+                const std::uint32_t dl_raw = dense_len_[p.doc];
+                const float dl  = dl_raw ? static_cast<float>(dl_raw) : avgdl;
+                const float f   = static_cast<float>(p.tf);
+                const float num = f * (k1 + 1.0f);
+                const float den = f + k1 * (1.0f - b + b * dl * inv_avgdl);
+                if (acc[p.doc] == 0.0f) touched.push_back(p.doc);
+                acc[p.doc] += term_idf * (num / den);
+            }
+        }
+
+        std::vector<Hit> hits;
+        hits.reserve(touched.size());
+        for (std::uint32_t d : touched) hits.push_back(Hit{ChunkId{d}, Score{acc[d]}});
+
+        const std::size_t kk = std::min(k, hits.size());
+        std::partial_sort(hits.begin(), hits.begin() + static_cast<std::ptrdiff_t>(kk),
+                          hits.end(),
+                          [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
+        hits.resize(kk);
+        return hits;
+    }
+
+    // Fallback: sparse ordinal space, accumulate in a hash map.
     std::unordered_map<std::uint32_t, float> acc;
     for (const auto& term : q_terms) {
         auto pit = postings_.find(term);
@@ -93,7 +142,7 @@ std::vector<Hit> Bm25Index::search(std::string_view query, std::size_t k) const 
                            : static_cast<float>(dl_it->second);
             const float f = static_cast<float>(p.tf);
             const float num = f * (k1 + 1.0f);
-            const float den = f + k1 * (1.0f - b + b * dl / avgdl);
+            const float den = f + k1 * (1.0f - b + b * dl * inv_avgdl);
             acc[p.doc] += term_idf * (num / den);
         }
     }

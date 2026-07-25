@@ -68,6 +68,14 @@ private:
     std::unordered_map<std::string, std::vector<Posting>> postings_;
     // doc ordinal -> token count.
     std::unordered_map<std::uint32_t, std::uint32_t> doc_len_;
+
+    // Dense mirror of doc_len_, built by finalize(). Doc ordinals are dense and
+    // contiguous in a corpus, so scoring can index an array instead of hashing
+    // once per POSTING — the inner loop of every lexical query. dense_len_ is
+    // empty until finalize(); scoring falls back to the map if so.
+    std::vector<std::uint32_t> dense_len_;
+    std::uint32_t              max_doc_ = 0;
+
     double  total_len_ = 0.0;
     float   avgdl_     = 0.0f;
     bool    finalized_ = false;

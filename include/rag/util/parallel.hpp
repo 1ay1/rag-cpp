@@ -100,6 +100,15 @@ inline ThreadPool& pool() {
 // How many workers a parallel region will use (including the caller).
 [[nodiscard]] inline std::size_t max_workers() noexcept { return pool().size() + 1; }
 
+// How many contiguous blocks parallel_blocks(n) will produce. Callers that
+// need one private accumulator per block can size their vector up front.
+[[nodiscard]] inline std::size_t block_count(std::size_t n) noexcept {
+    if (n == 0) return 0;
+    const std::size_t workers = max_workers();
+    if (n < kParallelMin || workers <= 1) return 1;
+    return workers < n ? workers : n;
+}
+
 // Run `body(i)` for i in [0,n). Contiguous static blocking; the calling thread
 // takes the last block. Serial below kParallelMin or when the pool is empty.
 template <class F>
@@ -138,13 +147,15 @@ void parallel_for(std::size_t n, F&& body) {
     done_cv.wait(lk, [&] { return remaining.load(std::memory_order_acquire) == 0; });
 }
 
-// Run `body(lo, hi)` once per contiguous block. Use when a worker wants to
-// amortize setup (scratch buffers, a local top-k heap) across its whole range.
+// Run `body(lo, hi, block_index)` once per contiguous block. Use when a worker
+// wants to amortize setup (scratch buffers, a local top-k heap) across its
+// whole range; `block_index` in [0, block_count(n)) indexes per-block state
+// without any atomics.
 template <class F>
 void parallel_blocks(std::size_t n, F&& body) {
     if (n == 0) return;
     const std::size_t workers = max_workers();
-    if (n < kParallelMin || workers <= 1) { body(std::size_t{0}, n); return; }
+    if (n < kParallelMin || workers <= 1) { body(std::size_t{0}, n, std::size_t{0}); return; }
 
     const std::size_t blocks = workers < n ? workers : n;
     const std::size_t chunk  = (n + blocks - 1) / blocks;
@@ -156,15 +167,15 @@ void parallel_blocks(std::size_t n, F&& body) {
     for (std::size_t b = 0; b + 1 < blocks; ++b) {
         const std::size_t lo = b * chunk;
         const std::size_t hi = lo + chunk < n ? lo + chunk : n;
-        pool().submit([lo, hi, &body, &remaining, &done_mu, &done_cv] {
-            body(lo, hi);
+        pool().submit([lo, hi, b, &body, &remaining, &done_mu, &done_cv] {
+            body(lo, hi, b);
             if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                 std::lock_guard lk(done_mu);
                 done_cv.notify_one();
             }
         });
     }
-    body((blocks - 1) * chunk, n);
+    body((blocks - 1) * chunk, n, blocks - 1);
 
     std::unique_lock lk(done_mu);
     done_cv.wait(lk, [&] { return remaining.load(std::memory_order_acquire) == 0; });

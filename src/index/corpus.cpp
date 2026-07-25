@@ -3,8 +3,10 @@
 #include "rag/index/corpus.hpp"
 #include "rag/dense/simd.hpp"
 #include "rag/store/container.hpp"
+#include "rag/util/parallel.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <fstream>
 
@@ -161,15 +163,31 @@ Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_
         return allow ? hnsw_->search_filtered(*qv, k, allow) : hnsw_->search(*qv, k);
     }
 
+    // Brute-force scan. Parallel over contiguous blocks: each worker scores its
+    // own range into a private buffer, then we concatenate and select. Scoring
+    // is pure (reads immutable embeddings), so no synchronization is needed
+    // beyond the join.
+    const std::size_t n = chunks_.size();
+    std::vector<std::vector<Hit>> parts(util::block_count(n));
+
+    util::parallel_blocks(n, [&](std::size_t lo, std::size_t hi, std::size_t b) {
+        auto& local = parts[b];
+        local.reserve((hi - lo) / 4 + 8);
+        for (std::size_t i = lo; i < hi; ++i) {
+            const auto& ch = chunks_[i];
+            if (ch.embedding.empty()) continue;
+            if (!deleted_docs_.empty() && deleted_docs_.count(ch.doc.get())) continue;
+            if (allow && !allow(ch.id.get())) continue;
+            local.push_back(Hit{ch.id, Score{dense::dot(ch.embedding, *qv)}});
+        }
+    });
+
     std::vector<Hit> hits;
-    hits.reserve(chunks_.size());
-    for (const auto& ch : chunks_) {
-        if (ch.embedding.empty()) continue;
-        if (!deleted_docs_.empty() && deleted_docs_.count(ch.doc.get())) continue;
-        if (allow && !allow(ch.id.get())) continue;
-        float s = dense::dot(ch.embedding, *qv);
-        hits.push_back(Hit{ch.id, Score{s}});
-    }
+    std::size_t total = 0;
+    for (const auto& p : parts) total += p.size();
+    hits.reserve(total);
+    for (auto& p : parts) hits.insert(hits.end(), p.begin(), p.end());
+
     const std::size_t kk = std::min(k, hits.size());
     std::partial_sort(hits.begin(), hits.begin() + static_cast<std::ptrdiff_t>(kk), hits.end(),
         [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
