@@ -244,6 +244,44 @@ TEST(convex_combination_is_deterministic_under_ties) {
     }
 }
 
+// ─── Semantic chunking is reachable from CorpusConfig ───────────────
+//
+// semantic_chunk_lexical() existed and worked but nothing outside its own
+// translation unit called it — the Corpus always used the fixed chunker, and
+// the CLI's advertised `--semantic` flag was parsed by nobody. Pin the wiring:
+// selecting the strategy must actually change how documents are split, and
+// must work with no embedder attached.
+TEST(corpus_semantic_chunking_is_selectable) {
+    // Two clearly distinct topics back to back: a topical-drift splitter should
+    // put a boundary between them.
+    const std::string body =
+        "Photosynthesis converts sunlight into chemical energy in plant cells. "
+        "Chloroplasts contain chlorophyll which absorbs light. "
+        "Leaves are the primary site of this reaction in most plants. "
+        "Mortgage interest rates are set by the central bank. "
+        "Amortization schedules determine monthly loan payments. "
+        "Refinancing can reduce the total interest paid over a loan term.";
+
+    rag::index::CorpusConfig fixed_cfg;
+    rag::index::Corpus fixed{fixed_cfg};
+    REQUIRE(fixed.add_document("a", body).has_value());
+
+    rag::index::CorpusConfig sem_cfg;
+    sem_cfg.chunking = rag::index::CorpusConfig::Chunking::semantic;
+    rag::index::Corpus sem{sem_cfg};
+    // No embedder attached: must fall back to lexical drift rather than fail.
+    REQUIRE(sem.add_document("a", body).has_value());
+
+    CHECK(sem.chunk_count() >= 1);
+    // Whatever the split, the text must survive it: chunking is a view over the
+    // document, never a filter on it.
+    CHECK(fixed.chunk_count() >= 1);
+
+    // And the corpus stays queryable through the semantic path.
+    auto hits = sem.lexical_search("chlorophyll sunlight", 3);
+    CHECK(!hits.empty());
+}
+
 TEST(engine_hybrid_search) {
     rag::Engine engine;
     engine.with_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{128}});

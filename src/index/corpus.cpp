@@ -43,7 +43,18 @@ Result<DocId> Corpus::add_document(std::string uri, std::string text, Metadata m
     docs_.push_back(std::move(doc));
     const Document& stored = docs_.back();
 
-    auto new_chunks = text::chunk_document(did, stored.text, cfg_.chunk);
+    auto new_chunks = [&] {
+        if (cfg_.chunking != CorpusConfig::Chunking::semantic)
+            return text::chunk_document(did, stored.text, cfg_.chunk);
+        // Semantic chunking prefers the embedder (true topical drift) but must
+        // degrade rather than fail: an unavailable backend should change chunk
+        // BOUNDARIES, never make ingest impossible.
+        if (embedder_) {
+            if (auto sc = text::semantic_chunk(did, stored.text, *embedder_, cfg_.semantic))
+                return std::move(*sc);
+        }
+        return text::semantic_chunk_lexical(did, stored.text, cfg_.semantic);
+    }();
     for (auto& ch : new_chunks) {
         ChunkId cid{static_cast<std::uint32_t>(chunks_.size())};
         ch.id   = cid;

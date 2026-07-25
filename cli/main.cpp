@@ -1,8 +1,8 @@
 // cli/main.cpp — the `ragcpp` turnkey command-line tool.
 //
-//   ragcpp index  <dir> <out.ragdb> [--glob=*.md] [--semantic]
+//   ragcpp index  <dir> <out.ragdb> [--ext=.md] [--semantic]
 //   ragcpp query  <db.ragdb> "<query>" [-k N] [--mmr]
-//   ragcpp serve  <db.ragdb> [--http PORT] [--write] [--graph]
+//   ragcpp serve  <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]
 //   ragcpp eval   <beir-dir> [--split=test]
 //   ragcpp info   <db.ragdb>
 //
@@ -28,9 +28,9 @@ int usage() {
     std::printf(
         "ragcpp — a type-theoretic RAG engine\n\n"
         "usage:\n"
-        "  ragcpp index <dir> <out.ragdb> [--glob=PATTERN] [--semantic]\n"
+        "  ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic]\n"
         "  ragcpp query <db.ragdb> \"<query>\" [-k N] [--mmr]\n"
-        "  ragcpp serve <db.ragdb> [--http PORT] [--write] [--graph]\n"
+        "  ragcpp serve <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]\n"
         "  ragcpp eval  <beir-dir> [--split=test]\n"
         "  ragcpp info  <db.ragdb>\n");
     return 2;
@@ -52,10 +52,24 @@ int cmd_index(const std::vector<std::string>& args) {
     const std::string& dir = args[0];
     const std::string& out = args[1];
 
-    rag::index::Corpus corpus;
+    rag::index::CorpusConfig ccfg;
+    if (flag(args, "--semantic"))
+        ccfg.chunking = rag::index::CorpusConfig::Chunking::semantic;
+    rag::index::Corpus corpus{ccfg};
     rag::loaders::DirOptions lo;
-    std::string ext = opt(args, "--glob", "");   // e.g. --glob=.md restricts to one ext
-    if (!ext.empty()) { if (ext[0] != '.') ext = "." + ext; lo.include_ext = {ext}; }
+    // --ext restricts by FILE EXTENSION. This was previously spelled --glob,
+    // which was actively misleading: it never accepted a pattern, so
+    // `--glob='*.md'` silently matched nothing and indexed zero documents.
+    // The old spelling still works so existing invocations do not break.
+    std::string ext = opt(args, "--ext", "");
+    if (ext.empty()) ext = opt(args, "--glob", "");
+    if (!ext.empty()) {
+        // Accept .md, md, and *.md alike rather than failing silently on the
+        // form a user would most naturally reach for.
+        if (ext.rfind("*.", 0) == 0) ext.erase(0, 1);
+        if (ext[0] != '.') ext = "." + ext;
+        lo.include_ext = {ext};
+    }
     auto docs = rag::loaders::load_directory(dir, lo);
     if (!docs) { std::printf("load error: %s\n", docs.error().message.c_str()); return 1; }
 
@@ -122,6 +136,18 @@ int cmd_serve(const std::vector<std::string>& args) {
     opts.named("ragcpp", "1.0");
     if (flag(args, "--write")) opts.with_index(true);
     if (flag(args, "--graph")) opts.with_graph(true);
+    // memory/* and feedback/* are backed entirely by the engine itself — they
+    // need no external model, no API key and no extra process. Leaving them off
+    // by default meant the turnkey server advertised strictly less than it could
+    // actually do; --all turns on everything that costs nothing to provide.
+    if (flag(args, "--all")) {
+        opts.with_memory(true);
+        opts.with_feedback(true);
+        opts.with_graph(true);
+    } else {
+        if (flag(args, "--memory"))   opts.with_memory(true);
+        if (flag(args, "--feedback")) opts.with_feedback(true);
+    }
 
     if (http_port > 0) {
         std::fprintf(stderr, "ragcpp: RCP/1 server on http://127.0.0.1:%d  (corpus: %s)\n",

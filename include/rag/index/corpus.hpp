@@ -22,6 +22,7 @@
 #include "rag/index/hnsw.hpp"
 #include "rag/lexical/bm25.hpp"
 #include "rag/text/chunker.hpp"
+#include "rag/text/semantic_chunker.hpp"
 
 namespace rag::index {
 
@@ -34,6 +35,19 @@ struct CorpusConfig {
     // cosine is faster and exact.
     std::size_t            hnsw_threshold = 2000;
     std::size_t            embed_batch    = 32;
+
+    // How documents are split. `fixed` is the structural chunker (headings +
+    // token windows): fast, deterministic, and the right default. `semantic`
+    // places boundaries where the topic actually drifts, which produces more
+    // self-contained chunks on prose at the cost of a similarity pass over
+    // adjacent sentences.
+    //
+    // `semantic` uses the embedder when one is attached and falls back to
+    // lexical (Jaccard) drift otherwise, so it never becomes a hard dependency
+    // on an embedding backend.
+    enum class Chunking { fixed, semantic };
+    Chunking               chunking = Chunking::fixed;
+    text::SemanticChunkOptions semantic{};
 };
 
 // Predicate over a chunk's document metadata for filtered retrieval.
