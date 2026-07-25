@@ -161,25 +161,35 @@ namespace {
 Result<void> feature_rerank(std::string_view query, std::vector<Hit>& cands,
                             const index::Corpus& corpus) {
     auto q_terms = corpus.tokenizer().tokenize(query);
-    std::unordered_set<std::string> qset(q_terms.begin(), q_terms.end());
-    if (qset.empty()) return {};
+    if (q_terms.empty()) return {};
+    // Distinct query terms — coverage is over the SET, not the multiset.
+    std::sort(q_terms.begin(), q_terms.end());
+    q_terms.erase(std::unique(q_terms.begin(), q_terms.end()), q_terms.end());
+    const float nq = static_cast<float>(q_terms.size());
 
     // Normalize fusion scores to [0,1] for a stable blend.
     float lo = 1e30f, hi = -1e30f;
     for (auto& h : cands) { lo = std::min(lo, h.score.get()); hi = std::max(hi, h.score.get()); }
     float range = hi - lo;
 
-    for (auto& h : cands) {
-        const Chunk* ch = corpus.chunk(h.chunk);
-        if (!ch) continue;
-        auto terms = corpus.tokenizer().tokenize(ch->indexed_text());
-        std::unordered_set<std::string> tset(terms.begin(), terms.end());
-        std::size_t hit = 0;
-        for (const auto& q : qset) if (tset.contains(q)) ++hit;
-        float coverage = static_cast<float>(hit) / static_cast<float>(qset.size());
-        float base = range > 1e-9f ? (h.score.get() - lo) / range : 1.0f;
+    // Coverage from the INVERTED INDEX. The previous implementation tokenized
+    // every candidate's full text and built an unordered_set per candidate:
+    // with ~60 candidates per query that is thousands of string allocations
+    // and hash inserts per query, and it made the hybrid path an order of
+    // magnitude slower than either of its halves (2.2ms vs 0.15/0.24ms).
+    // The index already records which chunks contain which terms; asking it
+    // costs one merge-walk of the query terms' postings, no tokenization.
+    std::vector<std::uint32_t> ids;
+    ids.reserve(cands.size());
+    for (const auto& h : cands) ids.push_back(h.chunk.get());
+    std::vector<std::uint32_t> covered;
+    corpus.term_coverage(q_terms, ids, covered);
+
+    for (std::size_t i = 0; i < cands.size(); ++i) {
+        float coverage = static_cast<float>(covered[i]) / nq;
+        float base = range > 1e-9f ? (cands[i].score.get() - lo) / range : 1.0f;
         // 0.6 fusion + 0.4 coverage — coverage anchors on ABSOLUTE term presence.
-        h.score = Score{0.6f * base + 0.4f * coverage};
+        cands[i].score = Score{0.6f * base + 0.4f * coverage};
     }
     return {};
 }

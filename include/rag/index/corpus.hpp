@@ -108,6 +108,15 @@ public:
     [[nodiscard]] const std::vector<Chunk>& chunks() const { ensure_linked(); return chunks_; }
     [[nodiscard]] const text::Tokenizer& tokenizer() const noexcept { return bm25_.tokenizer(); }
 
+    // Distinct-query-term coverage for a candidate set, answered from the
+    // inverted index rather than by re-tokenizing each candidate's text.
+    // See Bm25Index::term_coverage.
+    void term_coverage(const std::vector<std::string>& q_terms,
+                       std::span<const std::uint32_t> chunk_ids,
+                       std::vector<std::uint32_t>& out) const {
+        bm25_.term_coverage(q_terms, chunk_ids, out);
+    }
+
     // Apply a metadata filter, returning the ids that pass (for pre/post-filter).
     [[nodiscard]] bool passes(ChunkId id, const MetaFilter& f) const;
 

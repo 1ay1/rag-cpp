@@ -10,6 +10,7 @@
 // always positive so common terms never contribute negatively).
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -56,6 +57,22 @@ public:
     // to rescore a candidate set consistently).
     [[nodiscard]] float score_doc(const std::vector<std::string>& q_terms,
                                   std::uint32_t doc_id) const;
+
+    // For each doc in `docs`, how many of the DISTINCT terms in `q_terms`
+    // occur in it, written to `out` (same order, same size).
+    //
+    // This is the lexical-coverage feature the reranker needs, and computing
+    // it from the inverted index is asymptotically better than the obvious
+    // per-candidate approach: re-tokenizing every candidate's full text costs
+    // O(candidates × doc_length) with a string allocation per token, whereas
+    // walking the postings of the (few) query terms costs O(query_terms ×
+    // log postings) with no tokenization and no allocation at all. The index
+    // already knows which documents contain which terms — asking it is both
+    // faster and, since it is the same analysis chain that produced the
+    // postings, strictly more consistent than re-deriving the answer.
+    void term_coverage(const std::vector<std::string>& q_terms,
+                       std::span<const std::uint32_t> docs,
+                       std::vector<std::uint32_t>& out) const;
 
     [[nodiscard]] std::size_t size()      const noexcept { return doc_len_.size(); }
     [[nodiscard]] std::size_t vocab_size() const noexcept { return postings_.size(); }

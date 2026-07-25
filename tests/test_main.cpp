@@ -478,6 +478,60 @@ TEST(lexical_search_works_without_explicit_build) {
     CHECK_EQ(d->uri, std::string("needle.md"));
 }
 
+// ─── Coverage from the inverted index ───────────────────────────
+//
+// feature_rerank blends fusion rank with lexical coverage: how many distinct
+// query terms occur in a candidate. That used to be computed by re-tokenizing
+// every candidate's text and building a set per candidate. It is now answered
+// from the postings, which is much faster — but only legitimate if the answer
+// is IDENTICAL. This test is the equivalence proof: the postings walk must
+// agree with the re-tokenize reference on every (query, candidate) pair.
+TEST(term_coverage_matches_retokenization) {
+    static const char* w[] = {"vector","index","query","embedding","token","rank",
+                              "fusion","graph","sparse","dense","chunk","corpus",
+                              "search","semantic","neural","lexical"};
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<int> pick(0, 15);
+
+    rag::index::Corpus corpus;
+    for (int i = 0; i < 400; ++i) {
+        std::string s;
+        for (int j = 0; j < 40; ++j) { s += w[pick(rng)]; s += ' '; }
+        corpus.add_document("d" + std::to_string(i) + ".md", s);
+    }
+    (void)corpus.build();
+
+    std::size_t compared = 0, mismatches = 0;
+    for (int q = 0; q < 40; ++q) {
+        std::string qs;
+        for (int j = 0; j < 3; ++j) { qs += w[pick(rng)]; qs += ' '; }
+        auto terms = corpus.tokenizer().tokenize(qs);
+        std::sort(terms.begin(), terms.end());
+        terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
+
+        auto hits = corpus.lexical_search(qs, 30);
+        std::vector<std::uint32_t> ids;
+        for (auto& h : hits) ids.push_back(h.chunk.get());
+        std::vector<std::uint32_t> fast;
+        corpus.term_coverage(terms, ids, fast);
+        REQUIRE(fast.size() == ids.size());
+
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            const auto* ch = corpus.chunk(rag::ChunkId{ids[i]});
+            REQUIRE(ch);
+            auto ct = corpus.tokenizer().tokenize(ch->indexed_text());
+            std::sort(ct.begin(), ct.end());
+            std::uint32_t slow = 0;
+            for (const auto& t : terms)
+                if (std::binary_search(ct.begin(), ct.end(), t)) ++slow;
+            ++compared;
+            if (slow != fast[i]) ++mismatches;
+        }
+    }
+    CHECK(compared > 100);       // the comparison actually exercised something
+    CHECK_EQ(mismatches, std::size_t{0});
+}
+
 // ─── Persistence container round-trip ──────────────────────────────────
 TEST(container_roundtrip_and_crc) {
     rag::store::Container c;

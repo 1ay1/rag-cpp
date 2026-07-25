@@ -58,6 +58,42 @@ float Bm25Index::idf(std::size_t n_t) const {
                                              (static_cast<double>(n_t) + 0.5)));
 }
 
+void Bm25Index::term_coverage(const std::vector<std::string>& q_terms,
+                              std::span<const std::uint32_t> docs,
+                              std::vector<std::uint32_t>& out) const {
+    out.assign(docs.size(), 0);
+    if (docs.empty() || q_terms.empty()) return;
+
+    // Map doc id -> its slot in `out`. `docs` is a candidate list (tens of
+    // entries), so a small sorted index beats a hash map and needs no
+    // allocation beyond one vector.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> slot;
+    slot.reserve(docs.size());
+    for (std::uint32_t i = 0; i < docs.size(); ++i) slot.emplace_back(docs[i], i);
+    std::sort(slot.begin(), slot.end());
+
+    // One pass per DISTINCT query term. Because each term is visited once, a
+    // doc can be credited at most once per term — which is exactly the
+    // "distinct terms covered" semantics, with no per-candidate dedup needed.
+    std::vector<std::string> uniq = q_terms;
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+
+    for (const auto& t : uniq) {
+        auto pit = postings_.find(t);
+        if (pit == postings_.end()) continue;
+        const auto& plist = pit->second;
+        // Postings are sorted by doc id and so is `slot`: walk both once
+        // rather than searching one inside the other.
+        std::size_t pi = 0, si = 0;
+        while (pi < plist.size() && si < slot.size()) {
+            if (plist[pi].doc < slot[si].first)      ++pi;
+            else if (slot[si].first < plist[pi].doc) ++si;
+            else { ++out[slot[si].second]; ++pi; ++si; }
+        }
+    }
+}
+
 float Bm25Index::score_doc(const std::vector<std::string>& q_terms,
                            std::uint32_t doc_id) const {
     auto dl_it = doc_len_.find(doc_id);
