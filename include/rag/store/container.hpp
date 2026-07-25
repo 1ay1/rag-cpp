@@ -43,6 +43,11 @@ public:
 
     // Convenience: write to / read from a file path.
     [[nodiscard]] Result<void> write_file(const std::string& path) const;
+
+    // Delete `<path>.tmp.<pid>.*` files whose owning process is gone. Called
+    // automatically after a successful write_file; exposed so a host can also
+    // reclaim space at startup without performing a save.
+    static void sweep_orphan_temps(const std::string& path);
     [[nodiscard]] static Result<Container> read_file(const std::string& path);
 
 private:

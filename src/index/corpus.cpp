@@ -36,6 +36,23 @@ void Corpus::move_from(Corpus&& o) {
 }
 
 Result<DocId> Corpus::add_document(std::string uri, std::string text, Metadata meta, std::string title) {
+    std::unique_lock lk(mu_);
+    return add_document_locked(std::move(uri), std::move(text), std::move(meta), std::move(title));
+}
+
+Result<DocId> Corpus::upsert_document(std::string uri, std::string text, Metadata meta,
+                                      std::string title) {
+    // ONE lock across find + remove + add, so two threads upserting the same
+    // uri cannot both miss and both insert.
+    std::unique_lock lk(mu_);
+    if (!uri.empty())
+        if (auto existing = find_by_uri_locked(uri))
+            (void)remove_document_locked(*existing);
+    return add_document_locked(std::move(uri), std::move(text), std::move(meta), std::move(title));
+}
+
+Result<DocId> Corpus::add_document_locked(std::string uri, std::string text, Metadata meta,
+                                          std::string title) {
     DocId did{static_cast<std::uint32_t>(docs_.size())};
     Document doc;
     doc.id = did; doc.uri = std::move(uri); doc.title = std::move(title);
@@ -77,6 +94,11 @@ Result<DocId> Corpus::add_document(std::string uri, std::string text, Metadata m
 }
 
 void Corpus::ensure_linked() const {
+    // Double-checked: the common case is a clean corpus, where this is a single
+    // relaxed read and no lock at all. Only the rare stale case pays for the
+    // mutex, and the re-check inside it stops two readers from both relinking.
+    if (!meta_stale_) return;
+    std::lock_guard lk(lazy_mu_);
     if (!meta_stale_) return;
     const_cast<Corpus*>(this)->relink_meta();
     meta_stale_ = false;
@@ -135,6 +157,11 @@ Result<void> Corpus::embed_pending() {
 }
 
 Result<void> Corpus::build() {
+    std::unique_lock lk(mu_);
+    return build_locked();
+}
+
+Result<void> Corpus::build_locked() {
     ensure_linked();
     bm25_.finalize();
     if (embedder_) {
@@ -161,18 +188,30 @@ Result<void> Corpus::build() {
 }
 
 std::vector<Hit> Corpus::lexical_search(std::string_view query, std::size_t k) const {
+    std::shared_lock lk(mu_);
+    return lexical_search_locked(query, k);
+}
+
+std::vector<Hit> Corpus::lexical_search_locked(std::string_view query, std::size_t k) const {
     // add_document() no longer finalizes on every insert (that was quadratic);
     // a caller may therefore query without an intervening build(). finalize()
     // is idempotent and pure in the accumulated counts, so bringing it up to
     // date here is both cheap and correct.
-    if (!bm25_.finalized()) const_cast<Corpus*>(this)->bm25_.finalize();
+    //
+    // It is also a WRITE performed under a shared lock, so it needs lazy_mu_:
+    // without it two concurrent readers would finalize the same index at the
+    // same time. Double-checked, so a finalized index costs one bool read.
+    if (!bm25_.finalized()) {
+        std::lock_guard lz(lazy_mu_);
+        if (!bm25_.finalized()) const_cast<Corpus*>(this)->bm25_.finalize();
+    }
     if (deleted_docs_.empty()) return bm25_.search(query, k);
     // Over-fetch, then drop tombstoned chunks and truncate to k.
     auto hits = bm25_.search(query, k + deleted_docs_.size() * 2 + k);
     std::vector<Hit> out;
     out.reserve(std::min(hits.size(), k));
     for (const auto& h : hits) {
-        const Chunk* ch = chunk(h.chunk);
+        const Chunk* ch = chunk_locked(h.chunk);
         if (ch && deleted_docs_.count(ch->doc.get())) continue;
         out.push_back(h);
         if (out.size() >= k) break;
@@ -181,6 +220,11 @@ std::vector<Hit> Corpus::lexical_search(std::string_view query, std::size_t k) c
 }
 
 Result<void> Corpus::remove_document(DocId id) {
+    std::unique_lock lk(mu_);
+    return remove_document_locked(id);
+}
+
+Result<void> Corpus::remove_document_locked(DocId id) {
     ensure_linked();
     if (id.get() >= docs_.size() || deleted_docs_.count(id.get()))
         return fail<void>(Errc::not_found, "remove_document: unknown or already-deleted id");
@@ -192,8 +236,14 @@ Result<void> Corpus::remove_document(DocId id) {
     return {};
 }
 
-bool Corpus::is_deleted(DocId id) const noexcept { return deleted_docs_.count(id.get()) != 0; }
-std::size_t Corpus::live_document_count() const noexcept { return docs_.size() - deleted_docs_.size(); }
+bool Corpus::is_deleted(DocId id) const noexcept {
+    std::shared_lock lk(mu_);
+    return deleted_docs_.count(id.get()) != 0;
+}
+std::size_t Corpus::live_document_count() const noexcept {
+    std::shared_lock lk(mu_);
+    return docs_.size() - deleted_docs_.size();
+}
 
 Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_t k) const {
     return dense_search(query, k, MetaFilter{});
@@ -209,6 +259,12 @@ Result<Vector> Corpus::embed_text(const std::string& text) const {
 
 Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_t k,
                                               const MetaFilter& filter) const {
+    std::shared_lock lk(mu_);
+    return dense_search_locked(query, k, filter);
+}
+
+Result<std::vector<Hit>> Corpus::dense_search_locked(std::string_view query, std::size_t k,
+                                                     const MetaFilter& filter) const {
     if (!embedder_) return fail<std::vector<Hit>>(Errc::unavailable, "no embedder");
     ensure_linked();     // the allow-predicate below dereferences chunk->meta
     auto qv = embedder_->embed_one(std::string(query));
@@ -263,14 +319,27 @@ Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_
 }
 
 const Chunk* Corpus::chunk(ChunkId id) const {
+    std::shared_lock lk(mu_);
+    return chunk_locked(id);
+}
+const Chunk* Corpus::chunk_locked(ChunkId id) const {
     ensure_linked();
     return id.get() < chunks_.size() ? &chunks_[id.get()] : nullptr;
 }
 const Document* Corpus::document(DocId id) const {
+    std::shared_lock lk(mu_);
+    return document_locked(id);
+}
+const Document* Corpus::document_locked(DocId id) const {
     return id.get() < docs_.size() ? &docs_[id.get()] : nullptr;
 }
 
 std::optional<DocId> Corpus::find_by_uri(std::string_view uri) const {
+    std::shared_lock lk(mu_);
+    return find_by_uri_locked(uri);
+}
+
+std::optional<DocId> Corpus::find_by_uri_locked(std::string_view uri) const {
     if (uri.empty()) return std::nullopt;
     for (const auto& d : docs_) {
         if (deleted_docs_.count(d.id.get())) continue;   // skip tombstones
@@ -280,18 +349,28 @@ std::optional<DocId> Corpus::find_by_uri(std::string_view uri) const {
 }
 
 SearchResult Corpus::resolve(const Hit& h) const {
+    std::shared_lock lk(mu_);
+    return resolve_locked(h);
+}
+
+SearchResult Corpus::resolve_locked(const Hit& h) const {
     SearchResult r;
-    const Chunk* ch = chunk(h.chunk);
+    const Chunk* ch = chunk_locked(h.chunk);
     if (!ch) return r;
     r.chunk = ch->id; r.doc = ch->doc; r.score = h.score;
     r.text = ch->text; r.context = ch->context;
     r.start_line = ch->start_line; r.end_line = ch->end_line;
-    if (const Document* d = document(ch->doc)) r.uri = d->uri;
+    if (const Document* d = document_locked(ch->doc)) r.uri = d->uri;
     return r;
 }
 
 bool Corpus::passes(ChunkId id, const MetaFilter& f) const {
-    const Chunk* ch = chunk(id);
+    std::shared_lock lk(mu_);
+    return passes_locked(id, f);
+}
+
+bool Corpus::passes_locked(ChunkId id, const MetaFilter& f) const {
+    const Chunk* ch = chunk_locked(id);
     if (!ch || !ch->meta) return !f;   // no metadata: pass only if no filter
     return f ? f(*ch->meta) : true;
 }
@@ -302,6 +381,15 @@ bool Corpus::passes(ChunkId id, const MetaFilter& f) const {
 // BM25 (inverted index), HNSW (ANN graph). CRC-verified on load.
 // ─────────────────────────────────────────────────────────────────────────────
 Result<void> Corpus::save(const std::string& path) const {
+    // A shared lock is enough and is what we want: save() only READS the
+    // corpus, so concurrent queries continue while a snapshot is written, and
+    // only writers are held off. That is what makes the snapshot consistent —
+    // no document can be appended halfway through serializing the arrays.
+    std::shared_lock lk(mu_);
+    return save_locked(path);
+}
+
+Result<void> Corpus::save_locked(const std::string& path) const {
     ensure_linked();
     store::Container c;
     std::uint32_t flags = 0;

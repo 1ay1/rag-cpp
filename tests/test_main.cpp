@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <random>
@@ -280,6 +281,141 @@ TEST(corpus_semantic_chunking_is_selectable) {
     // And the corpus stays queryable through the semantic path.
     auto hits = sem.lexical_search("chlorophyll sunlight", 3);
     CHECK(!hits.empty());
+}
+
+// ─── Concurrent readers + a writer must not corrupt the corpus ──────
+//
+// This is the shape `ragcpp serve --write` exposes: retrieve requests read the
+// corpus while index/add mutates it. Chunk::meta is a BORROWED pointer into
+// docs_[].meta, and add_document() push_backs into docs_ — reallocating and
+// freeing the storage every one of those pointers refers to. Before Corpus
+// took a lock, a 4-reader/1-writer harness of exactly this shape segfaulted on
+// every single run.
+TEST(corpus_survives_concurrent_readers_and_writer) {
+    rag::index::Corpus corpus;
+    for (int i = 0; i < 100; ++i)
+        REQUIRE(corpus.add_document("seed" + std::to_string(i),
+                                    "retrieval augmented generation vector index " + std::to_string(i),
+                                    {{"kind", "seed"}}).has_value());
+    REQUIRE(corpus.build().has_value());
+
+    std::atomic<bool> stop{false};
+    std::atomic<long> reads{0}, corrupt{0};
+
+    std::vector<std::thread> readers;
+    for (int t = 0; t < 4; ++t) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                for (const auto& h : corpus.lexical_search("retrieval vector", 5)) {
+                    auto r = corpus.resolve(h);
+                    // Every document was created with a non-empty uri. Anything
+                    // else means we read through a dangling pointer or a
+                    // half-constructed document.
+                    if (r.uri.empty()) corrupt.fetch_add(1, std::memory_order_relaxed);
+                }
+                reads.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (int i = 0; i < 800; ++i)
+        (void)corpus.add_document("new" + std::to_string(i),
+                                  "newly indexed retrieval vector document " + std::to_string(i),
+                                  {{"kind", "new"}});
+    stop = true;
+    for (auto& t : readers) t.join();
+
+    CHECK_EQ(corrupt.load(), 0L);
+    CHECK(reads.load() > 0);        // the readers really ran
+    CHECK_EQ(corpus.document_count(), std::size_t{900});
+}
+
+// Two concurrent READERS race each other even with no writer present, because
+// the const read path performs lazy repairs (relink_meta, bm25 finalize, hnsw
+// seal) — that laziness is what keeps bulk ingest from being quadratic. A
+// shared_mutex alone does not cover it; the repairs need their own lock.
+TEST(corpus_concurrent_readers_see_consistent_results) {
+    rag::index::Corpus corpus;
+    for (int i = 0; i < 200; ++i)
+        REQUIRE(corpus.add_document("d" + std::to_string(i),
+                                    "alpha beta gamma retrieval " + std::to_string(i)).has_value());
+    // Deliberately NOT calling build(): this leaves bm25 unfinalized so the
+    // first readers all race to finalize it on the read path.
+    std::vector<std::thread> ts;
+    std::atomic<long> mismatch{0};
+    std::size_t expected = corpus.lexical_search("alpha retrieval", 10).size();
+    for (int t = 0; t < 8; ++t)
+        ts.emplace_back([&] {
+            for (int i = 0; i < 200; ++i)
+                if (corpus.lexical_search("alpha retrieval", 10).size() != expected)
+                    mismatch.fetch_add(1, std::memory_order_relaxed);
+        });
+    for (auto& t : ts) t.join();
+    CHECK_EQ(mismatch.load(), 0L);
+}
+
+// ─── save() is crash-safe ───────────────────────────────────────
+//
+// Saving is a REPLACEMENT. Truncating the destination and writing into it means
+// a crash part-way leaves neither the old index nor the new one. Writing to a
+// temp file and rename()-ing it over the destination makes the swap atomic, so
+// an overwrite that fails leaves the previous index intact.
+TEST(save_overwrite_leaves_a_loadable_index) {
+    const std::string path = "/tmp/ragcpp_durability_test.ragdb";
+    std::remove(path.c_str());
+
+    {
+        rag::index::Corpus a;
+        for (int i = 0; i < 50; ++i)
+            REQUIRE(a.add_document("old" + std::to_string(i), "old document " + std::to_string(i)).has_value());
+        REQUIRE(a.build().has_value());
+        REQUIRE(a.save(path).has_value());
+    }
+    auto first = rag::index::Corpus::load(path);
+    REQUIRE(first.has_value());
+    CHECK_EQ(first->document_count(), std::size_t{50});
+
+    // Overwrite in place with a different corpus; the result must be complete,
+    // never a mixture of the two.
+    {
+        rag::index::Corpus b;
+        for (int i = 0; i < 120; ++i)
+            REQUIRE(b.add_document("new" + std::to_string(i), "new document " + std::to_string(i)).has_value());
+        REQUIRE(b.build().has_value());
+        REQUIRE(b.save(path).has_value());
+    }
+    auto second = rag::index::Corpus::load(path);
+    REQUIRE(second.has_value());
+    CHECK_EQ(second->document_count(), std::size_t{120});
+
+    // And no temp files are left behind on success.
+    CHECK(!std::filesystem::exists(path + ".tmp"));
+    std::remove(path.c_str());
+}
+
+// Concurrent upserts of the SAME uri must never produce a duplicate — RCP
+// §7.10 requires an explicit id to replace, not duplicate. Spelling the upsert
+// as find-then-remove-then-add at the call site takes the lock three times, so
+// two threads can both observe "not present" and both insert.
+TEST(concurrent_upsert_of_same_uri_never_duplicates) {
+    rag::index::Corpus corpus;
+    constexpr int kThreads = 8, kRounds = 40;
+
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kThreads; ++t)
+        ts.emplace_back([&, t] {
+            for (int i = 0; i < kRounds; ++i)
+                (void)corpus.upsert_document("shared-uri",
+                                             "revision from thread " + std::to_string(t));
+        });
+    for (auto& th : ts) th.join();
+
+    // Exactly one LIVE document may carry that uri, however many revisions were
+    // written. (Tombstoned predecessors still occupy slots, which is why this
+    // checks the live count rather than document_count().)
+    CHECK_EQ(corpus.live_document_count(), std::size_t{1});
+    auto found = corpus.find_by_uri("shared-uri");
+    CHECK(found.has_value());
 }
 
 TEST(engine_hybrid_search) {

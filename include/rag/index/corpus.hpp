@@ -10,7 +10,9 @@
 
 #include <memory>
 #include <functional>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -61,6 +63,11 @@ public:
     // Chunks hold a borrowed pointer into `docs_` metadata; any move must
     // re-link those pointers to the NEW storage, and copying is disabled to
     // avoid silently sharing dangling pointers. (Move is cheap: vector steals.)
+    //
+    // Moving is NOT thread-safe and must not race with any other access: the
+    // mutexes below are not themselves moved (a locked mutex cannot be), so a
+    // move while another thread holds a lock is undefined. Move a Corpus only
+    // while you have exclusive ownership of it — typically right after load().
     Corpus(const Corpus&) = delete;
     Corpus& operator=(const Corpus&) = delete;
     Corpus(Corpus&& o) noexcept { move_from(std::move(o)); }
@@ -85,6 +92,19 @@ public:
     // Ingest a document: chunk it, assign ids, index lexically, and (if an
     // embedder is set) embed its chunks. Returns the assigned DocId.
     Result<DocId> add_document(std::string uri, std::string text, Metadata meta = {}, std::string title = {});
+
+    // Add, replacing any live document that already has this uri — as ONE
+    // atomic step.
+    //
+    // The obvious spelling of an upsert at the call site is
+    //   if (auto old = find_by_uri(u)) remove_document(*old);
+    //   add_document(u, ...);
+    // which takes the lock three separate times. Two threads upserting the same
+    // uri can then both observe "not present" and both insert, producing the
+    // duplicate that RCP §7.10 explicitly forbids. Holding the write lock across
+    // the whole read-modify-write is the only way to make it a real upsert.
+    Result<DocId> upsert_document(std::string uri, std::string text, Metadata meta = {},
+                                  std::string title = {});
 
     // Rebuild dense structures (embed any un-embedded chunks, (re)build HNSW if
     // over threshold). Idempotent; safe to call after a batch of add_document.
@@ -117,9 +137,19 @@ public:
     // explicit id is an upsert, not a duplicate).
     [[nodiscard]] std::optional<DocId> find_by_uri(std::string_view uri) const;
     [[nodiscard]] SearchResult    resolve(const Hit& h) const;
-    [[nodiscard]] std::size_t     chunk_count()    const noexcept { return chunks_.size(); }
-    [[nodiscard]] std::size_t     document_count() const noexcept { return docs_.size(); }
-    [[nodiscard]] const std::vector<Chunk>& chunks() const { ensure_linked(); return chunks_; }
+    [[nodiscard]] std::size_t     chunk_count()    const noexcept {
+        std::shared_lock lk(mu_); return chunks_.size();
+    }
+    [[nodiscard]] std::size_t     document_count() const noexcept {
+        std::shared_lock lk(mu_); return docs_.size();
+    }
+    // NOTE: returns a reference to internal storage. Safe only while no writer
+    // runs — the lock is released on return, and a subsequent add_document()
+    // can reallocate the vector out from under the caller. Use the indexed
+    // accessors on a concurrently-written corpus.
+    [[nodiscard]] const std::vector<Chunk>& chunks() const {
+        std::shared_lock lk(mu_); ensure_linked(); return chunks_;
+    }
     [[nodiscard]] const text::Tokenizer& tokenizer() const noexcept { return bm25_.tokenizer(); }
 
     // Distinct-query-term coverage for a candidate set, answered from the
@@ -146,6 +176,38 @@ private:
     lexical::Bm25Index                bm25_{cfg_.bm25, cfg_.tokenize};
     std::optional<HnswIndex>          hnsw_;
     bool                              dirty_ = false;
+
+    // ── Concurrency ────────────────────────────────────────────────
+    // A served Corpus is read by many request threads and written by index/add
+    // at the same time. Without this, add_document() reallocating docs_ frees
+    // the storage that every Chunk::meta pointer borrows into, and a concurrent
+    // reader dereferences it: measured as an immediate segfault on every run of
+    // a 4-reader/1-writer harness.
+    //
+    // TWO locks, because there are two distinct hazards:
+    //
+    //   mu_ (shared_mutex) guards the STRUCTURE — docs_, chunks_, bm25_, hnsw_,
+    //     deleted_docs_. Readers share it, mutators take it exclusively. It is
+    //     a shared_mutex rather than a plain mutex because the workload is
+    //     overwhelmingly read-heavy and queries must not serialize behind each
+    //     other.
+    //
+    //   lazy_mu_ guards the LAZY REPAIRS that the read path performs —
+    //     relink_meta(), bm25_.finalize(), hnsw_->seal(). These are the reason
+    //     a shared_mutex alone is not enough: the const read path MUTATES
+    //     (that laziness is what made bulk ingest non-quadratic), so two
+    //     concurrent readers holding only a shared lock would race each other
+    //     with no writer present at all. Each repair is idempotent, so a short
+    //     exclusive lock around it is both correct and cheap — it is taken only
+    //     when the corresponding dirty flag is set, which is never on a steady
+    //     -state read.
+    //
+    // Lock ORDER is always mu_ then lazy_mu_; nothing ever acquires them the
+    // other way round, so the pair cannot deadlock.
+    //
+    // `mutable` so const read methods can take a shared lock.
+    mutable std::shared_mutex mu_;
+    mutable std::mutex        lazy_mu_;
     // A chunk borrows a pointer to its document's metadata, and add_document()
     // may reallocate `docs_`. Rather than relink every chunk on every add (O(n)
     // per document — quadratic ingest), we mark the pointers stale and repair
@@ -155,6 +217,29 @@ private:
     std::unordered_set<std::uint32_t> deleted_docs_;   // tombstoned DocId values
 
     [[nodiscard]] Result<void> embed_pending();
+
+    // add/remove with the write lock ALREADY held, so compound operations
+    // (upsert) can be performed atomically.
+    Result<DocId> add_document_locked(std::string uri, std::string text, Metadata meta,
+                                      std::string title);
+    Result<void>  remove_document_locked(DocId id);
+    [[nodiscard]] std::optional<DocId> find_by_uri_locked(std::string_view uri) const;
+
+    // Unlocked internals. Every public method acquires the appropriate lock and
+    // then delegates here, so that methods which call ONE ANOTHER (e.g.
+    // lexical_search -> chunk, dense_search -> passes -> chunk) do not attempt
+    // to re-acquire a lock they already hold. std::shared_mutex is NOT
+    // recursive: a second shared_lock on the same thread deadlocks if a writer
+    // is queued between them.
+    [[nodiscard]] const Chunk*    chunk_locked(ChunkId id) const;
+    [[nodiscard]] const Document* document_locked(DocId id) const;
+    [[nodiscard]] SearchResult    resolve_locked(const Hit& h) const;
+    [[nodiscard]] bool            passes_locked(ChunkId id, const MetaFilter& f) const;
+    [[nodiscard]] std::vector<Hit> lexical_search_locked(std::string_view query, std::size_t k) const;
+    [[nodiscard]] Result<std::vector<Hit>>
+    dense_search_locked(std::string_view query, std::size_t k, const MetaFilter& filter) const;
+    [[nodiscard]] Result<void>    build_locked();
+    [[nodiscard]] Result<void>    save_locked(const std::string& path) const;
 
     // Repair borrowed meta pointers if a preceding add_document() invalidated
     // them. Called by every read path that can expose a Chunk.

@@ -3,8 +3,17 @@
 #include "rag/store/container.hpp"
 
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <csignal>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <random>
 #include <sstream>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace rag::store {
 
@@ -100,13 +109,109 @@ Result<Container> Container::parse(std::string_view blob) {
 }
 
 // ─── File I/O ─────────────────────────────────────────────────────────────────
+//
+// Writing an index is a REPLACEMENT, and the naive form of it destroys data:
+// opening the destination truncates it, so a crash (or a full disk, or a kill
+// -9) part-way through leaves a half-written file where a working index used to
+// be. The old index is gone and the new one is unreadable.
+//
+// So: write to a temporary file in the SAME directory, flush it all the way to
+// the storage device, then rename() it over the destination. POSIX guarantees
+// rename() within a filesystem is atomic, so at every instant an observer sees
+// either the complete old index or the complete new one, never a torn mixture.
+// Same directory matters twice over — rename() across filesystems fails, and a
+// temp file elsewhere would be a copy rather than an atomic swap.
+//
+// The fsync ORDER is the part that is easy to get wrong and impossible to
+// notice in testing: fsync the FILE before the rename (so its bytes are durable
+// before anything points at them), and fsync the DIRECTORY after (so the
+// rename itself is durable). Without the second one, a power loss can leave the
+// directory entry pointing at the old inode even though the data was written.
 Result<void> Container::write_file(const std::string& path) const {
-    std::ofstream out(path, std::ios::binary);
-    if (!out) return fail<void>(Errc::io_error, "open " + path);
-    std::string blob = serialize();
-    out.write(blob.data(), static_cast<std::streamsize>(blob.size()));
-    if (!out) return fail<void>(Errc::io_error, "write " + path);
+    // Temp name in the destination's directory, salted so two concurrent saves
+    // to the same path cannot collide on it.
+    const auto slash = path.find_last_of('/');
+    const std::string dir = (slash == std::string::npos) ? std::string(".")
+                                                         : path.substr(0, slash);
+    static std::atomic<std::uint64_t> counter{0};
+    std::random_device rd;
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid()) + "."
+                          + std::to_string(counter.fetch_add(1, std::memory_order_relaxed))
+                          + "." + std::to_string(rd());
+
+    const std::string blob = serialize();
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) return fail<void>(Errc::io_error, "open " + tmp);
+        out.write(blob.data(), static_cast<std::streamsize>(blob.size()));
+        out.flush();
+        if (!out) { std::remove(tmp.c_str()); return fail<void>(Errc::io_error, "write " + tmp); }
+    }
+
+    // Flush the file's contents out of the OS page cache onto the device.
+    // ofstream::flush only pushes to the kernel; it is not durability.
+    if (int fd = ::open(tmp.c_str(), O_RDONLY); fd >= 0) {
+        const int rc = ::fsync(fd);
+        ::close(fd);
+        if (rc != 0) { std::remove(tmp.c_str()); return fail<void>(Errc::io_error, "fsync " + tmp); }
+    } else {
+        std::remove(tmp.c_str());
+        return fail<void>(Errc::io_error, "reopen " + tmp);
+    }
+
+    // The atomic swap. After this returns, `path` is the new index.
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        return fail<void>(Errc::io_error, "rename " + tmp + " -> " + path);
+    }
+
+    // Make the rename itself durable. Best-effort: some filesystems refuse to
+    // open a directory for fsync, and failing the whole save over that would be
+    // worse than the (already atomic) swap we just completed.
+    if (int dfd = ::open(dir.c_str(), O_RDONLY); dfd >= 0) {
+        ::fsync(dfd);
+        ::close(dfd);
+    }
+
+    // Sweep temps orphaned by a PREVIOUS writer that died between creating its
+    // temp file and renaming it. That process could not clean up after itself
+    // by definition, so without this they accumulate in the data directory
+    // forever — each one a full-size copy of the index.
+    //
+    // Only files belonging to this exact destination are considered, and only
+    // those whose owning process is gone, so a concurrent save in progress is
+    // never disturbed.
+    sweep_orphan_temps(path);
     return {};
+}
+
+// Remove `<path>.tmp.<pid>.*` files whose <pid> is no longer running.
+void Container::sweep_orphan_temps(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path target(path);
+    const fs::path dir = target.has_parent_path() ? target.parent_path() : fs::path(".");
+    const std::string prefix = target.filename().string() + ".tmp.";
+
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.rfind(prefix, 0) != 0) continue;
+
+        // Extract the pid field: <prefix><pid>.<counter>.<salt>
+        const std::string rest = name.substr(prefix.size());
+        const std::size_t dot  = rest.find('.');
+        if (dot == std::string::npos) continue;
+        long pid = 0;
+        try { pid = std::stol(rest.substr(0, dot)); } catch (...) { continue; }
+        if (pid <= 0) continue;
+
+        // kill(pid, 0) probes for existence without signalling. ESRCH means the
+        // process is gone and the temp is definitively garbage; EPERM means it
+        // exists but belongs to someone else, so leave it alone.
+        if (::kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM) continue;
+        std::error_code rm;
+        fs::remove(it->path(), rm);
+    }
 }
 
 Result<Container> Container::read_file(const std::string& path) {

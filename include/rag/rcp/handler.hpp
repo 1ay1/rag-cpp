@@ -545,11 +545,12 @@ public:
                 for (auto it = d["meta"].begin(); it != d["meta"].end(); ++it)
                     meta[it.key()] = it->is_string() ? it->get<std::string>() : it->dump();
 
-            if (!uri.empty())
-                if (auto existing = engine_.corpus().find_by_uri(uri))
-                    engine_.corpus().remove_document(*existing);   // upsert
-
-            auto id = engine_.corpus().add_document(uri, text, meta, title);
+            // §7.10: an explicit id is an UPSERT (replace, never duplicate).
+            // Done as one atomic corpus operation — find-then-remove-then-add at
+            // this level would let two concurrent index/add calls for the same
+            // uri both miss and both insert, which is the duplicate the spec
+            // forbids.
+            auto id = engine_.corpus().upsert_document(uri, text, meta, title);
             if (!id) return std::unexpected(to_wire(id.error()));
             ids.push_back(uri.empty() ? std::to_string(id->get()) : uri);
         }
