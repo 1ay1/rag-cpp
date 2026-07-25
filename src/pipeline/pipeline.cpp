@@ -3,29 +3,57 @@
 #include "rag/pipeline/pipeline.hpp"
 
 #include <algorithm>
+#include <thread>
 #include <array>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace rag::pipeline {
 
-// ── HybridRetrieveStage ──────────────────────────────────────────────────────
+// ── HybridRetrieveStage ───────────────────────────────────────────
 Result<Context> HybridRetrieveStage::process(Context ctx) const {
     if (!ctx.corpus) return fail<Context>(Errc::invalid_argument, "no corpus in context");
     const auto& corpus = *ctx.corpus;
 
     std::vector<fusion::RankedList> lists;
 
-    // Lexical.
-    auto lex = corpus.lexical_search(ctx.query, cfg_.candidate_k);
+    // The two retrievers are INDEPENDENT: they read disjoint index structures
+    // (inverted lists vs the ANN graph) and neither observes the other's
+    // output, so running them one after the other simply adds their latencies.
+    // Overlapping them makes hybrid cost max(lexical, dense) instead of the
+    // sum — and they have complementary profiles (BM25 is pointer-chasing over
+    // postings, the dense walk is bandwidth-bound), so they interleave well.
+    //
+    // Only worth a thread when there IS a second retriever to run.
+    const bool run_dense = corpus.has_embedder();
+
+    std::vector<Hit>                 lex;
+    Result<std::vector<Hit>>         dense = std::vector<Hit>{};
+
+    auto do_lexical = [&] { lex = corpus.lexical_search(ctx.query, cfg_.candidate_k); };
+    auto do_dense   = [&] {
+        // The metadata filter is pushed into the ANN walk as a PRE-filter so a
+        // selective predicate still returns a full candidate pool.
+        dense = ctx.filter ? corpus.dense_search(ctx.query, cfg_.candidate_k, ctx.filter)
+                           : corpus.dense_search(ctx.query, cfg_.candidate_k);
+    };
+
+    if (run_dense) {
+        // Dense on a helper, lexical on this thread. A plain std::thread rather
+        // than the shared pool: this may itself be running on a pool worker
+        // (a server handling queries in parallel), and blocking a pool thread
+        // on work queued to that same pool is the classic way to deadlock.
+        std::thread helper(do_dense);
+        do_lexical();
+        helper.join();
+    } else {
+        do_lexical();
+    }
+
     lists.push_back({std::move(lex), cfg_.bm25_weight});
 
-    // Dense (degrade gracefully if unavailable/offline). The metadata filter is
-    // pushed into the ANN walk as a PRE-filter so a selective predicate still
-    // returns a full candidate pool.
-    if (corpus.has_embedder()) {
-        auto dense = ctx.filter ? corpus.dense_search(ctx.query, cfg_.candidate_k, ctx.filter)
-                                : corpus.dense_search(ctx.query, cfg_.candidate_k);
+    if (run_dense) {
+        // Degrade gracefully if the embedder is unavailable/offline.
         if (dense) lists.push_back({std::move(*dense), cfg_.dense_weight});
         else ctx.trace.push_back(std::string("dense unavailable: ") + std::string(to_string(dense.error().code)));
     }

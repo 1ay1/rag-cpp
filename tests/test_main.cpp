@@ -622,6 +622,52 @@ TEST(sq8_walk_preserves_recall) {
     CHECK(std::fabs(hits[0].score.get() - exact_self) < 1e-5f);
 }
 
+// ─── Concurrent hybrid retrieval is deterministic ─────────────────
+//
+// HybridRetrieveStage runs the lexical and dense retrievers concurrently
+// (they read disjoint index structures, so hybrid costs max rather than sum).
+// The contract that must hold: overlapping them is a pure latency win and
+// changes nothing observable — identical hits, identical scores, identical
+// order, every time.
+TEST(hybrid_search_is_deterministic_under_concurrency) {
+    static const char* w[] = {"vector","index","query","embedding","token","rank",
+                              "fusion","graph","sparse","dense","chunk","corpus",
+                              "search","semantic","neural","lexical"};
+    std::mt19937 rng(3);
+    std::uniform_int_distribution<int> pick(0, 15);
+
+    rag::Engine e;
+    e.with_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{128}});
+    for (int i = 0; i < 600; ++i) {
+        std::string s;
+        for (int j = 0; j < 40; ++j) { s += w[pick(rng)]; s += ' '; }
+        e.add("d" + std::to_string(i) + ".md", s);
+    }
+    (void)e.build();
+
+    std::size_t compared = 0, divergences = 0;
+    for (int q = 0; q < 40; ++q) {
+        std::string qs;
+        for (int j = 0; j < 4; ++j) { qs += w[pick(rng)]; qs += ' '; }
+
+        auto first = e.search(qs, 10);
+        REQUIRE(first.has_value());
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            auto again = e.search(qs, 10);
+            REQUIRE(again.has_value());
+            REQUIRE(again->size() == first->size());
+            for (std::size_t i = 0; i < first->size(); ++i) {
+                ++compared;
+                if ((*first)[i].chunk.get() != (*again)[i].chunk.get() ||
+                    std::fabs((*first)[i].score.get() - (*again)[i].score.get()) > 1e-6f)
+                    ++divergences;
+            }
+        }
+    }
+    CHECK(compared > 100);
+    CHECK_EQ(divergences, std::size_t{0});
+}
+
 // ─── Persistence container round-trip ──────────────────────────────────
 TEST(container_roundtrip_and_crc) {
     rag::store::Container c;
