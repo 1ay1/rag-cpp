@@ -41,33 +41,60 @@ bool has_avx2() {
     return v;
 }
 
+// Four independent accumulators. A single acc chains every FMA through one
+// dependency (~4-cycle latency each); four lets the CPU keep its FMA units
+// saturated, which is what actually makes this throughput- rather than
+// latency-bound. Embedding dims (256/384/768/1024) are all multiples of 32,
+// so the 32-wide main loop covers the vast majority of the work.
 __attribute__((target("avx2,fma")))
 float dot_avx2(const float* a, const float* b, std::size_t n) noexcept {
-    __m256 acc = _mm256_setzero_ps();
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
     std::size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        __m256 va = _mm256_loadu_ps(a + i);
-        __m256 vb = _mm256_loadu_ps(b + i);
-        acc = _mm256_fmadd_ps(va, vb, acc);
+    for (; i + 32 <= n; i += 32) {
+        _mm_prefetch(reinterpret_cast<const char*>(a + i + 128), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(b + i + 128), _MM_HINT_T0);
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i +  0), _mm256_loadu_ps(b + i +  0), a0);
+        a1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i +  8), _mm256_loadu_ps(b + i +  8), a1);
+        a2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 16), _mm256_loadu_ps(b + i + 16), a2);
+        a3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 24), _mm256_loadu_ps(b + i + 24), a3);
     }
-    alignas(32) float tmp[8];
-    _mm256_store_ps(tmp, acc);
-    float s = tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
+    for (; i + 8 <= n; i += 8)
+        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), a0);
+
+    a0 = _mm256_add_ps(_mm256_add_ps(a0, a1), _mm256_add_ps(a2, a3));
+    // Horizontal reduce: 256 -> 128 -> scalar.
+    __m128 lo = _mm256_castps256_ps128(a0);
+    __m128 hi = _mm256_extractf128_ps(a0, 1);
+    lo = _mm_add_ps(lo, hi);
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+    float s = _mm_cvtss_f32(lo);
     for (; i < n; ++i) s += a[i] * b[i];
     return s;
 }
 #endif
 
 #if defined(RAGCPP_NEON)
+// Same four-accumulator structure. vfmaq_f32 is a true fused multiply-add
+// (single rounding, one instruction); vmlaq_f32 is not guaranteed to fuse.
 float dot_neon(const float* a, const float* b, std::size_t n) noexcept {
-    float32x4_t acc = vdupq_n_f32(0.0f);
+    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+    float32x4_t a2 = vdupq_n_f32(0.0f), a3 = vdupq_n_f32(0.0f);
     std::size_t i = 0;
-    for (; i + 4 <= n; i += 4) {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vb = vld1q_f32(b + i);
-        acc = vmlaq_f32(acc, va, vb);
+    for (; i + 16 <= n; i += 16) {
+        __builtin_prefetch(a + i + 64, 0, 0);
+        __builtin_prefetch(b + i + 64, 0, 0);
+        a0 = vfmaq_f32(a0, vld1q_f32(a + i +  0), vld1q_f32(b + i +  0));
+        a1 = vfmaq_f32(a1, vld1q_f32(a + i +  4), vld1q_f32(b + i +  4));
+        a2 = vfmaq_f32(a2, vld1q_f32(a + i +  8), vld1q_f32(b + i +  8));
+        a3 = vfmaq_f32(a3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
     }
-    float s = vaddvq_f32(acc);
+    for (; i + 4 <= n; i += 4)
+        a0 = vfmaq_f32(a0, vld1q_f32(a + i), vld1q_f32(b + i));
+
+    a0 = vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3));
+    float s = vaddvq_f32(a0);
     for (; i < n; ++i) s += a[i] * b[i];
     return s;
 }

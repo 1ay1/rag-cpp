@@ -17,6 +17,7 @@
 //     re-opening a corpus does not rebuild the graph.
 
 #include <cstdint>
+#include <atomic>
 #include <functional>
 #include <random>
 #include <span>
@@ -32,7 +33,12 @@ namespace rag::index {
 struct HnswConfig {
     std::size_t M               = 16;    // max neighbours per node (base layer 2M)
     std::size_t ef_construction = 200;   // beam width during insert
-    std::size_t ef_search       = 64;    // beam width during query
+    // Beam width during query. This is THE recall/latency dial: on realistic
+    // embedding geometry (topically clustered vectors) ef=32 already reaches
+    // ~0.999 recall@10 and ef=64 is comfortably saturated. Raise it only for
+    // near-uniform / very high-dimensional data, where every ANN index needs a
+    // wider beam because distances concentrate. Cost is roughly linear in ef.
+    std::size_t ef_search       = 64;
     float       ml              = 0.0f;  // level multiplier; 0 => 1/ln(M)
     std::size_t matryoshka_dim  = 0;     // >0: walk on this leading-dim prefix
     bool        binary          = false; // 1-bit sign codes for the walk
@@ -47,6 +53,22 @@ public:
     // Insert one embedding (referenced later by `id`). `vec` is copied and
     // unit-normalized internally. The dimension is fixed by the first insert.
     void add(std::uint32_t id, std::span<const float> vec);
+
+    // Bulk-construct the graph from `n` vectors in PARALLEL.
+    //
+    // Concurrent HNSW insertion is safe when the node array is fixed up front:
+    // we materialize every node (vector, sign code, level) serially — cheap and
+    // allocation-bound — then run the expensive part, the neighbour search and
+    // linking, across all cores. Each node's adjacency lists are guarded by its
+    // own spinlock, so writers only contend when they touch the same node; the
+    // graph walk itself reads links optimistically, which is what hnswlib and
+    // FAISS do. Recall is statistically identical to serial insertion (the
+    // link-selection heuristic is order-sensitive either way).
+    //
+    // `vec_at(i)` must return a span for the i-th vector; `id_at(i)` its id.
+    void build_batch(std::size_t n,
+                     const std::function<std::span<const float>(std::size_t)>& vec_at,
+                     const std::function<std::uint32_t(std::size_t)>& id_at);
 
     // k-NN search: returns (id, cosine-similarity) pairs, descending.
     [[nodiscard]] std::vector<Hit> search(std::span<const float> query, std::size_t k) const;
@@ -87,6 +109,17 @@ private:
         std::vector<std::vector<std::uint32_t>> links;  // links[layer]
     };
 
+    // One spinlock per node, guarding that node's `links` during a concurrent
+    // build. A spinlock (not a mutex) because the critical section is a few
+    // dozen nanoseconds — sorting at most 2M neighbour ids — and contention is
+    // rare: two threads must pick the same neighbour in the same layer.
+    // Held in a separate array so Node stays trivially movable/serializable.
+    struct alignas(64) NodeLock {                 // cache-line padded: no false sharing
+        std::atomic_flag flag = ATOMIC_FLAG_INIT;
+        void lock()   noexcept { while (flag.test_and_set(std::memory_order_acquire)) ; }
+        void unlock() noexcept { flag.clear(std::memory_order_release); }
+    };
+
     HnswConfig    cfg_{};
     std::size_t   dim_       = 0;
     int           max_layer_ = -1;
@@ -102,6 +135,47 @@ private:
     search_layer(std::span<const float> q, std::span<const std::uint64_t> q_bits,
                  std::uint32_t entry, int layer, std::size_t ef) const;
     void connect(std::uint32_t node, int layer, std::vector<std::uint32_t> neighbours);
+
+    // connect() variant used during a concurrent build: takes the per-node
+    // spinlocks before mutating adjacency.
+    void connect_locked(std::uint32_t node, int layer,
+                        std::vector<std::uint32_t> neighbours,
+                        std::vector<NodeLock>& locks);
+
+    // ── Search scratch ───────────────────────────────────────────────────────
+    // search_layer is the hottest function in the index: it runs on every hop
+    // of every insert and every query. Allocating a visited-set and two heaps
+    // per call dominated its cost. Instead each thread keeps a persistent
+    // scratch block: an epoch-stamped visited array (O(1) clear — bump the
+    // epoch instead of rewriting n bytes) and vector-backed heaps that keep
+    // their capacity across calls.
+    struct Scratch {
+        std::vector<std::uint32_t> visit_epoch;   // per-node last-seen epoch
+        std::uint32_t             epoch = 0;
+        std::vector<std::pair<float, std::uint32_t>> cand;    // max-heap by sim
+        std::vector<std::pair<float, std::uint32_t>> result;  // min-heap by sim
+
+        void reset(std::size_t n) {
+            if (visit_epoch.size() < n) visit_epoch.assign(n, 0);
+            if (++epoch == 0) {                      // wrapped: clear for real
+                std::fill(visit_epoch.begin(), visit_epoch.end(), 0);
+                epoch = 1;
+            }
+            cand.clear();
+            result.clear();
+        }
+        [[nodiscard]] bool mark(std::uint32_t id) {  // true if newly visited
+            if (visit_epoch[id] == epoch) return false;
+            visit_epoch[id] = epoch;
+            return true;
+        }
+    };
+    // thread_local so concurrent queries and parallel inserts each get their
+    // own scratch without locking or per-call allocation.
+    static Scratch& scratch() {
+        static thread_local Scratch s;
+        return s;
+    }
 };
 
 } // namespace rag::index

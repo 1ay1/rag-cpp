@@ -1,9 +1,12 @@
 // tests/test_main.cpp — a minimal, dependency-free test harness + all tests.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -175,6 +178,105 @@ TEST(engine_metadata_filter) {
     });
     REQUIRE(res.has_value());
     for (auto& r : *res) CHECK_EQ(r.uri, std::string("d2"));
+}
+
+// ─── ANN quality: recall vs exact, and parallel-build parity ───────────
+// Guards the two properties that make the index trustworthy: the graph must
+// actually find the true nearest neighbours on realistic (topically clustered)
+// embedding geometry, and the parallel bulk build must not degrade that
+// relative to serial insertion.
+namespace {
+
+struct AnnFixture {
+    std::vector<std::vector<float>> vecs, cents;
+    std::size_t dim = 64, n = 4000, nc = 80;
+
+    AnnFixture() {
+        std::mt19937 rng(11);
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        cents.resize(nc);
+        for (auto& c : cents) {
+            c.resize(dim);
+            for (auto& x : c) x = g(rng);
+            rag::dense::normalize(c);
+        }
+        std::uniform_int_distribution<int> pick(0, static_cast<int>(nc) - 1);
+        vecs.resize(n);
+        for (auto& v : vecs) {
+            int c = pick(rng);
+            v.resize(dim);
+            for (std::size_t d = 0; d < dim; ++d) v[d] = cents[c][d] + 0.06f * g(rng);
+            rag::dense::normalize(v);
+        }
+    }
+
+    // Mean recall@k of `idx` against exact brute-force search.
+    double recall(const rag::index::HnswIndex& idx, std::size_t k, std::size_t queries) const {
+        std::mt19937 qr(23);
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        std::uniform_int_distribution<int> pick(0, static_cast<int>(nc) - 1);
+        double acc = 0;
+        for (std::size_t qi = 0; qi < queries; ++qi) {
+            int c = pick(qr);
+            std::vector<float> q(dim);
+            for (std::size_t d = 0; d < dim; ++d) q[d] = cents[c][d] + 0.06f * g(qr);
+            rag::dense::normalize(q);
+
+            std::vector<std::pair<float, std::uint32_t>> exact;
+            exact.reserve(n);
+            for (std::size_t i = 0; i < n; ++i)
+                exact.push_back({rag::dense::dot(vecs[i], q), static_cast<std::uint32_t>(i)});
+            std::partial_sort(exact.begin(), exact.begin() + k, exact.end(),
+                              [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::vector<std::uint32_t> truth;
+            for (std::size_t i = 0; i < k; ++i) truth.push_back(exact[i].second);
+
+            std::size_t got = 0;
+            for (const auto& h : idx.search(q, k))
+                if (std::find(truth.begin(), truth.end(), h.chunk.get()) != truth.end()) ++got;
+            acc += static_cast<double>(got) / static_cast<double>(k);
+        }
+        return acc / static_cast<double>(queries);
+    }
+};
+
+} // namespace
+
+TEST(hnsw_recall_matches_exact_search) {
+    AnnFixture fx;
+    rag::index::HnswConfig cfg;
+    cfg.M = 16; cfg.ef_construction = 200; cfg.ef_search = 64;
+    rag::index::HnswIndex idx(cfg);
+    idx.build_batch(fx.n,
+        [&](std::size_t i) { return std::span<const float>(fx.vecs[i]); },
+        [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+
+    // On clustered embedding geometry a correct HNSW is near-exact. Anything
+    // below this means the graph or the neighbour heuristic has regressed.
+    double r = fx.recall(idx, 10, 60);
+    CHECK(r > 0.95);
+}
+
+TEST(hnsw_parallel_build_matches_serial_recall) {
+    AnnFixture fx;
+    rag::index::HnswConfig cfg;
+    cfg.M = 16; cfg.ef_construction = 200; cfg.ef_search = 64;
+
+    rag::index::HnswIndex serial(cfg);
+    for (std::size_t i = 0; i < fx.n; ++i)
+        serial.add(static_cast<std::uint32_t>(i), fx.vecs[i]);
+
+    rag::index::HnswIndex parallel(cfg);
+    parallel.build_batch(fx.n,
+        [&](std::size_t i) { return std::span<const float>(fx.vecs[i]); },
+        [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+
+    CHECK_EQ(serial.size(), parallel.size());
+    // Concurrent insertion changes link order, so recall is statistically
+    // rather than bitwise identical; it must not drop materially.
+    double rs = fx.recall(serial, 10, 40);
+    double rp = fx.recall(parallel, 10, 40);
+    CHECK(rp > rs - 0.05);
 }
 
 // ─── Filtered-HNSW pre-filter ─────────────────────────────────────────

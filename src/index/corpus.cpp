@@ -80,8 +80,17 @@ Result<void> Corpus::build() {
         // Build HNSW past threshold.
         if (chunks_.size() >= cfg_.hnsw_threshold) {
             HnswIndex idx(cfg_.hnsw);
-            for (const auto& ch : chunks_)
-                if (!ch.embedding.empty()) idx.add(ch.id.get(), ch.embedding);
+            // Collect the embedded chunks, then construct the graph in parallel.
+            // build_batch stages all nodes first and links them across every
+            // core — the dominant cost of indexing a large corpus.
+            std::vector<std::size_t> rows;
+            rows.reserve(chunks_.size());
+            for (std::size_t i = 0; i < chunks_.size(); ++i)
+                if (!chunks_[i].embedding.empty()) rows.push_back(i);
+
+            idx.build_batch(rows.size(),
+                [&](std::size_t i) -> std::span<const float> { return chunks_[rows[i]].embedding; },
+                [&](std::size_t i) { return chunks_[rows[i]].id.get(); });
             hnsw_ = std::move(idx);
         }
     }
