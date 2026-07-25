@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace rag::text {
@@ -213,9 +214,40 @@ std::string porter_stem(std::string_view word) {
     return s;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────
 // Tokenizer
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Memoized stemming.
+//
+// porter_stem is a long chain of suffix tests and string rewrites — profiling
+// a 20k-document ingest showed it (and the `replace`/`ends_with` helpers it
+// calls) as the single dominant cost, above chunking and above BM25 posting
+// construction. But it is a PURE function of the word, and word frequency is
+// Zipfian: a few thousand distinct tokens cover the overwhelming majority of
+// occurrences in real text.
+//
+// So cache it. Thread-local, so no locking and no sharing between the
+// concurrent ingest paths; bounded, so a pathological input (hashes, base64,
+// minified JS — text with unbounded distinct "words") cannot grow it without
+// limit. On overflow we simply clear and start again rather than implement LRU
+// eviction: the access pattern is heavily skewed, so the hot words are back in
+// the cache almost immediately, and a clear is O(1) amortized against the
+// misses it costs.
+const std::string& stem_cached(const std::string& word) {
+    static constexpr std::size_t kMaxEntries = 1u << 16;   // ~65k distinct words
+    static thread_local std::unordered_map<std::string, std::string> cache;
+
+    auto it = cache.find(word);
+    if (it != cache.end()) return it->second;
+    if (cache.size() >= kMaxEntries) cache.clear();
+    return cache.emplace(word, porter_stem(word)).first->second;
+}
+
+} // namespace
+
 std::vector<std::string> Tokenizer::tokenize(std::string_view text) const {
     std::vector<std::string> out;
     std::string cur;
@@ -225,8 +257,12 @@ std::vector<std::string> Tokenizer::tokenize(std::string_view text) const {
         if (cur.empty()) return;
         if (cur.size() <= opts_.max_len) {
             if (!(opts_.drop_stopwords && is_stopword(cur))) {
-                std::string tok = opts_.stem ? porter_stem(cur) : cur;
-                if (tok.size() >= opts_.min_len) out.push_back(std::move(tok));
+                if (opts_.stem) {
+                    const std::string& tok = stem_cached(cur);
+                    if (tok.size() >= opts_.min_len) out.push_back(tok);
+                } else if (cur.size() >= opts_.min_len) {
+                    out.push_back(cur);
+                }
             }
         }
         cur.clear();

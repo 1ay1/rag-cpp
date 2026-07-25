@@ -668,6 +668,49 @@ TEST(hybrid_search_is_deterministic_under_concurrency) {
     CHECK_EQ(divergences, std::size_t{0});
 }
 
+// ─── Stem memoization is transparent ───────────────────────────
+//
+// Tokenizer memoizes porter_stem (it dominated ingest). The cache must be
+// invisible: same tokens as calling the stemmer directly, including after the
+// bounded cache overflows and is cleared.
+TEST(tokenizer_stem_cache_matches_direct_stemming) {
+    rag::text::TokenizeOptions opts;
+    opts.stem = true;
+    opts.drop_stopwords = false;
+    opts.min_len = 1;
+    rag::text::Tokenizer tok{opts};
+
+    // Words with real Porter structure (plurals, -ing, -ed, -ational, ...) so
+    // the stemmer actually rewrites rather than passing through.
+    static const char* words[] = {
+        "running", "runs", "ran", "happiness", "relational", "conditional",
+        "rationalize", "vietnamization", "predication", "hopefulness",
+        "formality", "sensitivity", "agreed", "plastered", "motoring",
+        "sing", "conflated", "troubled", "sized", "hopping", "falling",
+        "controlling", "rolling", "feed", "matting", "skies", "cats",
+    };
+
+    std::size_t compared = 0;
+    for (int repeat = 0; repeat < 3; ++repeat) {          // exercise cache hits
+        for (const char* w : words) {
+            auto got = tok.tokenize(w);
+            REQUIRE(got.size() == 1u);
+            CHECK_EQ(got[0], rag::text::porter_stem(w));
+            ++compared;
+        }
+    }
+    CHECK(compared == 3 * (sizeof(words) / sizeof(words[0])));
+
+    // Overflow the cache with many distinct tokens, then re-check the original
+    // words: a cleared cache must repopulate to the same answers.
+    for (int i = 0; i < 70000; ++i) (void)tok.tokenize("zq" + std::to_string(i) + "ing");
+    for (const char* w : words) {
+        auto got = tok.tokenize(w);
+        REQUIRE(got.size() == 1u);
+        CHECK_EQ(got[0], rag::text::porter_stem(w));
+    }
+}
+
 // ─── Persistence container round-trip ──────────────────────────────────
 TEST(container_roundtrip_and_crc) {
     rag::store::Container c;
