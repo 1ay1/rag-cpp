@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 
@@ -62,16 +63,47 @@ Result<void> Corpus::embed_pending() {
         if (chunks_[i].embedding.empty()) pending.push_back(i);
     if (pending.empty()) return {};
 
-    for (std::size_t off = 0; off < pending.size(); off += cfg_.embed_batch) {
-        std::size_t end = std::min(off + cfg_.embed_batch, pending.size());
+    const std::size_t bs = cfg_.embed_batch ? cfg_.embed_batch : 1;
+    const std::size_t nb = (pending.size() + bs - 1) / bs;
+
+    // Batches are independent: each reads a disjoint slice of `pending` and
+    // writes only the chunks named by that slice, so they can be in flight
+    // concurrently. HOW concurrently is the backend's call — an in-process
+    // model already owns every core (hint 1 ⇒ serial), a hosted endpoint is
+    // latency-bound (hint 8) — see dense::ConcurrencyAware.
+    const std::size_t workers = std::min(embedder_->max_concurrency(), nb);
+
+    // First failure wins; later batches short-circuit rather than pile up
+    // retries against a backend that is already known to be down.
+    std::atomic<bool> failed{false};
+    std::mutex        err_mu;
+    Error             first_err{};
+
+    auto run_batch = [&](std::size_t b) {
+        if (failed.load(std::memory_order_relaxed)) return;
+        const std::size_t off = b * bs;
+        const std::size_t end = std::min(off + bs, pending.size());
         std::vector<std::string> batch;
+        batch.reserve(end - off);
         for (std::size_t j = off; j < end; ++j) batch.push_back(chunks_[pending[j]].indexed_text());
+
         auto res = embedder_->embed(batch);
-        if (!res) return std::unexpected(res.error());
+        if (!res) {
+            std::lock_guard lk(err_mu);
+            if (!failed.exchange(true, std::memory_order_acq_rel)) first_err = res.error();
+            return;
+        }
         auto& vecs = *res;
-        for (std::size_t j = 0; j < vecs.size() && off + j < pending.size(); ++j)
+        for (std::size_t j = 0; j < vecs.size() && off + j < end; ++j)
             chunks_[pending[off + j]].embedding = std::move(vecs[j]);
-    }
+    };
+
+    if (workers <= 1)
+        for (std::size_t b = 0; b < nb; ++b) run_batch(b);
+    else
+        util::parallel_for_dynamic(nb, workers, run_batch);
+
+    if (failed.load(std::memory_order_acquire)) return std::unexpected(first_err);
     return {};
 }
 

@@ -1,16 +1,21 @@
 // tests/test_main.cpp — a minimal, dependency-free test harness + all tests.
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <memory>
 #include <random>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <rag/rag.hpp>
+#include <rag/util/parallel.hpp>
 
 namespace {
 struct Case { std::string name; std::function<void()> fn; };
@@ -293,6 +298,132 @@ TEST(hnsw_filtered_search) {
     auto hits = idx.search_filtered(q, 5, allow);
     REQUIRE(!hits.empty());
     for (auto& h : hits) CHECK(h.chunk.get() % 2 == 0);
+}
+
+// ─── Parallel embedding: batches must be concurrency-transparent ──────
+//
+// Corpus::embed_pending fans batches out across workers when the embedder
+// advertises max_concurrency() > 1. The wire contract is that this is pure
+// throughput: every chunk gets the SAME vector it would have got serially,
+// nothing is dropped, and a failing backend still surfaces its error.
+namespace {
+
+// An embedder whose vector encodes the text identity, so a mis-assigned
+// batch (off-by-one, torn write, lost update) is detectable rather than
+// merely improbable. Also counts concurrent `embed` calls so we can prove
+// the hint is honoured in both directions.
+struct CountingEmbedder {
+    std::size_t                    dim_;
+    std::size_t                    conc_;
+    bool                           fail_at_ = false;
+    std::size_t                    fail_index_ = 0;
+    std::shared_ptr<std::atomic<int>> live   = std::make_shared<std::atomic<int>>(0);
+    std::shared_ptr<std::atomic<int>> peak   = std::make_shared<std::atomic<int>>(0);
+    std::shared_ptr<std::atomic<int>> calls  = std::make_shared<std::atomic<int>>(0);
+
+    [[nodiscard]] std::size_t dimension() const noexcept { return dim_; }
+    [[nodiscard]] std::string_view identity() const noexcept { return "counting"; }
+    [[nodiscard]] std::size_t max_concurrency() const noexcept { return conc_; }
+
+    [[nodiscard]] rag::Result<std::vector<rag::Vector>>
+    embed(std::span<const std::string> texts) const {
+        const int now = live->fetch_add(1, std::memory_order_acq_rel) + 1;
+        int seen = peak->load(std::memory_order_relaxed);
+        while (now > seen && !peak->compare_exchange_weak(seen, now)) {}
+        // Hold the "connection" open so overlap is observable.
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        const std::size_t idx = static_cast<std::size_t>(
+            calls->fetch_add(1, std::memory_order_acq_rel));
+        live->fetch_sub(1, std::memory_order_acq_rel);
+
+        if (fail_at_ && idx == fail_index_)
+            return rag::fail<std::vector<rag::Vector>>(rag::Errc::unavailable, "synthetic");
+
+        std::vector<rag::Vector> out;
+        out.reserve(texts.size());
+        for (const auto& t : texts) {
+            rag::Vector v(dim_, 0.0f);
+            // Deterministic, order-independent fingerprint of the text.
+            std::uint64_t h = 1469598103934665603ull;
+            for (unsigned char c : t) { h ^= c; h *= 1099511628211ull; }
+            for (std::size_t i = 0; i < dim_; ++i) {
+                h ^= h >> 33; h *= 0xff51afd7ed558ccdull;
+                v[i] = static_cast<float>(static_cast<double>(h >> 11) / 9007199254740992.0);
+            }
+            out.push_back(std::move(v));
+        }
+        return out;
+    }
+};
+
+rag::index::Corpus embed_corpus(std::size_t conc, std::size_t docs,
+                                CountingEmbedder* out_probe = nullptr) {
+    rag::index::CorpusConfig cfg;
+    cfg.embed_batch     = 4;
+    cfg.hnsw_threshold  = 1'000'000;   // keep this test about embedding only
+    rag::index::Corpus c{cfg};
+    CountingEmbedder e{16, conc};
+    if (out_probe) *out_probe = e;     // shares the atomics via shared_ptr
+    c.set_embedder(rag::dense::AnyEmbedder{e});
+    for (std::size_t i = 0; i < docs; ++i)
+        c.add_document("d" + std::to_string(i) + ".md",
+                       "document number " + std::to_string(i) + " about retrieval");
+    (void)c.build();
+    return c;
+}
+
+} // namespace
+
+TEST(parallel_embedding_matches_serial_vectors) {
+    constexpr std::size_t kDocs = 64;
+    auto serial   = embed_corpus(1,  kDocs);
+    auto parallel = embed_corpus(16, kDocs);
+
+    REQUIRE(serial.chunk_count() == parallel.chunk_count());
+    REQUIRE(serial.chunk_count() >= kDocs);
+
+    for (std::size_t i = 0; i < serial.chunk_count(); ++i) {
+        const auto* a = serial.chunk(rag::ChunkId{static_cast<std::uint32_t>(i)});
+        const auto* b = parallel.chunk(rag::ChunkId{static_cast<std::uint32_t>(i)});
+        REQUIRE(a && b);
+        REQUIRE(!a->embedding.empty());          // nothing left unembedded
+        REQUIRE(a->embedding.size() == b->embedding.size());
+        for (std::size_t d = 0; d < a->embedding.size(); ++d)
+            if (a->embedding[d] != b->embedding[d]) {
+                CHECK_EQ(a->embedding[d], b->embedding[d]);
+                return;                           // one report is enough
+            }
+    }
+    CHECK(true);
+}
+
+TEST(parallel_embedding_honours_concurrency_hint) {
+    CountingEmbedder probe_serial{}, probe_par{};
+    (void)embed_corpus(1,  64, &probe_serial);
+    (void)embed_corpus(8,  64, &probe_par);
+
+    // hint == 1 must never overlap two embed calls.
+    CHECK_EQ(probe_serial.peak->load(), 1);
+    // hint > 1 should actually overlap (pool has >1 thread on any CI box we
+    // care about; if it genuinely has one core this degrades to 1, so only
+    // assert overlap when the machine can provide it).
+    if (rag::util::max_workers() > 1) CHECK(probe_par.peak->load() > 1);
+}
+
+TEST(parallel_embedding_propagates_backend_failure) {
+    rag::index::CorpusConfig cfg;
+    cfg.embed_batch    = 4;
+    cfg.hnsw_threshold = 1'000'000;
+    rag::index::Corpus c{cfg};
+    CountingEmbedder e{16, 8};
+    e.fail_at_ = true; e.fail_index_ = 3;
+    c.set_embedder(rag::dense::AnyEmbedder{e});
+    for (std::size_t i = 0; i < 64; ++i)
+        c.add_document("d" + std::to_string(i), "text " + std::to_string(i));
+
+    auto r = c.build();
+    REQUIRE(!r.has_value());
+    CHECK(r.error().code == rag::Errc::unavailable);
 }
 
 // ─── Persistence container round-trip ──────────────────────────────────

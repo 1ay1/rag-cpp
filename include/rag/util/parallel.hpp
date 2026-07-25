@@ -181,4 +181,52 @@ void parallel_blocks(std::size_t n, F&& body) {
     done_cv.wait(lk, [&] { return remaining.load(std::memory_order_acquire) == 0; });
 }
 
+// Run `body(i)` for i in [0,n) with an EXPLICIT worker count and DYNAMIC
+// (atomic-counter) scheduling — the counterpart to parallel_for for coarse,
+// non-uniform items such as embedding batches, where each item costs
+// milliseconds-to-seconds and one straggler must not stall a whole block.
+//
+// Differences from parallel_for:
+//   • no kParallelMin gate — the caller has already decided this is worth
+//     parallelizing (a handful of network round-trips easily is);
+//   • `workers` is set by the caller (e.g. an embedder's concurrency hint) and
+//     is NOT clamped to the core count. These items are typically IO-bound —
+//     eight in-flight HTTP requests are useful on a two-core box, where a
+//     core-clamped pool would leave 6/8 of the throughput on the table;
+//   • helpers are transient std::threads rather than the shared pool. At this
+//     granularity thread creation (~20µs) rounds to zero against a batch that
+//     costs milliseconds, and staying off the pool means this primitive can be
+//     called from inside a pool worker without the classic nested-parallelism
+//     deadlock (queued tasks that can never be dequeued because every pool
+//     thread is blocked waiting for them);
+//   • work is claimed one index at a time, so uneven items self-balance.
+template <class F>
+void parallel_for_dynamic(std::size_t n, std::size_t workers, F&& body) {
+    if (n == 0) return;
+    std::size_t w = workers ? workers : 1;
+    if (w > n) w = n;
+    if (w <= 1) {
+        for (std::size_t i = 0; i < n; ++i) body(i);
+        return;
+    }
+
+    std::atomic<std::size_t> next{0};
+    auto drain = [&] {
+        for (;;) {
+            const std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n) return;
+            body(i);
+        }
+    };
+
+    // The calling thread is worker 0 and joins the rest — join() is the only
+    // synchronization needed, so there is no condition-variable protocol to
+    // get wrong and no way to leak a running worker past this call.
+    std::vector<std::thread> helpers;
+    helpers.reserve(w - 1);
+    for (std::size_t t = 0; t + 1 < w; ++t) helpers.emplace_back(drain);
+    drain();
+    for (auto& th : helpers) th.join();
+}
+
 } // namespace rag::util

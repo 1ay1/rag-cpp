@@ -19,8 +19,11 @@ namespace rag::dense {
 // Dot product of two equal-length float spans.
 [[nodiscard]] float dot(std::span<const float> a, std::span<const float> b) noexcept;
 
-// In-place L2 normalization; no-op on a zero vector.
-void normalize(std::vector<float>& v) noexcept;
+// In-place L2 normalization; no-op on a zero vector. The span overload lets
+// callers normalize a slice of a larger arena (e.g. one row of a flat vector
+// store) without owning a std::vector.
+void normalize(std::span<float> v) noexcept;
+inline void normalize(std::vector<float>& v) noexcept { normalize(std::span<float>(v)); }
 
 // Cosine similarity of two vectors that need NOT be normalized.
 [[nodiscard]] float cosine(std::span<const float> a, std::span<const float> b) noexcept;

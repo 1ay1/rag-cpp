@@ -15,6 +15,7 @@
 // local hash) so retrieval never hard-fails.
 
 #include <chrono>
+#include <algorithm>
 #include <memory>
 #include <span>
 #include <string>
@@ -34,6 +35,10 @@ struct OllamaConfig {
     std::string   model   = "nomic-embed-text";
     std::size_t   dim     = 768;
     std::chrono::milliseconds timeout{30'000};
+    // In-flight batches. Ollama serializes on one model by default, but the
+    // client-side win from pipelining round-trips is real; 4 is a safe default
+    // that does not stampede a laptop-hosted server.
+    std::size_t   concurrency = 4;
 };
 
 class OllamaEmbedder {
@@ -43,6 +48,7 @@ public:
         : cfg_(std::move(cfg)), tp_(std::move(tp)) {}
     [[nodiscard]] std::size_t dimension() const noexcept { return cfg_.dim; }
     [[nodiscard]] std::string_view identity() const noexcept { return cfg_.model; }
+    [[nodiscard]] std::size_t max_concurrency() const noexcept { return cfg_.concurrency; }
     [[nodiscard]] Result<std::vector<Vector>> embed(std::span<const std::string> texts) const;
 private:
     OllamaConfig cfg_;
@@ -59,6 +65,10 @@ struct OpenAIConfig {
     std::string   api_key;                     // Bearer token
     std::size_t   dim     = 1536;
     std::chrono::milliseconds timeout{30'000};
+    // Hosted embedding endpoints are latency-bound and rate-limited per minute,
+    // not per connection: 8 concurrent requests is the usual sweet spot before
+    // 429s start costing more than they buy.
+    std::size_t   concurrency = 8;
 
     // Presets for common OpenAI-compatible servers.
     static OpenAIConfig openai(std::string key, std::string model = "text-embedding-3-small");
@@ -76,6 +86,7 @@ public:
         : cfg_(std::move(cfg)), tp_(std::move(tp)) {}
     [[nodiscard]] std::size_t dimension() const noexcept { return cfg_.dim; }
     [[nodiscard]] std::string_view identity() const noexcept { return cfg_.model; }
+    [[nodiscard]] std::size_t max_concurrency() const noexcept { return cfg_.concurrency; }
     [[nodiscard]] Result<std::vector<Vector>> embed(std::span<const std::string> texts) const;
 private:
     OpenAIConfig cfg_;
@@ -89,6 +100,9 @@ struct LlamaCppConfig {
     std::string   path    = "/embedding";
     std::size_t   dim     = 0;                  // 0 => inferred from first response
     std::chrono::milliseconds timeout{30'000};
+    // llama.cpp's server runs the model on all cores per request; concurrent
+    // requests mostly queue. Kept at 1 — raise only for a multi-slot server.
+    std::size_t   concurrency = 1;
 };
 
 class LlamaCppEmbedder {
@@ -98,6 +112,7 @@ public:
         : cfg_(std::move(cfg)), tp_(std::move(tp)) {}
     [[nodiscard]] std::size_t dimension() const noexcept { return dim_; }
     [[nodiscard]] std::string_view identity() const noexcept { return "llamacpp-embed"; }
+    [[nodiscard]] std::size_t max_concurrency() const noexcept { return cfg_.concurrency; }
     [[nodiscard]] Result<std::vector<Vector>> embed(std::span<const std::string> texts) const;
 private:
     LlamaCppConfig cfg_;
@@ -111,6 +126,13 @@ public:
     explicit HashEmbedder(std::size_t dim = 256) : dim_(dim) {}
     [[nodiscard]] std::size_t dimension() const noexcept { return dim_; }
     [[nodiscard]] std::string_view identity() const noexcept { return "hash-embed-v1"; }
+    // Pure CPU, no shared state, no internal threading — scales with cores, and
+    // NOT beyond them: unlike a network backend there is nothing to overlap, so
+    // extra workers would only contend.
+    [[nodiscard]] std::size_t max_concurrency() const noexcept {
+        const unsigned hc = std::thread::hardware_concurrency();
+        return hc ? hc : 1u;
+    }
     [[nodiscard]] Result<std::vector<Vector>> embed(std::span<const std::string> texts) const;
 private:
     std::size_t dim_;
@@ -125,6 +147,7 @@ public:
         : inner_(std::move(inner)), attempts_(max_attempts), delay_(base_delay) {}
     [[nodiscard]] std::size_t dimension() const { return inner_.dimension(); }
     [[nodiscard]] std::string_view identity() const { return inner_.identity(); }
+    [[nodiscard]] std::size_t max_concurrency() const { return inner_.max_concurrency(); }
     [[nodiscard]] Result<std::vector<Vector>> embed(std::span<const std::string> texts) const {
         Result<std::vector<Vector>> last = fail<std::vector<Vector>>(Errc::unavailable);
         auto d = delay_;
@@ -151,6 +174,10 @@ public:
         : primary_(std::move(primary)), secondary_(std::move(secondary)) {}
     [[nodiscard]] std::size_t dimension() const { return primary_.dimension(); }
     [[nodiscard]] std::string_view identity() const { return primary_.identity(); }
+    // Either path may run, so honour the more conservative of the two.
+    [[nodiscard]] std::size_t max_concurrency() const {
+        return std::min(primary_.max_concurrency(), secondary_.max_concurrency());
+    }
     [[nodiscard]] Result<std::vector<Vector>> embed(std::span<const std::string> texts) const {
         auto r = primary_.embed(texts);
         if (r) return r;

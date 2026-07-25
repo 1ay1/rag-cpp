@@ -112,7 +112,7 @@ float dot(std::span<const float> a, std::span<const float> b) noexcept {
     return dot_scalar(a.data(), b.data(), n);
 }
 
-void normalize(std::vector<float>& v) noexcept {
+void normalize(std::span<float> v) noexcept {
     float norm = std::sqrt(dot(v, v));
     if (norm <= 1e-12f) return;
     const float inv = 1.0f / norm;

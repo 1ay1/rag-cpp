@@ -71,6 +71,37 @@ struct HttpTransport {
 [[nodiscard]] std::shared_ptr<HttpTransport> default_http_transport();
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Embedding concurrency hint.
+//
+// Batches are the unit of parallelism when indexing a corpus, but the right
+// number of in-flight batches is a property of the BACKEND, not of the corpus:
+//
+//   • a hosted/remote embedder is latency-bound — a dozen concurrent POSTs
+//     costs the client nothing and multiplies throughput;
+//   • an in-process embedder (ONNX Runtime, llama.cpp) already saturates every
+//     core inside a single `embed` call, so issuing batches concurrently only
+//     oversubscribes the machine and makes things slower;
+//   • a pure-CPU toy embedder scales with the core count.
+//
+// So an embedder MAY expose `max_concurrency()`; if it doesn't, we assume 1
+// (serial), which is always correct if not always fastest. Opt-in rather than
+// required, so third-party embedders satisfying `Embedder` keep compiling.
+template <class E>
+concept ConcurrencyAware = requires(const E& e) {
+    { e.max_concurrency() } -> std::convertible_to<std::size_t>;
+};
+
+template <Embedder E>
+[[nodiscard]] constexpr std::size_t embedder_concurrency(const E& e) noexcept {
+    if constexpr (ConcurrencyAware<E>) {
+        const std::size_t c = e.max_concurrency();
+        return c ? c : 1;
+    } else {
+        return 1;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // AnyEmbedder — type-erased embedder for the runtime-polymorphic path.
 // ─────────────────────────────────────────────────────────────────────────────
 class AnyEmbedder {
@@ -92,12 +123,17 @@ public:
         return std::move((*r)[0]);
     }
 
+    // How many `embed` calls the wrapped backend wants in flight at once.
+    // 1 unless the concrete embedder opted in (see ConcurrencyAware above).
+    [[nodiscard]] std::size_t max_concurrency() const { return self_->max_concurrency(); }
+
 private:
     struct Concept {
         virtual ~Concept() = default;
         virtual std::size_t dimension() const = 0;
         virtual std::string_view identity() const = 0;
         virtual Result<std::vector<Vector>> embed(std::span<const std::string>) const = 0;
+        virtual std::size_t max_concurrency() const = 0;
     };
     template <Embedder E>
     struct Model final : Concept {
@@ -108,6 +144,7 @@ private:
         Result<std::vector<Vector>> embed(std::span<const std::string> t) const override {
             return e.embed(t);
         }
+        std::size_t max_concurrency() const override { return embedder_concurrency(e); }
     };
     std::shared_ptr<const Concept> self_;
 };

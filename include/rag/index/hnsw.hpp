@@ -102,9 +102,15 @@ public:
     [[nodiscard]] static Result<HnswIndex> deserialize(std::string_view blob);
 
 private:
+    // Node payload WITHOUT the vector. Vectors live in a flat arena (`store_`)
+    // rather than one std::vector<float> per node, because the graph walk is
+    // the hot loop and per-node heap blocks cost it twice: an extra pointer
+    // chase before every distance computation (the header is in cache, the
+    // payload is a fresh miss) and no spatial locality between neighbours
+    // scored back-to-back. One arena makes `vec_at(n)` pure address arithmetic
+    // and makes prefetching the next neighbour actually pay.
     struct Node {
         std::uint32_t              id = 0;
-        std::vector<float>         vec;     // unit-normalized
         std::vector<std::uint64_t> bits;    // sign code (binary mode)
         std::vector<std::vector<std::uint32_t>> links;  // links[layer]
     };
@@ -125,8 +131,23 @@ private:
     int           max_layer_ = -1;
     std::uint32_t entry_     = 0;
     std::vector<Node> nodes_;                 // index == internal node ordinal
+    // Flat vector arena: node k's unit-normalized vector is
+    // store_[k*dim_ .. k*dim_+dim_). Sized in lockstep with nodes_.
+    //
+    // CONCURRENCY: build_batch stages ALL vectors (and reserves the arena to
+    // its final size) before any linking thread starts, so `store_` never
+    // reallocates while readers hold spans into it. Do not push into store_
+    // from a parallel phase.
+    std::vector<float> store_;
     std::unordered_set<std::uint32_t> deleted_;  // tombstoned ids (soft-delete)
     mutable std::mt19937_64 rng_{cfg_.seed};
+
+    [[nodiscard]] std::span<const float> vec_at(std::size_t n) const noexcept {
+        return {store_.data() + n * dim_, dim_};
+    }
+    [[nodiscard]] std::span<float> vec_at(std::size_t n) noexcept {
+        return {store_.data() + n * dim_, dim_};
+    }
 
     [[nodiscard]] int  random_level();
     [[nodiscard]] float sim(std::size_t node_a, std::span<const float> q,
@@ -135,6 +156,12 @@ private:
     search_layer(std::span<const float> q, std::span<const std::uint64_t> q_bits,
                  std::uint32_t entry, int layer, std::size_t ef) const;
     void connect(std::uint32_t node, int layer, std::vector<std::uint32_t> neighbours);
+
+    // Score `cands` against `nv` and sort best-first into `out`, computing each
+    // dot product exactly once. Shared by connect() and connect_locked().
+    void score_and_sort(std::span<const float> nv,
+                        const std::vector<std::uint32_t>& cands,
+                        std::vector<std::pair<float, std::uint32_t>>& out) const;
 
     // connect() variant used during a concurrent build: takes the per-node
     // spinlocks before mutating adjacency.
