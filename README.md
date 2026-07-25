@@ -154,6 +154,56 @@ ragcpp query corpus.ragdb "my question" -k 5 --mmr
 ragcpp eval  ./nfcorpus --split=test  # BEIR metrics
 ```
 
+## Serve over RCP (the Retrieval Context Protocol)
+
+rag-cpp speaks [**RCP/1**](https://github.com/1ay1/rcp) — an open JSON-RPC
+protocol for retrieval engines (what MCP is to tools, RCP is to grounding
+context). Any RCP client can drive the engine's hybrid retrieval, embedding,
+GraphRAG, and index over stdio or HTTP. The front-end is a thin, header-only
+framework layer (`rag/rcp/`) over the same live `Engine` your app already builds:
+
+```cpp
+#include <rag/rcp/rcp.hpp>
+
+int main() {
+    rag::Engine engine;                       // your engine, your corpus
+    engine.with_embedder(/* … */);
+    engine.add("doc://1", "…"); engine.build();
+
+    rag::rcp::serve_stdio(engine);            // now a conformant RCP/1 server
+}
+```
+
+Need more surface? The fluent `ServerBuilder` advertises exactly the
+capabilities you turn on, and any method can be overridden with a host hook
+(an external reranker, an LLM query rewriter, a policy-scoped retrieve) without
+subclassing:
+
+```cpp
+rag::rcp::ServerBuilder(engine)
+    .named("docs", "1.0")
+    .with_index(/*writable=*/true)            // index/add + index/delete (upsert)
+    .filter_on("lang", "keyword")            // §8 metadata filtering
+    .on_rerank(my_cross_encoder)             // add a capability the base lacks
+    .serve_http(8000);
+```
+
+The engine is held by **reference** — the host keeps ingesting/persisting
+through its own handle while the server reads the same live corpus. Capabilities
+are advertised honestly (e.g. `embed` only when an embedder is attached), the
+funnel invariant `candidateK ≥ topN ≥ k` is wire-enforced, and every hit carries
+a citation for grounded generation.
+
+Build and certify:
+
+```sh
+cmake --build build --target ragcpp_rcp_server        # RAGCPP_WITH_RCP=ON (default)
+./build/examples/ragcpp_rcp_server                     # stdio
+./build/examples/ragcpp_rcp_server --http 8000         # HTTP
+python3 ~/projects/rcp/conformance/check.py -- ./build/examples/ragcpp_rcp_server
+#  → CERTIFIED LEVEL: L2
+```
+
 ## Performance (5000 chunks, Apple M-series, NEON)
 
 ```

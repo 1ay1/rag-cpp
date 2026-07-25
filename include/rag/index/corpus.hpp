@@ -55,6 +55,13 @@ public:
     // Attach a dense embedder (enables the dense half). Optional.
     void set_embedder(dense::AnyEmbedder e) { embedder_ = std::move(e); }
     [[nodiscard]] bool has_embedder() const noexcept { return embedder_.has_value(); }
+    // Read-only view of the attached embedder (its dimension/identity/embed),
+    // or nullptr when none is set. Lets front-ends (e.g. the RCP server) both
+    // advertise the dense capability and answer raw `embed` requests without
+    // reaching into corpus internals.
+    [[nodiscard]] const dense::AnyEmbedder* embedder() const noexcept {
+        return embedder_ ? &*embedder_ : nullptr;
+    }
 
     // Embed arbitrary text with the attached embedder (unit-normalized, same as
     // indexed chunks). Fails with Errc::unavailable if no embedder is set. Used
@@ -91,6 +98,10 @@ public:
     // ── Resolution / access ─────────────────────────────────────────────────
     [[nodiscard]] const Chunk*    chunk(ChunkId id) const;
     [[nodiscard]] const Document* document(DocId id) const;
+    // Look up a live (non-tombstoned) document by its stable external uri, or
+    // nullopt if none. Enables upsert semantics (RCP index/add §7.10 mandates an
+    // explicit id is an upsert, not a duplicate).
+    [[nodiscard]] std::optional<DocId> find_by_uri(std::string_view uri) const;
     [[nodiscard]] SearchResult    resolve(const Hit& h) const;
     [[nodiscard]] std::size_t     chunk_count()    const noexcept { return chunks_.size(); }
     [[nodiscard]] std::size_t     document_count() const noexcept { return docs_.size(); }

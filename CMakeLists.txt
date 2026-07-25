@@ -13,6 +13,8 @@ option(RAGCPP_USE_SIMD       "Enable SIMD distance kernels" ON)
 option(RAGCPP_WERROR         "Treat warnings as errors"     OFF)
 option(RAGCPP_WITH_ONNX      "Build in-process ONNX Runtime embedder" OFF)
 option(RAGCPP_WITH_LLAMA     "Build in-process GGUF (llama.cpp) embedder" OFF)
+option(RAGCPP_WITH_RCP       "Build the Retrieval Context Protocol (RCP) server front-end" ON)
+set(RAGCPP_RCP_SDK_DIR "" CACHE PATH "Path to a local RCP C++ SDK checkout (sdk/cpp). Empty = FetchContent from GitHub.")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
@@ -88,6 +90,30 @@ if(NOT MSVC)
     if(RAGCPP_WERROR)
         target_compile_options(ragcpp PRIVATE -Werror)
     endif()
+endif()
+
+# ── RCP: the Retrieval Context Protocol server front-end ─────────────────────
+# rag-cpp speaks RCP/1 (github.com/1ay1/rcp) so any RCP client can drive the
+# engine over stdio or HTTP. The SDK is header-only C++23. Prefer a local
+# checkout (RAGCPP_RCP_SDK_DIR, or the sibling ~/projects/rcp/sdk/cpp) so the
+# two repos co-develop; fall back to FetchContent for a standalone build.
+if(RAGCPP_WITH_RCP)
+    if(RAGCPP_RCP_SDK_DIR AND EXISTS "${RAGCPP_RCP_SDK_DIR}/include/rcp.hpp")
+        add_subdirectory(${RAGCPP_RCP_SDK_DIR} ${CMAKE_BINARY_DIR}/rcp-sdk)
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../rcp/sdk/cpp/include/rcp.hpp")
+        add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../rcp/sdk/cpp ${CMAKE_BINARY_DIR}/rcp-sdk)
+    else()
+        FetchContent_Declare(rcp
+            GIT_REPOSITORY https://github.com/1ay1/rcp.git
+            GIT_TAG        main
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  sdk/cpp)
+        FetchContent_MakeAvailable(rcp)
+    endif()
+    add_library(ragcpp_rcp INTERFACE)
+    add_library(ragcpp::rcp ALIAS ragcpp_rcp)
+    target_link_libraries(ragcpp_rcp INTERFACE ragcpp rcp::rcp)
+    target_compile_definitions(ragcpp_rcp INTERFACE RAGCPP_WITH_RCP=1)
 endif()
 
 if(RAGCPP_BUILD_TESTS)

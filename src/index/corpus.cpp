@@ -175,6 +175,15 @@ const Document* Corpus::document(DocId id) const {
     return id.get() < docs_.size() ? &docs_[id.get()] : nullptr;
 }
 
+std::optional<DocId> Corpus::find_by_uri(std::string_view uri) const {
+    if (uri.empty()) return std::nullopt;
+    for (const auto& d : docs_) {
+        if (deleted_docs_.count(d.id.get())) continue;   // skip tombstones
+        if (d.uri == uri) return d.id;
+    }
+    return std::nullopt;
+}
+
 SearchResult Corpus::resolve(const Hit& h) const {
     SearchResult r;
     const Chunk* ch = chunk(h.chunk);

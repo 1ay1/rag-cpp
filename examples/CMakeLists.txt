@@ -26,3 +26,11 @@ target_link_libraries(ragcpp_plugin_host PRIVATE ragcpp)
 # ── Polyglot (Python / any-language) backend demo ─────────────────────────
 add_executable(ragcpp_python_backend polyglot/python_backend.cpp)
 target_link_libraries(ragcpp_python_backend PRIVATE ragcpp)
+
+# ── RCP/1 protocol server front-end ───────────────────────────────────────────
+# rag-cpp exposed over the Retrieval Context Protocol (stdio + HTTP). Requires
+# the RCP C++ SDK, wired by the top-level CMake when RAGCPP_WITH_RCP is ON.
+if(TARGET ragcpp::rcp)
+    add_executable(ragcpp_rcp_server rcp_server.cpp)
+    target_link_libraries(ragcpp_rcp_server PRIVATE ragcpp::rcp)
+endif()

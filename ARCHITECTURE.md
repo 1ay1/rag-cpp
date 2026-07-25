@@ -189,6 +189,27 @@ The stable, versioned, CRC-checked `.ragdb` container (see `FORMAT.md`).
 A flat opaque-handle C API (`rag/c/rag.h`) so Python/Rust/Go/any language can
 drive the engine. Errors cross as status codes, never exceptions.
 
+### rcp — the protocol front-end
+rag-cpp as a conformant [**RCP/1**](https://github.com/1ay1/rcp) server. A
+header-only framework layer (`rag/rcp/`) over the RCP C++ SDK, layered like the
+rest of the library:
+
+- `error.hpp` — the one total map between `rag::Error` (Errc) and the wire's
+  JSON-RPC codes (`rcp::errc`), exhaustively switched.
+- `convert.hpp` — pure wire↔engine translation: `retrieve` param parsing with the
+  funnel invariant (§3.3), `SearchResult`→`Hit` (id/score/citation/trust/vector),
+  and the §8 filter tree → a `MetaFilter` predicate (validated against advertised
+  fields, precise `-32602` otherwise).
+- `handler.hpp` — `EngineHandler` satisfies the SDK `Handler` concept over an
+  `Engine&`. Capabilities are **data** (`Options`), advertised only when honestly
+  backable (e.g. `embed` iff an embedder is attached); disabled methods are
+  unreachable via `-32003` before the hook runs. `Hooks` lets a host override or
+  extend any method with a `std::function` — no subclassing.
+- `server.hpp` — `ServerBuilder` + `serve_stdio`/`serve_http` free functions.
+
+The engine is borrowed by reference (host owns lifetime + ingestion); the server
+reads the live corpus. Certified at conformance level L2.
+
 ## Design invariants
 
 1. **The network is optional and injected.** `HttpTransport` is the single
