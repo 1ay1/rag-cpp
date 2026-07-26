@@ -280,11 +280,16 @@ attached in-process, evaluated through `Pipeline::run` — the same code path
 | ColBERTv2 | 0.693 |
 | SPLADE++ | 0.710 |
 | **rag-cpp hybrid (MiniLM-L6)** | **0.7347** |
+| **rag-cpp dense (bge-base)** | **0.7563** |
 
 Hybrid beats **both of its own halves** — BM25 alone scores 0.6800, MiniLM alone
 0.6518 — on all three datasets tested, which is the fusion earning its keep
-rather than a better retriever being picked. Full tables, the NFCorpus/ArguAna
-runs, and the reproduction commands are in
+rather than a better retriever being picked. Swap MiniLM for **bge-base** and the
+ceiling rises on every dataset (SciFact 0.7347→0.7563, ArguAna 0.3848→0.4455) —
+and the best config *flips* to pure dense, because a strong embedder no longer
+needs BM25 fused in. All measured, not asserted. Full tables, the
+NFCorpus/ArguAna runs, the embedder-scaling comparison, and the reproduction
+commands are in
 [`BENCHMARKS.md`](BENCHMARKS.md#hybrid-retrieval-with-a-neural-embedder).
 
 ## Documentation

@@ -187,7 +187,12 @@ resulting index. Raise `LocalEmbedderConfig::threads` and
 **Choosing a model.** Anything in the sentence-transformers / BGE / E5 family
 with an ONNX export drops into the same three lines; only `model_path` changes.
 MiniLM-L6 is the floor, not the ceiling — it is the model the benchmarks use
-precisely because winning with the *small* one is the stronger claim.
+precisely because winning with the *small* one is the stronger claim. Going
+bigger is measured, not hand-waved: **`bge-base-en-v1.5`** (dim 768) in the same
+slot lifts SciFact nDCG@10 0.7347→0.7563 and ArguAna 0.3848→0.4455, and —
+usefully — makes pure `dense` overtake hybrid, because a strong embedder no
+longer needs BM25 fused in. The comparison and its caveats are in
+[BENCHMARKS.md](../BENCHMARKS.md#scaling-the-embedder-bge-base-vs-minilm-l6).
 
 ## Remote embedders over a bridge
 

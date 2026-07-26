@@ -108,6 +108,7 @@ Reproduce (models are ~86 MB, one `curl`; see
 | SPLADE++ | 0.710 | published |
 | BGE-base / E5-base (dense) | ~0.72–0.74 | published |
 | **rag-cpp (hybrid, MiniLM-L6)** | **0.7347** | this repo, reproducible above |
+| **rag-cpp (dense, bge-base)** | **0.7563** | this repo, reproducible above |
 
 Two separate claims, both measured:
 
@@ -119,9 +120,10 @@ Two separate claims, both measured:
    at the top of the BGE/E5 band. The fusion is doing the work, not the model.
 
 The honest caveat on (2): these are single-dataset comparisons against numbers
-from papers, not a re-run of those systems in this harness, and MiniLM-L6 is a
-small model — a `bge-base` or `e5-base` embedder in the same slot should go
-higher still. It is not measured here, so it is not claimed here.
+from papers, not a re-run of those systems in this harness. MiniLM-L6 is a small
+model; a `bge-base` embedder in the same slot goes higher still, and that is now
+**measured, not asserted** — see [Scaling the embedder](#scaling-the-embedder-bge-base-vs-minilm-l6)
+below.
 
 **ArguAna, previously a known open gap, is closed by this.** With no model the
 `standard` pipeline was *behind* pure lexical there (0.3628 vs 0.3720) — ArguAna
@@ -139,6 +141,55 @@ motion, so a diversity penalty computed in a real semantic space suppresses the
 entire relevant cluster — the one dataset where "show me something different" is
 precisely the wrong instruction. MMR stays opt-in and this is why. Use
 `standard`, or Dartboard (below), when relevance is the objective.
+
+### Scaling the embedder: bge-base vs MiniLM-L6
+
+The MiniLM numbers above are deliberately the *small* choice. The obvious
+question — does a bigger embedder help, and by how much — was previously left
+unmeasured, so it was left unclaimed. It is measured now, dropping
+**`bge-base-en-v1.5`** (109 M params, dim 768) into the exact same slot as
+MiniLM-L6 (22 M, dim 384), same harness, same datasets, in-process on CPU:
+
+| Dataset | MiniLM `dense` | MiniLM `standard` | bge-base `dense` | bge-base `standard` |
+|---------|---------------|-------------------|------------------|---------------------|
+| SciFact  | 0.6518 | 0.7347 | **0.7563** | 0.7284 |
+| NFCorpus | 0.3179 | 0.3602 | **0.3802** | 0.3699 |
+| ArguAna  | 0.3614 | 0.3848 | **0.4455** | 0.4400 |
+
+(nDCG@10. MiniLM columns repeat the section above; bge-base columns are the new
+measurement.) Two findings, both of which change what you should deploy:
+
+1. **A bigger embedder lifts the ceiling on every dataset.** Best-of-config
+   nDCG@10 goes 0.7347→0.7563 (SciFact), 0.3602→0.3802 (NFCorpus),
+   0.3848→0.4455 (ArguAna). The ArguAna gain (+0.061) is the largest — a
+   counter-argument task rewards a stronger semantic space most.
+2. **The winning configuration flips.** With MiniLM, hybrid beats dense on all
+   three (fusion rescues a weak embedder). With bge-base, **dense beats hybrid**
+   on all three: the dense signal is now strong enough that fusing in BM25 is a
+   net *drag*, not a lift. There is no single "best pipeline" independent of the
+   embedder — `standard` (hybrid) is the right default for a small model, and
+   pure `dense` overtakes it once the embedder is strong. Pick by measuring on
+   your data, which is what this harness is for.
+
+MMR collapses harder here, not less: bge-base `quality` on ArguAna is **0.2866**
+vs `dense` 0.4455 (MiniLM: 0.0380 vs 0.3848). A stronger embedder packs the
+near-duplicate arguments *closer*, so a diversity penalty in that space suppresses
+the relevant cluster even more aggressively — the MMR caveat above is not a
+small-model artefact.
+
+Caveats, stated: bge-v1.5 recommends a query-instruction prefix for retrieval
+("Represent this sentence for searching relevant passages:") that this harness
+does **not** apply — queries and documents are embedded symmetrically — so these
+bge numbers are a slight *under*-estimate of what bge-base can do. And these are
+three datasets, not the full BEIR suite.
+
+Reproduce (bge-base ONNX + tokenizer are one `curl` each from
+`BAAI/bge-base-en-v1.5`):
+
+```sh
+./build/bench/ragcpp_beir_bench ./scifact --split=test \
+    --model=bge-base/model.onnx --tokenizer=bge-base/tokenizer.json
+```
 
 ## Retrieval-quality fixes, measured
 
