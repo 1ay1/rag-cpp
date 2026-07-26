@@ -1,10 +1,81 @@
 # GPU acceleration
 
-rag-cpp has an optional **Metal** backend that scores dense-retrieval batches on
-the GPU. It is on by default on Apple platforms (`-DRAGCPP_WITH_METAL=ON`) and
-absent elsewhere. It is a **throughput optimization for batch scoring**, not a
+rag-cpp scores dense-retrieval batches on the GPU through **two interchangeable
+backends**, so acceleration is available on every major vendor — not just Apple:
+
+| Backend | Runs on | Built when |
+|---------|---------|------------|
+| **Metal** | Apple silicon / macOS | `-DRAGCPP_WITH_METAL=ON` (default on Apple) |
+| **OpenCL** | **NVIDIA, AMD, Intel**, and Apple as a fallback | `-DRAGCPP_WITH_OPENCL=ON` (auto-detected) |
+
+The OpenCL kernel is compiled **at runtime** by whichever driver is installed, so
+one binary runs on any of those vendors with no vendor SDK at build time.
+
+GPU support is a **throughput optimization for batch scoring**, not a
 requirement — every path has a CPU fallback and the GPU is used only when it is
 provably faster.
+
+## Which backend gets used
+
+Selection happens once, at first use:
+
+1. `RAGCPP_GPU_BACKEND=metal|opencl|none` overrides everything, if set.
+2. **Metal**, when compiled in and a device initialises.
+3. **OpenCL**, otherwise.
+
+A backend that fails to initialise falls through to the next rather than
+disabling the GPU entirely — a broken OpenCL ICD should not cost an Apple user
+their Metal path.
+
+```cpp
+for (auto b : rag::gpu::compiled_backends())   // what this BINARY can use
+    std::printf("%s\n", rag::gpu::backend_name(b));
+
+if (rag::gpu::available())                      // what this MACHINE has now
+    std::printf("active: %s (%s)\n",
+                rag::gpu::backend_name(rag::gpu::device_info().backend),
+                rag::gpu::device_info().name.c_str());
+```
+
+Those are deliberately two different questions: "this build cannot use your GPU"
+and "this machine has no usable GPU" are very different problems.
+
+### Why Metal is preferred on Apple
+
+Measured on an M1, 200k × 384 corpus, 64 queries, against an 8-thread CPU scan:
+
+| Backend | Time | vs CPU |
+|---------|------|--------|
+| CPU (8 threads) | 482 ms | 1.0× |
+| **Metal** | **41 ms** | **11.6×** |
+| OpenCL | 692 ms | 0.7× |
+
+The OpenCL result is **not** the kernel's fault. Profiling with
+`CL_QUEUE_PROFILING_ENABLE` separates the two:
+
+```
+kernel execution (device timestamps)   16.1 ms   <- faster than Metal
+readback of the 48 MB result            4.3 ms
+wall time of the same dispatch         672   ms   <- Apple's ICD
+```
+
+Apple's OpenCL driver is deprecated and adds ~650 ms of per-dispatch latency,
+reproducibly, on every dispatch and at every work-group size. On NVIDIA/AMD/Intel
+ICDs that overhead is absent — which is exactly why Metal is preferred on Apple
+and OpenCL is the path that matters everywhere else.
+
+## Correctness across backends
+
+A GPU accumulates a dot product in a different **order** than the CPU, so results
+can differ by a float ULP. What is guaranteed, and tested
+(`gpu_active_backend_matches_cpu_whichever_it_is`), is that **scores** match the
+CPU to within `1e-4` on unit vectors — measured max error `2.4e-07` across 12.8M
+values, with zero exceedances on either backend.
+
+Ranked **ids** match too, except that the last slot may swap when two distinct
+documents sit within a ULP of each other astride the `k` boundary. Both answers
+are equally correct; demanding otherwise would require every vendor's FPU to
+reassociate exactly like the host's.
 
 ## What it accelerates
 

@@ -86,9 +86,26 @@ namespace rag::gpu {
 
 // What the active backend is, for diagnostics and for tests that must assert
 // they exercised the path they think they did.
-enum class Backend { none, metal };
+//
+// Two backends ship. They are not redundant:
+//
+//   metal   Apple-only, but on Apple silicon it is the better path — unified
+//           memory means no host<->device copy, and the driver is the one the
+//           hardware was designed around.
+//   opencl  Everything else: NVIDIA, AMD, Intel, and Apple as a fallback. One
+//           kernel source compiled at runtime by the vendor's driver, so a
+//           single build runs on any of them without a vendor SDK at build
+//           time. This is what makes GPU acceleration available off Apple.
+//
+// Selection is automatic (see select_backend below); a build may contain both.
+enum class Backend { none, metal, opencl };
 
 [[nodiscard]] const char* backend_name(Backend b) noexcept;
+
+// Which backends were COMPILED IN, regardless of whether a device exists now.
+// Lets a diagnostic distinguish "this binary cannot use your GPU" from "this
+// machine has no usable GPU", which are very different problems for a user.
+[[nodiscard]] std::vector<Backend> compiled_backends();
 
 // Description of the device actually in use.
 struct DeviceInfo {

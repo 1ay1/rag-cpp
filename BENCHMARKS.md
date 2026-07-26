@@ -211,7 +211,11 @@ Measured on standard ANN datasets, recall@10 vs exact cosine, `M=16`,
 ./build/bench/ragcpp_ann_bench <base.fvecs> [query.fvecs] [limit]
 ```
 
-## GPU batch scoring (Metal)
+## GPU batch scoring
+
+Two interchangeable backends: **Metal** (Apple) and **OpenCL** (NVIDIA, AMD,
+Intel, and Apple as a fallback). Selection is automatic; `RAGCPP_GPU_BACKEND`
+overrides it.
 
 dim 384, k=10, Apple M-series:
 
@@ -223,6 +227,30 @@ dim 384, k=10, Apple M-series:
 ```sh
 ./build/bench/ragcpp_gpu_bench
 ```
+
+### Backend comparison (M1, 200k × 384, 64 queries)
+
+| Backend | Time | vs CPU | Max error vs CPU |
+|---------|------|--------|------------------|
+| CPU (8 threads) | 482 ms | 1.0× | — |
+| **Metal** | **41 ms** | **11.6×** | 8.9e-08 |
+| OpenCL | 692 ms | 0.7× | 2.4e-07 |
+
+Both backends are numerically equivalent to the CPU: **zero** of 12.8M scores
+differ by more than `1e-4`.
+
+The OpenCL wall time on Apple is **driver overhead, not the kernel**. With
+`CL_QUEUE_PROFILING_ENABLE`:
+
+| Component | Time |
+|-----------|------|
+| Kernel execution (device timestamps) | **16.1 ms** — faster than Metal |
+| Readback of the 48 MB result | 4.3 ms |
+| Wall time of the same dispatch | **672 ms** — Apple's deprecated ICD |
+
+Reproducible on every dispatch and unchanged across work-group sizes 16–256. This
+is why Metal is preferred on Apple; on NVIDIA/AMD/Intel ICDs the overhead is
+absent.
 
 ## Durability
 

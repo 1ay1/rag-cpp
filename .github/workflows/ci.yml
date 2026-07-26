@@ -145,6 +145,29 @@ jobs:
       - run: cmake --build build -j 8
       - run: ctest --test-dir build --output-on-failure
 
+  # The OpenCL backend is the CROSS-PLATFORM GPU path — it is what gives NVIDIA,
+  # AMD and Intel users acceleration at all — so it must keep COMPILING on
+  # non-Apple targets, which no developer Mac verifies. A CI runner has no GPU,
+  # so this proves the build and the graceful decline (available() == false ->
+  # every caller takes its CPU path), not the kernel. The kernel's correctness is
+  # covered by gpu_active_backend_matches_cpu_whichever_it_is, which runs
+  # wherever a device does exist.
+  opencl:
+    name: linux / opencl build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the OpenCL headers and an ICD loader
+        run: sudo apt-get update && sudo apt-get install -y opencl-headers ocl-icd-opencl-dev
+      - name: Configure with OpenCL required
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DRAGCPP_WITH_OPENCL=ON
+      - name: Assert the backend was actually compiled in
+        run: |
+          grep -q 'RAGCPP_WITH_OPENCL' build/CMakeCache.txt || {
+            echo "::error::RAGCPP_WITH_OPENCL=ON did not take effect"; exit 1; }
+      - run: cmake --build build -j 8
+      - run: ctest --test-dir build --output-on-failure
+
   # Warnings get their own job so that a new compiler release inventing a
   # diagnostic cannot take down the pin check or the test matrix. Pinned to the
   # platform where -Werror was actually verified clean; widen it only after

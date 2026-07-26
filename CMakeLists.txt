@@ -53,6 +53,10 @@ if(NOT nlohmann_json_FOUND)
 endif()
 
 file(GLOB_RECURSE RAGCPP_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+# Backend translation units are added conditionally by their own blocks below;
+# the glob must not pull them in when the corresponding option is off, or the
+# build fails on a machine with no OpenCL headers.
+list(REMOVE_ITEM RAGCPP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/opencl_backend.cpp")
 
 add_library(ragcpp ${RAGCPP_SOURCES})
 add_library(ragcpp::ragcpp ALIAS ragcpp)
@@ -125,6 +129,32 @@ if(RAGCPP_WITH_METAL)
     find_library(FOUNDATION_LIB Foundation REQUIRED)
     target_link_libraries(ragcpp PUBLIC ${METAL_LIB} ${FOUNDATION_LIB})
     target_compile_definitions(ragcpp PRIVATE RAGCPP_WITH_METAL=1)
+endif()
+
+# ── OpenCL GPU backend (cross-platform) ───────────────────────────────
+# Metal is faster on Apple silicon and stays preferred there, but it is
+# Apple-only. OpenCL is what makes GPU acceleration available on NVIDIA, AMD and
+# Intel: the kernel is compiled at RUNTIME by whichever driver is installed, so
+# one binary runs on all of them and no vendor SDK is needed at build time.
+#
+# AUTO-DETECTED rather than defaulted ON: a machine without OpenCL headers must
+# still build, and silently requiring a dependency the user never asked for is
+# how a portable library stops being portable. Set RAGCPP_WITH_OPENCL=ON to make
+# a missing OpenCL a hard error instead.
+if(NOT DEFINED RAGCPP_WITH_OPENCL)
+    find_package(OpenCL QUIET)
+    if(OpenCL_FOUND)
+        option(RAGCPP_WITH_OPENCL "Build the OpenCL GPU backend (NVIDIA/AMD/Intel)" ON)
+    else()
+        option(RAGCPP_WITH_OPENCL "Build the OpenCL GPU backend (NVIDIA/AMD/Intel)" OFF)
+    endif()
+endif()
+if(RAGCPP_WITH_OPENCL)
+    find_package(OpenCL REQUIRED)
+    target_sources(ragcpp PRIVATE src/gpu/opencl_backend.cpp)
+    target_link_libraries(ragcpp PUBLIC OpenCL::OpenCL)
+    target_compile_definitions(ragcpp PRIVATE RAGCPP_WITH_OPENCL=1)
+    message(STATUS "rag-cpp: OpenCL GPU backend enabled")
 endif()
 
 if(RAGCPP_USE_SIMD)

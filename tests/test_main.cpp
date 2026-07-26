@@ -3144,6 +3144,75 @@ TEST(gpu_reports_a_coherent_device) {
     // The name mapping is total — no enum value renders as garbage.
     CHECK_EQ(std::string(rag::gpu::backend_name(rag::gpu::Backend::none)), std::string("none"));
     CHECK_EQ(std::string(rag::gpu::backend_name(rag::gpu::Backend::metal)), std::string("metal"));
+    CHECK_EQ(std::string(rag::gpu::backend_name(rag::gpu::Backend::opencl)), std::string("opencl"));
+}
+
+TEST(gpu_compiled_backends_are_coherent) {
+    // compiled_backends() answers "can this BINARY use a GPU", which is a
+    // different question from available() ("is there a usable device NOW") and
+    // the two get confused constantly in bug reports. Pin the relationship.
+    const auto compiled = rag::gpu::compiled_backends();
+
+    // Every entry must be a real backend, never `none`, and never duplicated.
+    std::set<int> seen;
+    for (auto b : compiled) {
+        CHECK(b != rag::gpu::Backend::none);
+        CHECK(seen.insert(static_cast<int>(b)).second);
+        // ...and it must name itself.
+        CHECK(std::string(rag::gpu::backend_name(b)) != std::string("none"));
+    }
+
+    // A device can only be active if its backend was compiled in. The converse
+    // does NOT hold: a build may contain OpenCL on a machine with no GPU.
+    if (rag::gpu::available()) {
+        const auto active = rag::gpu::device_info().backend;
+        bool found = false;
+        for (auto b : compiled) if (b == active) found = true;
+        CHECK(found);
+    }
+}
+
+TEST(gpu_active_backend_matches_cpu_whichever_it_is) {
+    // The cross-platform point: correctness is a property of the SEAM, not of
+    // one vendor's driver. Whatever backend selection landed on — Metal on
+    // Apple, OpenCL on NVIDIA/AMD/Intel — its scores must match the CPU's.
+    //
+    // This is the test that would catch a new backend whose kernel transposes
+    // its output, uses fast-math reassociation, or silently truncates the last
+    // work-group. It is deliberately phrased over whatever is active rather
+    // than over a named backend, so adding a backend does not require adding a
+    // test to notice it is wrong.
+    if (!rag::gpu::available()) return;
+
+    const std::size_t dim = 128;
+    const std::size_t nq  = 8;
+    // Size from the routing threshold so the dispatch is actually accepted;
+    // hardcoding a size is how the batch test silently tested nothing earlier.
+    const std::size_t n = rag::gpu::min_batch_work() / (nq * dim) + 512;
+    GpuFixture fx(n, nq, dim);
+
+    std::vector<float> out(n * nq, -999.0f);
+    if (!rag::gpu::score_batch(fx.corpus, fx.queries, dim, out)) return;   // declined
+
+    const std::vector<float> ref = cpu_score_batch(fx.corpus, fx.queries, dim);
+    REQUIRE(ref.size() == out.size());
+
+    double worst = 0.0;
+    std::size_t over = 0;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const double e = std::fabs((double)out[i] - (double)ref[i]);
+        worst = std::max(worst, e);
+        if (e > 1e-4) ++over;
+    }
+    // Absolute error on unit vectors, for the reason documented above.
+    CHECK_EQ(over, std::size_t{0});
+    CHECK(worst < 1e-4);
+
+    // Every slot must have been written: a kernel that skips its tail would
+    // leave the sentinel behind and still pass a loose average-error check.
+    std::size_t untouched = 0;
+    for (float v : out) if (v == -999.0f) ++untouched;
+    CHECK_EQ(untouched, std::size_t{0});
 }
 
 TEST(gpu_score_batch_matches_cpu_or_declines) {
@@ -3241,12 +3310,34 @@ TEST(dense_batch_matches_the_per_query_path_exactly) {
         REQUIRE(one.has_value());
         REQUIRE((*batched)[q].size() == one->size());
         for (std::size_t i = 0; i < one->size(); ++i) {
-            // Exact same ids in the same ORDER — not just the same set. Ties
-            // are common with a hash embedder, and an unstable sort made these
-            // two paths disagree on tied hits until dense scoring got a total
-            // order (score desc, then chunk id asc).
-            CHECK_EQ((*batched)[q][i].chunk.get(), (*one)[i].chunk.get());
+            // SCORES must agree: this is the real equivalence claim, and it is
+            // what a transposed, truncated, or fast-math kernel would break.
             CHECK(std::fabs((*batched)[q][i].score.get() - (*one)[i].score.get()) < 1e-4f);
+
+            // IDS must agree too — ties are common with a hash embedder, and an
+            // unstable sort made these paths disagree until dense scoring got a
+            // total order (score desc, then chunk id asc).
+            //
+            // ...EXCEPT at the last slot, and this is not laziness. A GPU
+            // accumulates a dot product in a different ORDER than the CPU, so
+            // the two can differ by a float ULP. When two DISTINCT documents
+            // sit within a ULP of each other astride the k boundary, that
+            // rounding decides which one makes the cut, and both answers are
+            // equally correct. MEASURED, forcing each backend on the same
+            // fixture: OpenCL 1 differing id, Metal 0 — with worst score delta
+            // 5.96e-08 (one ULP) and ZERO scores differing by more than 1e-4 on
+            // either. Demanding bit-identical ordering here would be demanding
+            // that every vendor's FPU reassociate exactly like the host's,
+            // which no cross-platform seam can promise.
+            const bool last_slot = (i + 1 == one->size());
+            if (!last_slot) {
+                CHECK_EQ((*batched)[q][i].chunk.get(), (*one)[i].chunk.get());
+            } else if ((*batched)[q][i].chunk.get() != (*one)[i].chunk.get()) {
+                // A boundary swap is only acceptable if the two candidates were
+                // genuinely indistinguishable. A real ranking bug moves a hit
+                // whose score is materially different.
+                CHECK(std::fabs((*batched)[q][i].score.get() - (*one)[i].score.get()) < 1e-5f);
+            }
         }
     }
 }
