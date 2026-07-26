@@ -128,6 +128,67 @@ A build without the flag still **resolves** `"onnx"`/`"gguf"` by name but return
 a clear `unavailable` error — so a `fallback` naming a local primary degrades to
 its secondary instead of breaking.
 
+### Running a real model in process
+
+End to end, from nothing to hybrid retrieval with a real transformer. This is the
+exact path the [hybrid BEIR numbers](../BENCHMARKS.md#hybrid-retrieval-with-a-neural-embedder)
+were measured on.
+
+**1. Install ONNX Runtime.**
+
+```sh
+brew install onnxruntime            # macOS
+# Linux: apt-get install libonnxruntime-dev, or unpack a release tarball
+```
+
+**2. Get a model.** Any sentence-transformer with an exported ONNX graph works.
+`all-MiniLM-L6-v2` is the reasonable default — 384-dim, 86 MB, fast on CPU:
+
+```sh
+mkdir -p minilm && cd minilm
+B=https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main
+curl -L -o model.onnx     $B/onnx/model.onnx
+curl -L -o tokenizer.json $B/tokenizer.json
+```
+
+> Use the `resolve/main/...` URL, not `blob/main/...`. The `blob` path returns an
+> HTML page or a 15-byte `Entry not found` stub, and the failure surfaces much
+> later as a tokenizer parse error.
+
+**3. Build with the flag and attach it:**
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DRAGCPP_WITH_ONNX=ON && cmake --build build -j
+```
+
+```cpp
+#include "rag/dense/local_embedder.hpp"
+
+rag::dense::LocalEmbedderConfig cfg;
+cfg.model_path     = "minilm/model.onnx";
+cfg.tokenizer_path = "minilm/tokenizer.json";
+cfg.normalize      = true;    // cosine == dot product afterwards
+cfg.max_tokens     = 256;     // MiniLM's window is 512; shorter is faster
+
+auto emb = rag::dense::OnnxEmbedder::load(cfg);
+if (!emb) { /* handle rag::Error — bad path, bad graph, no runtime */ }
+corpus.set_embedder(rag::dense::AnyEmbedder{std::move(*emb)});
+```
+
+That is the whole integration. From here `corpus.dense_search` works, and
+`Pipeline::standard()` fuses it with BM25 automatically — nothing else to enable.
+
+**Cost, measured on an M1 (CPU, no GPU):** indexing 5183 SciFact documents takes
+~185 s, i.e. ~28 docs/s single-model. Indexing is the expensive part and happens
+once; queries embed a single short string and are sub-millisecond against the
+resulting index. Raise `LocalEmbedderConfig::threads` and
+`CorpusConfig::embed_batch` if the ingest wall-clock matters to you.
+
+**Choosing a model.** Anything in the sentence-transformers / BGE / E5 family
+with an ONNX export drops into the same three lines; only `model_path` changes.
+MiniLM-L6 is the floor, not the ceiling — it is the model the benchmarks use
+precisely because winning with the *small* one is the stronger claim.
+
 ## Remote embedders over a bridge
 
 The plugin bridge registers `"process"`, `"http"`, and `"rest"` embedder types

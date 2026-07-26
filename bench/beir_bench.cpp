@@ -12,6 +12,14 @@
 //
 // Usage:
 //   ragcpp_beir_bench <beir-dir> [--split=test] [--variant=NAME]
+//                      [--model=model.onnx --tokenizer=tokenizer.json]
+//
+// WITHOUT --model the corpus is lexical-only, so the `standard` pipeline fuses a
+// single retriever and the dense half never runs — useful as a pure-BM25
+// reference, but it is NOT what the engine does in production. WITH a model the
+// dense retriever is live and `standard` performs real hybrid fusion, which is
+// where the engine's actual quality lives (SciFact nDCG@10 0.6809 -> 0.7343).
+// Requires -DRAGCPP_WITH_ONNX=ON.
 // Variants (default: all):
 //   lexical    corpus.lexical_search only (the published-BM25 comparison point)
 //   standard   Engine + Pipeline::standard()   — hybrid → filter → rerank → topk
@@ -27,6 +35,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "rag/dense/local_embedder.hpp"
 #include "rag/engine.hpp"
 #include "rag/eval/beir.hpp"
 #include "rag/index/corpus.hpp"
@@ -106,8 +115,40 @@ int main(int argc, char** argv) {
     // One corpus, reused across every ranking policy, so the only difference
     // between variants is the policy itself.
     rag::index::Corpus corpus;
+
+    // Attach a real embedding model when one is given. This is the difference
+    // between measuring BM25 and measuring the ENGINE: with no embedder the
+    // hybrid stage has only one retriever to fuse.
+    const std::string model = opt(argc, argv, "--model", "");
+    const std::string tok   = opt(argc, argv, "--tokenizer", "");
+    if (!model.empty()) {
+        rag::dense::LocalEmbedderConfig ec;
+        ec.model_path     = model;
+        ec.tokenizer_path = tok;
+        ec.max_tokens     = 256;
+        auto emb = rag::dense::OnnxEmbedder::load(ec);
+        if (!emb) {
+            std::printf("embedder error: %s\n", emb.error().message.c_str());
+            return 1;
+        }
+        std::printf("embedder: %s (dim %zu)\n", model.c_str(), emb->dimension());
+        corpus.set_embedder(rag::dense::AnyEmbedder{std::move(*emb)});
+    } else {
+        std::printf("embedder: none (LEXICAL ONLY — pass --model for hybrid)\n");
+    }
+
     auto doc_uri = index_dataset(*ds, corpus);
     std::printf("indexed %zu chunks\n\n", corpus.chunk_count());
+
+    // With a model attached, the pure-dense arm is worth reporting on its own:
+    // hybrid should beat BOTH halves, and showing only the winner hides whether
+    // fusion is actually contributing.
+    if (corpus.has_embedder()) {
+        run_variant("dense", *ds, cfg, [&](const std::string& q, std::size_t k) {
+            auto h = corpus.dense_search(q, k);
+            return h ? to_ranking(*h, corpus, doc_uri) : rag::eval::Ranking{};
+        });
+    }
 
     const bool all = (variant == "all");
 

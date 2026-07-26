@@ -250,6 +250,26 @@ bm25 only:     ~0.18 ms/query
 dense (HNSW):  ~0.14 ms/query
 ```
 
+## Quality (BEIR, measured)
+
+Speed is only half of it. The `standard` pipeline with `all-MiniLM-L6-v2`
+attached in-process, evaluated through `Pipeline::run` — the same code path
+`Engine::search` executes:
+
+| SciFact nDCG@10 | |
+|---|---|
+| BM25 (BEIR paper) | 0.665 |
+| rag-cpp, no model at all | 0.6809 |
+| ColBERTv2 | 0.693 |
+| SPLADE++ | 0.710 |
+| **rag-cpp hybrid (MiniLM-L6)** | **0.7347** |
+
+Hybrid beats **both of its own halves** — BM25 alone scores 0.6800, MiniLM alone
+0.6518 — on all three datasets tested, which is the fusion earning its keep
+rather than a better retriever being picked. Full tables, the NFCorpus/ArguAna
+runs, and the reproduction commands are in
+[`BENCHMARKS.md`](BENCHMARKS.md#hybrid-retrieval-with-a-neural-embedder).
+
 ## Documentation
 
 Full guides live in [**`docs/`**](docs/README.md). Start there if you're new.

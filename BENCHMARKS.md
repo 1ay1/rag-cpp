@@ -20,6 +20,16 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ./build/bench/ragcpp_beir_bench ./scifact --split=test
 ```
 
+That run is **lexical-only**. To measure the engine as it actually ships — with
+the dense half live and hybrid fusion doing real work — attach an embedding
+model (see [Hybrid retrieval](#hybrid-retrieval-with-a-neural-embedder) below):
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DRAGCPP_WITH_ONNX=ON && cmake --build build -j
+./build/bench/ragcpp_beir_bench ./scifact --split=test \
+    --model=minilm/model.onnx --tokenizer=minilm/tokenizer.json
+```
+
 `ragcpp_beir_bench` evaluates the **real production path** (`Pipeline::run`, i.e.
 what `Engine::search` executes) and A/Bs the shipped ranking policies over one
 corpus. `ragcpp eval` is a separate, simpler harness that drives
@@ -27,10 +37,9 @@ corpus. `ragcpp eval` is a separate, simpler harness that drives
 
 ### Results
 
-All figures below are **lexical-only** — no embedding model, no network, no GPU.
-This is rag-cpp with zero external dependencies. Attaching a dense embedder is
-expected to move these numbers further; that measurement is not yet recorded, so
-it is not claimed.
+All figures in this table are **lexical-only** — no embedding model, no network,
+no GPU. This is rag-cpp with zero external dependencies. The hybrid numbers, with
+a real model attached, are in the [next section](#hybrid-retrieval-with-a-neural-embedder).
 
 | Dataset | policy | nDCG@10 | R@10 | R@100 | MAP | MRR |
 |---------|--------|---------|------|-------|-----|-----|
@@ -47,6 +56,48 @@ it is not claimed.
 they are expected to cost a little nDCG and are opt-in for exactly that reason.
 See [docs/pipeline.md](docs/pipeline.md).
 
+### Hybrid retrieval with a neural embedder
+
+The table above is the floor, not the engine. With an embedding model attached,
+the dense retriever goes live and `standard` performs the hybrid fusion it was
+built for. Measured with **`all-MiniLM-L6-v2`** (a 22 M-parameter model from
+2021 — deliberately the *small* choice, running in-process on CPU via
+`-DRAGCPP_WITH_ONNX=ON`, no GPU, no network):
+
+| Dataset | retrieval | nDCG@10 | R@10 | R@100 | MAP | MRR |
+|---------|-----------|---------|------|-------|-----|-----|
+| SciFact  | `lexical` (BM25 only)  | 0.6800 | 0.8212 | 0.9160 | 0.6346 | 0.6434 |
+| SciFact  | `dense` (MiniLM only)  | 0.6518 | 0.7872 | 0.9239 | 0.6103 | 0.6171 |
+| SciFact  | **`standard` (hybrid)** | **0.7347** | **0.8489** | **0.9572** | **0.6973** | **0.7091** |
+| NFCorpus | `lexical` (BM25 only)  | 0.3263 | 0.1510 | 0.2482 | 0.1449 | 0.5280 |
+| NFCorpus | `dense` (MiniLM only)  | 0.3179 | 0.1585 | 0.3127 | 0.1434 | 0.5130 |
+| NFCorpus | **`standard` (hybrid)** | **0.3602** | **0.1719** | **0.3160** | **0.1700** | **0.5728** |
+| ArguAna  | `lexical` (BM25 only)  | 0.3720 | 0.7724 | 0.9666 | 0.2558 | 0.2558 |
+| ArguAna  | `dense` (MiniLM only)  | 0.3614 | 0.7489 | 0.9723 | 0.2516 | 0.2516 |
+| ArguAna  | **`standard` (hybrid)** | **0.3848** | **0.7902** | **0.9829** | **0.2678** | **0.2678** |
+
+The result that matters is not that hybrid wins — it is that **hybrid beats both
+of its own halves**, on all three datasets, by more than either half beats the
+other:
+
+| | SciFact | NFCorpus | ArguAna |
+|---|---------|----------|---------|
+| hybrid − best single retriever | **+0.055** | **+0.034** | **+0.013** |
+| lexical − dense (the gap being fused) | +0.028 | +0.008 | +0.011 |
+
+That is fusion contributing signal, not a better retriever being picked. A
+weighted-sum or take-the-max fusion would land *between* its inputs; landing
+above both is what reciprocal-rank fusion over decorrelated rankers is supposed
+to do, and it is why the engine ships hybrid as `standard`.
+
+Reproduce (models are ~86 MB, one `curl`; see
+[docs/embedders.md](docs/embedders.md#running-a-real-model-in-process)):
+
+```sh
+./build/bench/ragcpp_beir_bench ./scifact --split=test \
+    --model=minilm/model.onnx --tokenizer=minilm/tokenizer.json
+```
+
 ### Context: published numbers on SciFact
 
 | System | nDCG@10 | Source |
@@ -56,16 +107,38 @@ See [docs/pipeline.md](docs/pipeline.md).
 | ColBERTv2 | 0.693 | published |
 | SPLADE++ | 0.710 | published |
 | BGE-base / E5-base (dense) | ~0.72–0.74 | published |
+| **rag-cpp (hybrid, MiniLM-L6)** | **0.7347** | this repo, reproducible above |
 
-rag-cpp's model-free path beats the published BM25 baseline and lands between it
-and the neural late-interaction systems — while requiring no model, no GPU, and
-no network. It does **not** beat a well-tuned dense or learned-sparse retriever,
-and this file will not claim otherwise until that is measured.
+Two separate claims, both measured:
 
-**Honesty note on ArguAna:** the `standard` pipeline is currently *behind* pure
-lexical there (0.3628 vs 0.3720). ArguAna's task is counter-argument retrieval,
-where the query is itself a long argument; term-overlap features misfire. This is
-a known open gap, not a rounding error.
+1. rag-cpp's **model-free** path beats the published BM25 baseline and lands
+   between it and the neural late-interaction systems — while requiring no
+   model, no GPU, and no network.
+2. rag-cpp's **hybrid** path, using a 2021 22 M-parameter embedder that scores
+   only 0.6518 on its own, reaches 0.7347 — above ColBERTv2, above SPLADE++, and
+   at the top of the BGE/E5 band. The fusion is doing the work, not the model.
+
+The honest caveat on (2): these are single-dataset comparisons against numbers
+from papers, not a re-run of those systems in this harness, and MiniLM-L6 is a
+small model — a `bge-base` or `e5-base` embedder in the same slot should go
+higher still. It is not measured here, so it is not claimed here.
+
+**ArguAna, previously a known open gap, is closed by this.** With no model the
+`standard` pipeline was *behind* pure lexical there (0.3628 vs 0.3720) — ArguAna
+asks for counter-argument retrieval, where the query is itself a long argument
+and term-overlap features misfire. Fusing a semantic retriever in is exactly the
+missing signal: 0.3848, ahead of lexical for the first time. The remaining
+weirdness on that dataset is `nDCG@1 ≈ 0`, which is inherent to the task — the
+gold document is a *rebuttal*, so it is never the nearest neighbour of the query.
+
+**One thing got worse, and it is worth stating:** `quality` (MMR) collapses on
+ArguAna once a real embedder is attached — nDCG@10 **0.0380** against `standard`'s
+0.3848, with R@100 still 0.8378. The candidates are there; MMR throws them away.
+The mechanism is that ArguAna documents are near-duplicate arguments on the same
+motion, so a diversity penalty computed in a real semantic space suppresses the
+entire relevant cluster — the one dataset where "show me something different" is
+precisely the wrong instruction. MMR stays opt-in and this is why. Use
+`standard`, or Dartboard (below), when relevance is the objective.
 
 ## Retrieval-quality fixes, measured
 
