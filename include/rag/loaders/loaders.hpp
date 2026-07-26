@@ -83,6 +83,13 @@ struct DirOptions {
         ".c",".h",".cpp",".hpp",".cc",".cxx",".py",".js",".ts",".tsx",".jsx",
         ".go",".rs",".java",".rb",".php",".cs",".swift",".kt",".scala",".sh",
         ".json",".yaml",".yml",".toml",".sql",
+        // Office. Extracted in-process — no dependency, see ooxml.hpp.
+        ".docx",".xlsx",".pptx",
+        // Legacy binary Office and friends, via an external converter when one
+        // is installed. Listed here so they are ATTEMPTED: a corpus that
+        // silently skipped every .doc looked, to its owner, like a corpus that
+        // had indexed them.
+        ".doc",".xls",".ppt",".rtf",".odt",".epub",
     };
     std::vector<std::string> exclude_dirs = {
         ".git","node_modules","build","dist","target","__pycache__",".venv","venv",

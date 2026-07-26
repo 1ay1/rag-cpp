@@ -4,7 +4,7 @@ The `ragcpp` binary (built to `build/cli/ragcpp`) is a thin wrapper over the
 library. It has five subcommands.
 
 ```
-ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic] [--proposition] [--contextual]
+ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic] [--proposition] [--source] [--contextual]
 ragcpp query <db.ragdb> "<query>" [-k N] [--mmr] [--explain]
 ragcpp serve <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]
 ragcpp eval  <beir-dir> [--split=test]
@@ -25,8 +25,9 @@ self-contained `<out.ragdb>`. Reopening it later never rebuilds.
 
 | Flag | Effect |
 |------|--------|
-| `--ext=.md` | Restrict to a file **extension**. Accepts `.md`, `md`, and `*.md` alike. (The old `--glob` spelling still works but only ever matched by extension.) |
+| `--ext=.md` | Restrict to a file **extension**. Accepts `.md`, `md`, and `*.md` alike. **Repeats and comma-separated lists accumulate** — `--ext=.docx,.pptx` or `--ext=.docx --ext=.pptx` both work. (The old `--glob` spelling still works but only ever matched by extension.) |
 | `--semantic` | Use the semantic chunker — place boundaries where the topic drifts, rather than at fixed token windows. More self-contained chunks on prose; costs a similarity pass. See [Configuration](configuration.md#chunking). |
+| `--source` | Chunk **code on definition boundaries** instead of prose windows. Uses the hand-written chunker for known languages and **infers the conventions** of any language it does not know — an in-house DSL, a vendor format, anything. Measured 1.000 definition integrity vs 0.75–0.875 for windows ([BENCHMARKS.md](../BENCHMARKS.md#chunking-code-nobody-has-a-parser-for)). Safe on a mixed corpus: inference declines on prose. See [Formats and languages](formats.md). |
 | `--proposition` | Index one **atomic statement** per chunk. Maximises precision-per-unit for claim-shaped queries — but it **loses on general IR**: −0.092 nDCG@10 on SciFact for a 12× larger index ([BENCHMARKS.md](../BENCHMARKS.md#chunking-strategy-measured)). Opt in only if you have measured a win on your data. |
 | `--contextual` | [Contextual Retrieval](configuration.md#contextual-retrieval): situate each chunk in its document before indexing. The CLI has no LLM binding, so this uses the deterministic extractive context. Costs ~3× ingest — measure before enabling. |
 

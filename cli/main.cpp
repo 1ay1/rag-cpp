@@ -1,6 +1,6 @@
 // cli/main.cpp — the `ragcpp` turnkey command-line tool.
 //
-//   ragcpp index  <dir> <out.ragdb> [--ext=.md] [--semantic] [--proposition]
+//   ragcpp index  <dir> <out.ragdb> [--ext=.md] [--semantic] [--proposition] [--source]
 //   ragcpp query  <db.ragdb> "<query>" [-k N] [--mmr] [--explain]
 //   ragcpp serve  <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]
 //   ragcpp eval   <beir-dir> [--split=test]
@@ -30,7 +30,7 @@ int usage() {
     std::printf(
         "ragcpp — a type-theoretic RAG engine\n\n"
         "usage:\n"
-        "  ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic] [--proposition] [--contextual]\n"
+        "  ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic] [--proposition] [--source] [--contextual]\n"
         "  ragcpp query <db.ragdb> \"<query>\" [-k N] [--mmr] [--explain]\n"
         "  ragcpp serve <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]\n"
         "  ragcpp eval  <beir-dir> [--split=test]\n"
@@ -61,6 +61,12 @@ int cmd_index(const std::vector<std::string>& args) {
     // --proposition wins if both are given: it is the more specific request.
     if (flag(args, "--proposition"))
         ccfg.chunking = rag::index::CorpusConfig::Chunking::proposition;
+    // --source chunks code on definition boundaries instead of prose windows,
+    // inferring the conventions of any language it does not already know. Wins
+    // over the others when combined: it is the most specific claim about what
+    // the corpus contains.
+    if (flag(args, "--source"))
+        ccfg.chunking = rag::index::CorpusConfig::Chunking::source;
     // Contextual Retrieval (Anthropic 2024): situate each chunk in its document
     // before indexing. No model required — the CLI has no LLM binding, so this
     // uses the deterministic extractive context.
@@ -71,15 +77,37 @@ int cmd_index(const std::vector<std::string>& args) {
     // which was actively misleading: it never accepted a pattern, so
     // `--glob='*.md'` silently matched nothing and indexed zero documents.
     // The old spelling still works so existing invocations do not break.
-    std::string ext = opt(args, "--ext", "");
-    if (ext.empty()) ext = opt(args, "--glob", "");
-    if (!ext.empty()) {
-        // Accept .md, md, and *.md alike rather than failing silently on the
-        // form a user would most naturally reach for.
-        if (ext.rfind("*.", 0) == 0) ext.erase(0, 1);
-        if (ext[0] != '.') ext = "." + ext;
-        lo.include_ext = {ext};
+    //
+    // REPEATED and comma-separated forms both accumulate. Taking only the last
+    // --ext meant `--ext=.docx --ext=.pptx` silently indexed only the .pptx
+    // files, and reported success while doing it — the same silent-underindex
+    // failure the --glob rename was meant to end.
+    std::vector<std::string> exts;
+    auto add_ext = [&](std::string e) {
+        if (e.empty()) return;
+        if (e.rfind("*.", 0) == 0) e.erase(0, 1);
+        if (e[0] != '.') e = "." + e;
+        for (char& c : e) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        exts.push_back(std::move(e));
+    };
+    for (const std::string& a : args) {
+        std::string_view v(a);
+        std::string_view pfx;
+        if (v.rfind("--ext=", 0) == 0) pfx = "--ext=";
+        else if (v.rfind("--glob=", 0) == 0) pfx = "--glob=";
+        else continue;
+        std::string_view rest = v.substr(pfx.size());
+        // Accept .md, md, *.md, and ".md,.rst" alike rather than failing
+        // silently on whichever form a user reaches for first.
+        std::size_t start = 0;
+        while (start <= rest.size()) {
+            std::size_t comma = rest.find(',', start);
+            if (comma == std::string_view::npos) comma = rest.size();
+            add_ext(std::string(rest.substr(start, comma - start)));
+            start = comma + 1;
+        }
     }
+    if (!exts.empty()) lo.include_ext = std::move(exts);
     // A single CSV/TSV file is ingested ROW-WISE rather than walked as a
     // directory: each row is an independent record, and chunking a table as
     // prose would produce chunks spanning unrelated rows. Columns become

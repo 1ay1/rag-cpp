@@ -77,7 +77,18 @@ struct CorpusConfig {
     // set_propositionizer() to use an LLM instead; as with the contextualizer,
     // a failing seam degrades to the deterministic splitter rather than
     // failing ingest.
-    enum class Chunking { fixed, semantic, proposition };
+    // `source` chunks CODE on definition boundaries rather than prose windows.
+    // For a recognized extension it uses the hand-written per-language chunker;
+    // for anything else — an in-house DSL, a vendor format, a language invented
+    // last quarter — it INFERS the file's own conventions and chunks on those
+    // (loaders/structure.hpp). Non-code documents are unaffected: inference
+    // declines on prose and the fixed chunker runs instead, so this is safe to
+    // enable on a mixed corpus of code and documentation.
+    //
+    // Which language a document is written in comes from its `ext` metadata
+    // key, or from the extension of its URI when that key is absent, so the
+    // directory loader gets this for free.
+    enum class Chunking { fixed, semantic, proposition, source };
     Chunking               chunking = Chunking::fixed;
     text::SemanticChunkOptions semantic{};
 

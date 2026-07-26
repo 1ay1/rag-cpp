@@ -113,14 +113,44 @@ std::vector<Chunk> chunk_code(DocId doc, std::string_view ext, const std::string
     std::size_t chars = 0;
     std::string last_def;   // running symbol context
 
+    // A definition's leading comment block is its documentation and belongs to
+    // IT, not to whatever was defined above it. Cutting at the definition line
+    // files each doc comment with the previous function — so `func Beta`'s
+    // "// Beta does the second thing." ends up as the trailing line of Alpha's
+    // chunk, where it is retrieval poison: the doc comment is usually the most
+    // query-matchable text a definition has, and it was being attached to the
+    // wrong one. Walk the cut backwards over any comment block (and a single
+    // blank line inside it) so the comment travels with what it documents.
+    // Found by bench/structure_bench.cpp: definition integrity on Go/Rust/C++
+    // was 0.000 before this, because every definition was missing its header.
+    auto is_comment_line = [&](const std::string& s) {
+        std::size_t ind = indent_of(s);
+        std::string_view v(s);
+        v.remove_prefix(ind);
+        return v.starts_with("//") || v.starts_with("#") || v.starts_with("/*") ||
+               v.starts_with("*") || v.starts_with("--") || v.starts_with(";");
+    };
+    auto claim_leading_comments = [&](std::size_t at) {
+        std::size_t start = at;
+        while (start > 0) {
+            const std::string& prev = lines[start - 1];
+            if (is_comment_line(prev)) { --start; continue; }
+            bool blank = indent_of(prev) == prev.size();
+            if (blank && start >= 2 && is_comment_line(lines[start - 2])) { --start; continue; }
+            break;
+        }
+        return start;
+    };
+
     for (std::size_t i = 0; i < lines.size(); ++i) {
         bool boundary = is_boundary(lang, lines[i]);
-        std::size_t seg_len = i - seg_start;
-        bool too_big = seg_len >= opts.max_lines || chars >= opts.max_chars;
+        std::size_t cut = boundary ? claim_leading_comments(i) : i;
+        std::size_t seg_len = cut > seg_start ? cut - seg_start : 0;
+        bool too_big = (i - seg_start) >= opts.max_lines || chars >= opts.max_chars;
 
         if ((boundary && seg_len >= opts.min_lines) || too_big) {
-            flush(seg_start, i, last_def);
-            seg_start = i;
+            flush(seg_start, boundary ? cut : i, last_def);
+            seg_start = boundary ? cut : i;
             chars = 0;
         }
         if (boundary) {

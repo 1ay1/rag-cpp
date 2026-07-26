@@ -2,6 +2,8 @@
 
 #include "rag/loaders/loaders.hpp"
 
+#include "rag/loaders/extract.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -104,11 +106,6 @@ std::string lower_ext(const fs::path& p) {
     std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
     return e;
 }
-std::string read_all(const fs::path& p) {
-    std::ifstream in(p, std::ios::binary);
-    std::stringstream ss; ss << in.rdbuf();
-    return ss.str();
-}
 } // namespace
 
 Result<LoadedDoc> load_file(const fs::path& path) {
@@ -121,15 +118,18 @@ Result<LoadedDoc> load_file(const fs::path& path) {
     d.title = path.stem().string();
     d.meta["ext"] = ext;
 
-    if (ext == ".pdf") {
-        auto t = pdf_to_text(path);
-        if (!t) return std::unexpected(t.error());
-        d.text = std::move(*t);
-    } else if (ext == ".html" || ext == ".htm") {
-        d.text = html_to_text(read_all(path));
-    } else {
-        d.text = read_all(path);
-    }
+    // One dispatcher for every format — in-process for the ones we own
+    // (text, HTML, and the whole OOXML family), an external converter for the
+    // ones a library owns, a named error for the ones that need OCR. Going
+    // through extract_file here rather than special-casing extensions is what
+    // makes a .docx work identically in load_file, load_directory, and the CLI,
+    // and what lets register_extractor() add a company's internal format to all
+    // three at once.
+    auto r = extract_file(path);
+    if (!r) return std::unexpected(r.error());
+    d.text = std::move(r->text);
+    if (r->kind == ExtractKind::external && !r->tool.empty()) d.meta["extractor"] = r->tool;
+
     if (d.text.empty()) return fail<LoadedDoc>(Errc::parse_error, "empty extraction: " + path.string());
     return d;
 }

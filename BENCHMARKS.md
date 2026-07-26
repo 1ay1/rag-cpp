@@ -151,6 +151,73 @@ found it:
 | `feature_rerank` coverage weight 0.4 (a guess) | ArguAna nDCG@10 **0.3275** | **0.3628** |
 | MMR selection `O(k²n)` | k=100: **2727 ms/query** | **66 ms/query** |
 
+## Chunking code nobody has a parser for
+
+The usual way to "support every language" is a grammar per language. That has a
+hard ceiling: it cannot help with an in-house DSL, a vendor format with no
+public spec, or a dialect invented last quarter — which is precisely the code
+most worth searching, because none of it is on the public internet.
+
+rag-cpp infers the structure from the file itself (see
+[docs/formats.md](docs/formats.md) for the scoring model). The metric is
+**definition integrity**: the fraction of definitions that land intact —
+signature *and* body — inside a single chunk. It is the right target because a
+split definition is the specific failure that makes code retrieval useless: the
+chunk carries the name without the logic, or the logic with no name to match a
+query against. It also cannot be gamed by chunking more or less aggressively.
+
+The baseline is fixed-size line windows, which is what every language-blind
+system falls back to. Definition sizes are deliberately varied (3–17 lines) —
+with uniform sizes a 40-line window lands on a boundary by luck and the
+baseline column is a gift rather than a comparison.
+
+| Corpus | strategy | integrity | windows |
+|--------|----------|-----------|---------|
+| python | known_language | **1.000** | 0.850 |
+| go | known_language | **1.000** | 0.750 |
+| rust | known_language | **1.000** | 0.800 |
+| cpp | known_language | **1.000** | 0.850 |
+| ruby | known_language | **1.000** | 0.850 |
+| dsl:config (`@service`) | inferred | **1.000** | 0.875 |
+| dsl:4gl (`PROCEDURE`) | inferred | **1.000** | 0.850 |
+| dsl:rules (`rule`) | inferred | **1.000** | 0.800 |
+| dsl:hdl (`MODULE`) | inferred | **1.000** | 0.800 |
+| dsl:build (`target`) | inferred | **1.000** | 0.875 |
+
+The first five rows are a control: where a hand-written per-language chunker
+exists it is used, so inference is not being credited for them. **The last five
+are the claim** — languages that exist nowhere on the internet, with no parser,
+no grammar, and no file extension, chunked correctly on their own conventions
+the first time they are seen.
+
+The negative controls matter more than the positives, because the dangerous
+failure is not missing structure but **hallucinating** it — prose chunked as if
+it were code is strictly worse than the prose chunker:
+
+| Corpus | confidence | outcome |
+|--------|-----------|---------|
+| prose (an annual report) | 0.00 | declined |
+| flat key-value config | 0.00 | declined |
+
+The prose row was found the hard way and is why the model has a nesting gate.
+Blank-line-separated paragraphs beat every other term: each paragraph is one
+long line at column 0, so a word that opens several of them ("Revenue",
+"However") is repeated, perfectly aligned, spread across the whole file, and
+announced by the blank line above it. It scored **0.75 confidence** and would
+have chunked an annual report on the word "Revenue". The one thing it cannot do
+is open a body — prose has no bodies — which is the property that actually
+distinguishes a definition from a sentence.
+
+Building the bench also surfaced a real bug in the existing per-language
+chunker: it cut at the definition line, which files each doc comment with the
+**previous** definition. Go, Rust and C++ scored **0.000** integrity before the
+fix, because every definition was missing its header — and a doc comment is
+usually the most query-matchable text a definition has.
+
+```sh
+./build/bench/ragcpp_structure_bench
+```
+
 ## Chunking strategy, measured
 
 `CorpusConfig::Chunking` offers `fixed` (structural), `semantic` (topic drift),

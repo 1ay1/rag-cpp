@@ -15,6 +15,7 @@ the guide that matches what you're building.
 | [Vector store](vector-store.md) | Using rag-cpp as a plain vector database: you own the ids and vectors, no text pipeline. |
 | [The Pipeline](pipeline.md) | Composable retrieval stages, the `standard` / `quality` / `context` factories, and writing your own stage. |
 | [Embedders](embedders.md) | Every embedding backend, the retry/fallback decorators, the `HttpTransport` seam, and the in-process ONNX / GGUF paths. |
+| [Formats and languages](formats.md) | Office documents with no dependency, the extractor registry for in-house formats, and chunking languages nobody has a parser for. |
 | [Advanced Retrieval](advanced-retrieval.md) | SPLADE, ColBERT, RAPTOR, HyDE / multi-query, Corrective RAG, and GraphRAG. |
 | [Configuration](configuration.md) | Every tunable: `CorpusConfig`, `HnswConfig`, chunking, contextual retrieval, thresholds. |
 | [The CLI](cli.md) | Full `ragcpp` command reference — `index`, `query`, `eval`, `info`, `serve`. |

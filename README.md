@@ -111,9 +111,26 @@ Opt in with `-DRAGCPP_WITH_ONNX=ON` / `-DRAGCPP_WITH_LLAMA=ON`; without the dep
 they report `unavailable` and the core stays dependency-free.
 
 ### Source loaders
-Filesystem directory walker (include/exclude globs) · HTML → text · PDF (via
-`pdftotext`) · **code-aware chunker** that splits on function/class boundaries
-for C-like, Python, Ruby, Go, and Rust.
+Filesystem directory walker (include/exclude globs) · HTML → text · CSV row-wise
+with columns as filterable metadata · **Word, Excel and PowerPoint read
+in-process with no dependency at all** (rag-cpp owns a ZIP reader and a DEFLATE
+decoder; Excel's shared-string table is resolved, table rows stay one line,
+slides keep presentation order) · PDF and legacy `.doc`/`.xls`/`.ppt`/`.rtf`
+via an external converter when one is installed · scanned PDFs **detected and
+reported by name** rather than silently indexed as empty · `register_extractor()`
+for formats internal to one company.
+
+### Code, including languages nobody has a parser for
+A **code-aware chunker** that splits on function/class boundaries for C-like,
+Python, Ruby, Go and Rust — and, for everything else, **structure inference**:
+it reads a file once, learns the conventions it was written with, and chunks on
+those. No grammar, no dependency, and it works the first time it sees a
+language, which a grammar by construction cannot. Measured at **1.000
+definition integrity vs 0.75–0.875 for fixed windows** on five invented DSLs
+that exist nowhere on the internet — while correctly **declining** on prose, so
+a mixed corpus is safe. See
+[`docs/formats.md`](docs/formats.md) and
+[`BENCHMARKS.md`](BENCHMARKS.md#chunking-code-nobody-has-a-parser-for).
 
 ### Persistence
 A **stable, versioned, CRC-checked `.ragdb` container** (documented in

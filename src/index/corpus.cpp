@@ -3,6 +3,7 @@
 #include "rag/index/corpus.hpp"
 #include "rag/dense/simd.hpp"
 #include "rag/gpu/device.hpp"
+#include "rag/loaders/structure.hpp"
 #include "rag/store/container.hpp"
 #include "rag/util/parallel.hpp"
 
@@ -90,6 +91,20 @@ Result<DocId> Corpus::add_document_locked(std::string uri, std::string text, Met
             // failing) it uses the deterministic sentence splitter, so ingest
             // never depends on a model being reachable.
             return text::proposition_chunk(did, stored.text, propositionizer_);
+        if (cfg_.chunking == CorpusConfig::Chunking::source) {
+            // Code, chunked on definitions. The extension comes from metadata
+            // when the loader knew it, else from the URI; when it names no
+            // language chunk_source infers the file's own structure, and when
+            // there is no structure to infer it degrades to windows. So this
+            // never has to guess wrong in a way that costs the caller anything.
+            std::string ext;
+            if (auto it = stored.meta.find("ext"); it != stored.meta.end()) ext = it->second;
+            else if (auto dot = stored.uri.rfind('.'); dot != std::string::npos &&
+                     stored.uri.size() - dot <= 8)
+                ext = stored.uri.substr(dot);
+            for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return loaders::chunk_source(did, ext, stored.text);
+        }
         if (cfg_.chunking != CorpusConfig::Chunking::semantic)
             return text::chunk_document(did, stored.text, cfg_.chunk);
         // Semantic chunking prefers the embedder (true topical drift) but must
@@ -808,6 +823,7 @@ Result<store::Container> Corpus::snapshot_locked() const {
         // different granularity from the ones already stored.
         m["chunking"] = cfg_.chunking == CorpusConfig::Chunking::proposition ? "proposition"
                       : cfg_.chunking == CorpusConfig::Chunking::semantic    ? "semantic"
+                      : cfg_.chunking == CorpusConfig::Chunking::source      ? "source"
                                                                              : "fixed";
         m["chunk"] = { {"max_lines", cfg_.chunk.max_lines},
                        {"max_chars", cfg_.chunk.max_chars},
@@ -896,6 +912,7 @@ Result<Corpus> Corpus::load(const std::string& path) {
                 const std::string mode = m.value("chunking", std::string("fixed"));
                 c.cfg_.chunking = mode == "proposition" ? CorpusConfig::Chunking::proposition
                                 : mode == "semantic"    ? CorpusConfig::Chunking::semantic
+                                : mode == "source"      ? CorpusConfig::Chunking::source
                                                         : CorpusConfig::Chunking::fixed;
             }
             if (m.contains("chunk")) {

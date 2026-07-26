@@ -35,3 +35,10 @@ target_link_libraries(ragcpp_stitch_bench PRIVATE ragcpp)
 # one corpus so a retrieval-quality change is a measured diff, not a claim.
 add_executable(ragcpp_beir_bench beir_bench.cpp)
 target_link_libraries(ragcpp_beir_bench PRIVATE ragcpp)
+
+# Can we chunk a language nobody has a parser for? Measures definition
+# integrity on five real languages (control) and five INVENTED ones that exist
+# nowhere on the internet. Self-contained: synthesizes its own corpora, so the
+# numbers quoted in structure.hpp can be reproduced on any machine.
+add_executable(ragcpp_structure_bench structure_bench.cpp)
+target_link_libraries(ragcpp_structure_bench PRIVATE ragcpp)

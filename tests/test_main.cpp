@@ -2127,7 +2127,181 @@ TEST(code_chunker_splits_on_functions) {
     CHECK_EQ(rag::loaders::detect_language(".py"), rag::loaders::Language::python);
 }
 
-// ─── HTML → text ────────────────────────────────────────────────
+// ─── Structure inference, OOXML, extraction ─────────────────────
+namespace {
+// A language that does not exist, so nothing can be recognizing it by name.
+std::string invented_dsl(std::size_t n) {
+    std::string s = "; internal topology\n\n";
+    for (std::size_t i = 0; i < n; ++i) {
+        s += "; owns shard " + std::to_string(i) + "\n";
+        s += "@service unit_" + std::to_string(i) + "\n";
+        s += "  bind    tcp://0.0.0.0:" + std::to_string(9000 + i) + "\n";
+        s += "  timeout 30s\n";
+        s += "  retries 3 backoff=exponential\n";
+        s += "  depends upstream_" + std::to_string(i) + "\n\n";
+    }
+    return s;
+}
+} // namespace
+
+TEST(structure_inference_finds_definitions_in_an_unknown_language) {
+    const std::string src = invented_dsl(20);
+    auto prof = rag::loaders::infer_structure(src);
+    CHECK(prof.usable());
+    CHECK(!prof.definition_tokens.empty());
+    // The definition keyword of a language nobody has ever parsed.
+    CHECK_EQ(prof.definition_tokens.front(), std::string("@service"));
+    CHECK_EQ(prof.comment_prefix, std::string(";"));
+}
+
+TEST(structure_inference_chunks_on_inferred_boundaries) {
+    const std::string src = invented_dsl(20);
+    // No extension at all: inference is the only thing that can work here.
+    auto chunks = rag::loaders::chunk_source(rag::DocId{0}, "", src);
+    CHECK(chunks.size() >= 15);
+    // Each definition's comment must travel WITH it, not with the previous
+    // one: a chunk holding a bare `@service` line, or one whose comment
+    // describes the service above it, is the split that makes code retrieval
+    // useless.
+    std::size_t whole = 0;
+    for (const auto& c : chunks) {
+        if (c.text.find("@service") == std::string::npos) continue;
+        if (c.text.find("timeout") != std::string::npos &&
+            c.text.find("depends") != std::string::npos) ++whole;
+    }
+    CHECK(whole >= 15);
+}
+
+TEST(structure_inference_declines_on_prose) {
+    // The dangerous failure is hallucinating structure. Prose paragraphs are
+    // repeated, aligned and blank-separated, which fools a naive detector; the
+    // nesting gate is what stops it. If this ever fails, an annual report is
+    // being chunked on the word "Revenue".
+    std::string prose = "Annual Report\n\n";
+    for (int i = 0; i < 12; ++i) {
+        prose += "Revenue grew modestly against a difficult comparison, with margin "
+                 "pressure from input costs partially offset by pricing actions.\n\n";
+        prose += "The company continued to expand its regional footprint during the "
+                 "period under review, opening additional distribution centers.\n\n";
+    }
+    auto prof = rag::loaders::infer_structure(prose);
+    CHECK(!prof.usable());
+    CHECK(rag::loaders::strategy_for("", prose) == rag::loaders::ChunkStrategy::windows);
+}
+
+TEST(known_languages_still_use_their_own_chunker) {
+    std::string py = "import os\n\n";
+    for (int i = 0; i < 10; ++i) {
+        py += "def f" + std::to_string(i) + "(x):\n";
+        py += "    y = x + " + std::to_string(i) + "\n";
+        py += "    return y\n\n";
+    }
+    CHECK(rag::loaders::strategy_for(".py", py) ==
+          rag::loaders::ChunkStrategy::known_language);
+}
+
+TEST(doc_comments_travel_with_what_they_document) {
+    // A definition's leading comment is its most query-matchable text. Cutting
+    // at the definition line files it with the PREVIOUS definition, so a search
+    // for "Beta does" retrieves Alpha. Regression test for that bug.
+    std::string go =
+        "package main\n\n"
+        "// Alpha does the first thing.\n"
+        "func Alpha(x int) int {\n\treturn x + 1\n}\n\n"
+        "// Beta does the second thing.\n"
+        "func Beta(x int) int {\n\treturn x * 2\n}\n\n"
+        "// Gamma does the third thing.\n"
+        "func Gamma(x int) int {\n\treturn x - 3\n}\n";
+    auto chunks = rag::loaders::chunk_code(rag::DocId{0}, ".go", go);
+    for (const auto& c : chunks) {
+        if (c.text.find("// Beta does") == std::string::npos) continue;
+        // Wherever Beta's doc comment landed, Beta's body must be there too.
+        CHECK(c.text.find("func Beta") != std::string::npos);
+    }
+}
+
+TEST(ooxml_xml_to_text_preserves_structure) {
+    const std::string xml =
+        "<w:document><w:body>"
+        "<w:p><w:r><w:t>Heading</w:t></w:r></w:p>"
+        "<w:p><w:r><w:t>Body with &amp; entity and 40&#37; numeric.</w:t></w:r></w:p>"
+        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Metric</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>Value</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+        "<w:p><w:r><w:delText>REMOVED</w:delText></w:r></w:p>"
+        "</w:body></w:document>";
+    const std::string t = rag::loaders::ooxml_xml_to_text(xml);
+    CHECK(t.find("Heading") != std::string::npos);
+    CHECK(t.find("Body with & entity") != std::string::npos);   // named entity
+    CHECK(t.find("40% numeric") != std::string::npos);          // numeric entity
+    CHECK(t.find("REMOVED") == std::string::npos);              // tracked deletion
+    // A table ROW is one record and must stay on one line; exploding it into
+    // four lines destroys the association between label and value.
+    CHECK(t.find("Metric\tValue") != std::string::npos);
+}
+
+TEST(inflate_rejects_malformed_streams_without_reading_out_of_bounds) {
+    // Each of these is a different way a corrupt member can try to walk off the
+    // end of the buffer. All must be errors, none may crash.
+    const char* bad[] = { "", "\x01", "\x05", "\x07" };
+    for (std::size_t i = 0; i < 4; ++i) {
+        auto r = rag::loaders::inflate_raw(std::string(bad[i]), 1024);
+        CHECK(!r.has_value());
+    }
+    // A valid, empty fixed-Huffman block must still succeed.
+    auto ok = rag::loaders::inflate_raw(std::string("\x03\x00", 2), 0);
+    CHECK(ok.has_value());
+}
+
+TEST(zip_reader_rejects_non_zip_input) {
+    auto r = rag::loaders::zip_entries("this is definitely not a zip archive");
+    CHECK(!r.has_value());
+    CHECK(!rag::loaders::looks_like_zip("plain text"));
+}
+
+TEST(extract_bytes_refuses_to_index_binary_garbage) {
+    // The failure mode that matters: silently indexing bytes that are not text
+    // produces an index full of noise that nothing surfaces until retrieval has
+    // been bad for a month. An error is the correct outcome.
+    std::string binary(64, '\0');
+    binary[0] = 'M'; binary[1] = 'Z';
+    auto r = rag::loaders::extract_bytes(binary, "thing.bin");
+    CHECK(!r.has_value());
+}
+
+TEST(custom_extractor_handles_a_format_nobody_has_heard_of) {
+    // The in-house-format escape hatch: register once, and every ingest path
+    // can read a proprietary container.
+    rag::loaders::register_extractor(".acmerpt", [](std::string_view b) {
+        std::string out(b);
+        for (char& c : out) if (c == '|') c = ' ';
+        return rag::Result<std::string>{out};
+    }, "ACME internal report");
+
+    auto r = rag::loaders::extract_bytes("field|value|another", "q4.acmerpt");
+    CHECK(r.has_value());
+    CHECK_EQ(r->text, std::string("field value another"));
+}
+
+TEST(source_chunking_round_trips_through_persistence) {
+    // The chunking MODE is ingest policy: a corpus built with `source` and
+    // reopened as `fixed` would chunk new documents on a different granularity
+    // than the ones already stored.
+    const std::string path = "/tmp/ragcpp_test_source_mode.ragdb";
+    {
+        rag::index::CorpusConfig cfg;
+        cfg.chunking = rag::index::CorpusConfig::Chunking::source;
+        rag::index::Corpus c{cfg};
+        auto id = c.add_document("topology.svc", invented_dsl(12), {});
+        CHECK(id.has_value());
+        CHECK(c.save(path).has_value());
+    }
+    auto reopened = rag::index::Corpus::load(path);
+    CHECK(reopened.has_value());
+    CHECK(reopened->config().chunking == rag::index::CorpusConfig::Chunking::source);
+    std::filesystem::remove(path);
+}
+
+// ─── HTML → text ────────────────────
 TEST(html_to_text_strips_tags) {
     std::string html = "<html><head><style>x{}</style></head><body>"
                        "<h1>Title</h1><p>Hello &amp; welcome</p><script>bad()</script></body></html>";
