@@ -100,6 +100,43 @@ splitting a document into twelve pieces splits its term statistics with it.
 claim-verification workloads want — but it is opt-in, it is not the default, and
 these numbers are why.
 
+## Diversity policies: Dartboard vs MMR
+
+Both diversify a result set; they optimise different things. MMR subtracts a
+pairwise penalty ("is this unlike what I already picked?"); Dartboard
+([Pickett et al. 2024](https://arxiv.org/abs/2407.12101)) maximises relevant
+information gain ("does this cover something nothing else covers?").
+
+Measured on SciFact, same corpus and candidate pool, only the selection policy
+differs:
+
+| Policy | nDCG@10 | R@10 | MAP |
+|--------|---------|------|-----|
+| `standard` (no diversification) | **0.6809** | **0.8212** | 0.6354 |
+| `quality` (MMR, λ=0.5) | 0.6744 | 0.8069 | 0.6324 |
+| Dartboard (`relevance_weight`=0.7) | **0.6798** | **0.8212** | 0.6344 |
+
+Diversification always costs something on a benchmark that rewards pure
+relevance — but **Dartboard costs about 6× less than MMR** (−0.0011 vs −0.0065
+nDCG@10) and, unlike MMR, does not lose any Recall@10. If you need diversity,
+prefer Dartboard.
+
+### Dartboard complexity
+
+The gain of adding a document is a sum over every intent, so the naive greedy
+form recomputes all `n²` similarities on each of `k` steps. Precomputing the
+symmetric similarity matrix once reduces selection to array lookups:
+
+| pool (k) | before | after | speedup |
+|----------|--------|-------|---------|
+| 40 (k=10) | 24.68 ms | 2.39 ms | 10× |
+| 100 (k=25) | 369.09 ms | 11.32 ms | 33× |
+| 200 (k=50) | **2803.39 ms** | **38.68 ms** | **72×** |
+
+The same trap MMR fell into, in a different shape — caching a running max is not
+enough when the objective sums over intents rather than taking a max over the
+chosen set.
+
 ### The coverage-weight sweep
 
 `feature_rerank` blends `(1-w)·fusion + w·term_coverage`. The shipped default was

@@ -37,6 +37,7 @@
 #include "rag/ralm/ralm.hpp"
 #include "rag/raptor/raptor.hpp"
 #include "rag/rerank/reranker.hpp"
+#include "rag/rerank/dartboard.hpp"
 #include "rag/rerank/mmr.hpp"
 #include "rag/sparse/splade.hpp"
 #include "rag/store/container.hpp"

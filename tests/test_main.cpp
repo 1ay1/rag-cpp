@@ -1275,6 +1275,136 @@ TEST(csv_without_header_synthesizes_column_names) {
     CHECK_EQ((*docs)[0].meta["col2"], std::string("beta"));
 }
 
+// ─── Dartboard retrieval ───────────────────────────────────────
+
+TEST(dartboard_returns_k_and_is_deterministic) {
+    rag::index::Corpus c;
+    for (int i = 0; i < 40; ++i)
+        REQUIRE(c.add_document("d" + std::to_string(i),
+                               "topic " + std::to_string(i % 5) + " body sample " +
+                               std::to_string(i)).has_value());
+    REQUIRE(c.build().has_value());
+    auto cands = c.lexical_search("topic body sample", 30);
+    REQUIRE(cands.size() >= 10);
+
+    rag::rerank::DartboardConfig cfg;
+    cfg.k = 10;
+    auto a = rag::rerank::dartboard(c, cands, cfg);
+    REQUIRE(a.size() == std::size_t{10});
+    // Greedy selection must be reproducible run to run.
+    auto b = rag::rerank::dartboard(c, cands, cfg);
+    REQUIRE(b.size() == a.size());
+    for (std::size_t i = 0; i < a.size(); ++i) CHECK_EQ(a[i].chunk.get(), b[i].chunk.get());
+    // No duplicates: a document may be selected at most once.
+    std::set<std::uint32_t> seen;
+    for (const auto& h : a) CHECK(seen.insert(h.chunk.get()).second);
+}
+
+TEST(dartboard_relevance_weight_spans_relevance_to_coverage) {
+    // relevance_weight is the dial between "pure relevance order" and "pure
+    // coverage". Both ENDS must be observable, or the parameter is decorative.
+    //
+    // The fixture makes the two objectives disagree: five strong, mutually
+    // near-identical matches (coverage wants at most one of them) and fifteen
+    // weak but mutually distinct ones (coverage wants many).
+    //
+    // Note the middle of the dial is NOT tested, and deliberately: the relevance
+    // gap here is ~4.76 vs ~0.03, so after normalisation the strong documents
+    // sit at ~1.0 and the weak at ~0.0 and relevance keeps winning at rw=0.5.
+    // That is the correct bias — coverage should not override a landslide in
+    // relevance — but it means only the endpoints discriminate.
+    rag::index::Corpus c;
+    for (int i = 0; i < 5; ++i)
+        REQUIRE(c.add_document("strong" + std::to_string(i),
+                               "alpha beta gamma delta alpha beta gamma delta").has_value());
+    for (int i = 0; i < 15; ++i)
+        REQUIRE(c.add_document("weak" + std::to_string(i),
+                               "alpha zeta" + std::to_string(i) + " eta" + std::to_string(i) +
+                               " theta" + std::to_string(i)).has_value());
+    REQUIRE(c.build().has_value());
+    auto cands = c.lexical_search("alpha beta gamma delta", 20);
+    REQUIRE(cands.size() >= 10);
+
+    auto select = [&](float rw) {
+        rag::rerank::DartboardConfig cfg;
+        cfg.k = 5;
+        cfg.relevance_weight = rw;
+        return rag::rerank::dartboard(c, cands, cfg);
+    };
+
+    // rw=1: exactly the relevance prefix, near-duplicates and all.
+    auto pure_rel = select(1.0f);
+    REQUIRE(pure_rel.size() == std::size_t{5});
+    for (std::size_t i = 0; i < pure_rel.size(); ++i)
+        CHECK_EQ(pure_rel[i].chunk.get(), cands[i].chunk.get());
+
+    // rw=0: coverage only. It must NOT be the relevance prefix — having taken
+    // one of the near-identical strong documents, the rest add no information,
+    // so the distinct weak ones win the remaining slots.
+    auto pure_cov = select(0.0f);
+    REQUIRE(pure_cov.size() == std::size_t{5});
+    bool same_as_relevance = true;
+    for (std::size_t i = 0; i < pure_cov.size(); ++i)
+        if (pure_cov[i].chunk.get() != cands[i].chunk.get()) { same_as_relevance = false; break; }
+    CHECK(!same_as_relevance);
+
+    // Concretely: coverage should reach beyond the five near-duplicates.
+    std::size_t distinct_prefixes = 0;
+    std::set<std::string> kinds;
+    for (const auto& h : pure_cov) kinds.insert(c.resolve(h).uri.substr(0, 4));
+    distinct_prefixes = kinds.size();
+    CHECK(distinct_prefixes > 1);   // both "stro" and "weak" represented
+}
+
+TEST(dartboard_covers_more_topics_than_pure_relevance) {
+    // The whole point: with coverage weighted in, the selected set should span
+    // more distinct topics than taking the top-k by relevance alone.
+    rag::index::Corpus c;
+    // 5 topics x 8 near-duplicates each. Pure relevance tends to fill up with
+    // one topic's duplicates; coverage should reach into the others.
+    for (int t = 0; t < 5; ++t)
+        for (int j = 0; j < 8; ++j)
+            REQUIRE(c.add_document("t" + std::to_string(t) + "_" + std::to_string(j),
+                                   "shared query terms topic" + std::to_string(t) +
+                                   " unique" + std::to_string(t) + " " +
+                                   std::to_string(j)).has_value());
+    REQUIRE(c.build().has_value());
+
+    auto cands = c.lexical_search("shared query terms", 40);
+    REQUIRE(cands.size() >= 20);
+
+    auto topics_of = [&](const std::vector<rag::Hit>& hits) {
+        std::set<std::string> topics;
+        for (const auto& h : hits) {
+            auto r = c.resolve(h);
+            topics.insert(r.uri.substr(0, r.uri.find('_')));
+        }
+        return topics.size();
+    };
+
+    std::vector<rag::Hit> plain(cands.begin(), cands.begin() + 5);
+    rag::rerank::DartboardConfig cfg;
+    cfg.k = 5;
+    cfg.relevance_weight = 0.3f;      // lean on coverage
+    auto diversified = rag::rerank::dartboard(c, cands, cfg);
+
+    CHECK(topics_of(diversified) >= topics_of(plain));
+}
+
+TEST(dartboard_handles_degenerate_inputs) {
+    rag::index::Corpus c;
+    REQUIRE(c.add_document("a", "only document here").has_value());
+    REQUIRE(c.build().has_value());
+    // Empty candidate set.
+    CHECK(rag::rerank::dartboard(c, {}, {}).empty());
+    // k larger than the candidate pool: return what exists, not garbage.
+    auto cands = c.lexical_search("document", 5);
+    rag::rerank::DartboardConfig cfg;
+    cfg.k = 100;
+    auto got = rag::rerank::dartboard(c, cands, cfg);
+    CHECK_EQ(got.size(), cands.size());
+}
+
 TEST(hnsw_presets_are_ordered_points_on_the_curve) {
     using C = rag::index::HnswConfig;
     // fast < balanced < accurate on the recall knobs; compact drops floats.
