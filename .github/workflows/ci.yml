@@ -131,7 +131,15 @@ jobs:
       - uses: actions/checkout@v4
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build -j 8
+      # Neither runner has a usable GPU, and ubuntu-latest ships a SOFTWARE
+      # OpenCL ICD (POCL) that CMake auto-detects. Letting the suite dispatch
+      # its 200k-vector batches to a CPU-backed "GPU" turned this job from 2m40s
+      # into a >12-minute hang the first time OpenCL was enabled. The backend now
+      # refuses software devices, but the tests should not depend on that
+      # heuristic to terminate.
       - run: ctest --test-dir build --output-on-failure
+        env:
+          RAGCPP_GPU_BACKEND: none
 
   # A GPU-less build is a first-class configuration, not an afterthought: the
   # batch scoring path has a CPU fallback that has to stay correct, and nothing
@@ -166,7 +174,15 @@ jobs:
           grep -q 'RAGCPP_WITH_OPENCL' build/CMakeCache.txt || {
             echo "::error::RAGCPP_WITH_OPENCL=ON did not take effect"; exit 1; }
       - run: cmake --build build -j 8
+      # No GPU on a CI runner, and the ICD here is a SOFTWARE implementation
+      # (POCL). The backend already refuses software devices, but pinning the
+      # backend off makes this job test what it is actually for — that the
+      # OpenCL path COMPILES and that every caller degrades to the CPU — without
+      # depending on that refusal working. Kernel correctness is covered by
+      # gpu_active_backend_matches_cpu_whichever_it_is on real hardware.
       - run: ctest --test-dir build --output-on-failure
+        env:
+          RAGCPP_GPU_BACKEND: none
 
   # Warnings get their own job so that a new compiler release inventing a
   # diagnostic cannot take down the pin check or the test matrix. Pinned to the

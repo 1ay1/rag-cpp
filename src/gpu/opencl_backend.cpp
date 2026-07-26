@@ -102,6 +102,25 @@ Ctx& ctx() {
 // otherwise nothing. We deliberately do NOT fall back to a CPU OpenCL device —
 // the library already has a well-tuned threaded NEON/AVX path, and routing
 // through a driver to reach the same silicon would be slower, not faster.
+//
+// "CL_DEVICE_TYPE_GPU" is necessary but NOT sufficient. Software rasterisers and
+// CPU-backed ICDs (POCL, Mesa llvmpipe, Intel's CPU runtime) sometimes advertise
+// themselves as GPUs; dispatching a 200k x 384 scan to one is far slower than
+// the CPU path it displaced, and on a CI runner it looks like a hang rather than
+// a slowdown. So a device must ALSO not be flagged as an emulator and must not
+// name itself as a known software implementation.
+bool looks_like_software(const char* name) {
+    if (!name) return false;
+    static const char* kSoftware[] = {
+        "pocl", "llvmpipe", "swiftshader", "softpipe", "oclgrind", "portable computing",
+    };
+    std::string lower(name);
+    for (auto& ch : lower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    for (const char* s : kSoftware)
+        if (lower.find(s) != std::string::npos) return true;
+    return false;
+}
+
 bool pick_device(Ctx& c) {
     cl_uint nplat = 0;
     if (clGetPlatformIDs(0, nullptr, &nplat) != CL_SUCCESS || nplat == 0) return false;
@@ -120,6 +139,16 @@ bool pick_device(Ctx& c) {
             cl_bool avail = CL_FALSE;
             clGetDeviceInfo(d, CL_DEVICE_AVAILABLE, sizeof avail, &avail, nullptr);
             if (!avail) continue;
+
+            // Reject anything that is really the CPU wearing a GPU hat.
+            cl_device_type dtype = 0;
+            clGetDeviceInfo(d, CL_DEVICE_TYPE, sizeof dtype, &dtype, nullptr);
+            if (dtype & CL_DEVICE_TYPE_CPU) continue;
+
+            char dname[256] = {0};
+            clGetDeviceInfo(d, CL_DEVICE_NAME, sizeof dname - 1, dname, nullptr);
+            if (looks_like_software(dname)) continue;
+
             cl_ulong gmem = 0;
             clGetDeviceInfo(d, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof gmem, &gmem, nullptr);
             // More memory is a decent proxy for "the discrete card, not the
