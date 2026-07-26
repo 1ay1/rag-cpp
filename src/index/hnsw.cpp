@@ -482,6 +482,12 @@ void HnswIndex::build_batch(std::size_t n,
         deleted_.erase(nd.id);
         nodes_.push_back(std::move(nd));
     }
+    // build_batch appends nodes behind the id index's back, so drop it: the next
+    // add() rebuilds it from the full node array. Cheap (a bool + a clear) and
+    // it keeps the two insert paths from disagreeing about which node owns an
+    // id — which would silently reintroduce duplicate hits.
+    id_index_built_ = false;
+    id_to_ord_.clear();
     const std::size_t total = nodes_.size();
     if (total == base) return;
 
@@ -566,6 +572,15 @@ void HnswIndex::add(std::uint32_t id, std::span<const float> vec) {
     // Re-adding a tombstoned id resurrects it (incremental upsert).
     deleted_.erase(id);
 
+    // ...and re-adding a LIVE id supersedes its old node, so the id cannot be
+    // returned twice (once per node) with the stale vector still competing on
+    // its own score. The old node is left in place as a navigation waypoint
+    // rather than excised: removing it would mean re-linking every inbound
+    // edge, turning an O(log n) insert into an O(n) one. compact() reclaims it.
+    ensure_id_index();
+    if (auto it = id_to_ord_.find(id); it != id_to_ord_.end())
+        nodes_[it->second].superseded = true;
+
     Node nd;
     nd.id  = id;
     const std::size_t off = store_.size();
@@ -578,6 +593,7 @@ void HnswIndex::add(std::uint32_t id, std::span<const float> vec) {
 
     std::uint32_t ordinal = static_cast<std::uint32_t>(nodes_.size());
     nodes_.push_back(std::move(nd));
+    id_to_ord_[id] = ordinal;          // this node is now the live one for `id`
 
     if (max_layer_ < 0) { max_layer_ = level; entry_ = ordinal; return; }
 
@@ -648,6 +664,7 @@ std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k,
     hits.reserve(hop.size());
     for (std::uint32_t node : hop) {
         if (!deleted_.empty() && deleted_.count(nodes_[node].id)) continue;
+        if (nodes_[node].superseded) continue;   // stale node of a re-added id
         hits.push_back(Hit{ChunkId{nodes_[node].id}, Score{rescore(node, q, q8, sc)}});
     }
     // Only the top k are needed, and k ≪ ef: partial_sort touches O(n log k)
@@ -663,11 +680,24 @@ std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k,
     return hits;
 }
 
+void HnswIndex::ensure_id_index() {
+    if (id_index_built_) return;
+    id_index_built_ = true;
+    id_to_ord_.reserve(nodes_.size());
+    // Later ordinals win: if a duplicate id already exists from before this
+    // guard was introduced, the newest node is the live one.
+    for (std::uint32_t i = 0; i < nodes_.size(); ++i) id_to_ord_[nodes_[i].id] = i;
+}
+
 void HnswIndex::remove(std::uint32_t id) { deleted_.insert(id); }
 bool HnswIndex::is_deleted(std::uint32_t id) const noexcept { return deleted_.count(id) != 0; }
 
 void HnswIndex::compact() {
-    if (deleted_.empty()) return;
+    // Superseded nodes are garbage too — stale vectors of ids that were re-added
+    // — so compaction must be able to run for them even with no tombstones.
+    bool any_superseded = false;
+    for (const auto& nd : nodes_) if (nd.superseded) { any_superseded = true; break; }
+    if (deleted_.empty() && !any_superseded) return;
     // Rebuild the graph from the surviving nodes' vectors (their ids preserved).
     std::vector<std::uint32_t> ids;
     std::vector<float>         vecs;
@@ -675,6 +705,7 @@ void HnswIndex::compact() {
     vecs.reserve(nodes_.size() * dim_);
     for (std::size_t i = 0; i < nodes_.size(); ++i) {
         if (deleted_.count(nodes_[i].id)) continue;
+        if (nodes_[i].superseded) continue;
         ids.push_back(nodes_[i].id);
         auto v = vec_at(i);
         vecs.insert(vecs.end(), v.begin(), v.end());
@@ -740,6 +771,7 @@ std::vector<Hit> HnswIndex::search_filtered(std::span<const float> query, std::s
         std::uint32_t id = nodes_[node].id;
         if (!allow(id)) continue;
         if (!deleted_.empty() && deleted_.count(id)) continue;
+        if (nodes_[node].superseded) continue;   // stale node of a re-added id
         hits.push_back(Hit{ChunkId{id}, Score{rescore(node, q, q8, sc)}});
     }
     if (hits.size() > k) {

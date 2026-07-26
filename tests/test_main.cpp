@@ -11,6 +11,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2017,6 +2018,73 @@ TEST(hnsw_tombstone_excludes_from_search) {
     for (auto& h : hits) CHECK(h.chunk.get() != 0u);
     idx.compact();
     CHECK_EQ(idx.deleted_count(), 0u);
+}
+
+// ─── re-adding an id REPLACES it; it never appears twice ───────────────────
+//
+// add() documents re-adding an id as an upsert (it already resurrected a
+// tombstoned one), but it used to APPEND a second node with the same id. The
+// consequences were both silent: one search returned id 2 twice — two slots of
+// a top-k spent on one document, and a phantom duplicate for anything
+// downstream keyed by id — and the superseded vector kept scoring on its own
+// merits, so the OLD content stayed retrievable under the new id forever.
+TEST(hnsw_readding_an_id_replaces_it) {
+    rag::index::HnswIndex idx{rag::index::HnswConfig{}};
+    auto axis = [](std::size_t which) {
+        rag::Vector v(8, 0.0f); v[which] = 1.0f; rag::dense::normalize(v); return v;
+    };
+    for (std::uint32_t i = 0; i < 5; ++i) idx.add(i, axis(i));
+
+    idx.add(2, axis(7));                       // same id, entirely new direction
+
+    // The NEW vector must be found, under that id, exactly once.
+    auto hits = idx.search(axis(7), 5);
+    int seen = 0;
+    for (const auto& h : hits) if (h.chunk.get() == 2u) ++seen;
+    CHECK_EQ(seen, 1);
+    REQUIRE(!hits.empty());
+    CHECK_EQ(hits[0].chunk.get(), 2u);
+    CHECK(hits[0].score.get() > 0.99f);
+
+    // The OLD vector must no longer be retrievable under that id.
+    for (const auto& h : idx.search(axis(2), 5))
+        if (h.chunk.get() == 2u) CHECK(h.score.get() < 0.99f);
+
+    // No id may repeat anywhere in a result set.
+    std::set<std::uint32_t> ids;
+    for (const auto& h : idx.search(axis(7), 5)) CHECK(ids.insert(h.chunk.get()).second);
+
+    // compact() must reclaim the superseded node even with zero tombstones.
+    CHECK_EQ(idx.deleted_count(), 0u);
+    const std::size_t before = idx.size();
+    idx.compact();
+    CHECK(idx.size() < before);
+    auto after = idx.search(axis(7), 5);
+    REQUIRE(!after.empty());
+    CHECK_EQ(after[0].chunk.get(), 2u);
+}
+
+// The same guarantee across the bulk path: build_batch appends nodes without
+// going through add(), so a later add() of an id that build_batch already
+// placed must still replace it rather than duplicate it.
+TEST(hnsw_add_after_build_batch_replaces) {
+    rag::index::HnswIndex idx{rag::index::HnswConfig{}};
+    std::vector<rag::Vector> base;
+    for (std::size_t i = 0; i < 64; ++i) {
+        rag::Vector v(8, 0.01f); v[i % 8] = 1.0f; rag::dense::normalize(v);
+        base.push_back(std::move(v));
+    }
+    idx.build_batch(base.size(),
+        [&](std::size_t i) { return std::span<const float>(base[i]); },
+        [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+    (void)idx.search(base[0], 3);           // seal + quantize before mutating
+
+    rag::Vector fresh(8, 0.0f); fresh[5] = 1.0f; rag::dense::normalize(fresh);
+    idx.add(3, fresh);
+
+    int seen = 0;
+    for (const auto& h : idx.search(fresh, 10)) if (h.chunk.get() == 3u) ++seen;
+    CHECK_EQ(seen, 1);
 }
 
 // ── ONNX integration (only when built with RAGCPP_WITH_ONNX + a model path) ──

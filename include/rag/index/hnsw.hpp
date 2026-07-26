@@ -23,6 +23,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -120,6 +121,18 @@ public:
 
     // Insert one embedding (referenced later by `id`). `vec` is copied and
     // unit-normalized internally. The dimension is fixed by the first insert.
+    //
+    // Re-adding an id that is already present is an UPSERT: the new vector wins
+    // and the old node is tombstoned in the same step. It is not an in-place
+    // edit — the old node stays in the graph as a navigation waypoint, which is
+    // what keeps the operation O(log n) instead of requiring every inbound edge
+    // to be re-linked — but it can never be RETURNED again, so an id appears at
+    // most once in any result.
+    //
+    // Without that tombstone the same id came back TWICE from one search (once
+    // per node), with the stale vector still scoring on its own merits: a
+    // silently corrupted top-k, since two slots went to one document and any
+    // downstream fusion keyed by id saw a phantom duplicate.
     void add(std::uint32_t id, std::span<const float> vec);
 
     // Bulk-construct the graph from `n` vectors in PARALLEL.
@@ -228,6 +241,12 @@ private:
     // and makes prefetching the next neighbour actually pay.
     struct Node {
         std::uint32_t              id = 0;
+        // True once a later add() replaced this id. The node stays in the graph
+        // as a waypoint (its edges are still useful for navigation) but is
+        // never returned. Distinct from `deleted_`, which tombstones an ID:
+        // here the id is very much alive, it is this particular NODE that is
+        // stale, so an id-keyed set cannot express it.
+        bool                       superseded = false;
         std::vector<std::uint64_t> bits;    // sign code (binary mode)
         std::vector<std::vector<std::uint32_t>> links;  // links[layer]
     };
@@ -322,6 +341,20 @@ private:
     mutable bool sealed_ = false;
 
     std::unordered_set<std::uint32_t> deleted_;  // tombstoned ids (soft-delete)
+
+    // id -> ordinal of the LIVE node for that id, used only to supersede the
+    // old node on a re-add.
+    //
+    // Built lazily on the first incremental add() and maintained from then on.
+    // The bulk path (build_batch + search), which is how a served corpus is
+    // normally used, never touches add() and therefore never pays for this map
+    // — it would otherwise be a permanent ~8-16 bytes/vector on an index whose
+    // whole point is fitting in memory (337 B/vector on GloVe).
+    std::unordered_map<std::uint32_t, std::uint32_t> id_to_ord_;
+    bool id_index_built_ = false;
+
+    // Populate id_to_ord_ from nodes_ if it has not been built yet.
+    void ensure_id_index();
     mutable std::mt19937_64 rng_{cfg_.seed};
 
     // Build the CSR mirror of `nodes_[].links`. Idempotent; cheap relative to
