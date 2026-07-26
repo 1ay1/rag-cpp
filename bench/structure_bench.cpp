@@ -26,6 +26,7 @@
 //
 // Run: ./build/bench/ragcpp_structure_bench
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>

@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 
 namespace rag::loaders {

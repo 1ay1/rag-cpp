@@ -6,6 +6,7 @@
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <shared_mutex>
