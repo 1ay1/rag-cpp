@@ -25,6 +25,7 @@ To carry one around type-erased (as the Engine does), wrap it in `AnyEmbedder`.
 | `HashEmbedder` | `"hash"` | Deterministic feature-hash vectors. **The default.** Zero setup, no network — makes hybrid work out of the box and is ideal for tests. |
 | `OllamaEmbedder` | `"ollama"` | Local [Ollama](https://ollama.com) server (`nomic-embed-text`, etc.). |
 | `OpenAIEmbedder` | `"openai"` | OpenAI (and any OpenAI-compatible) embeddings endpoint. |
+| (OpenAI-compatible) | `"voyage"`, `"together"` | Voyage AI / Together AI, presets over the OpenAI shape. Adding another hosted provider is ~6 lines — see [`PLUGINS.md`](../PLUGINS.md). |
 | `LlamaCppEmbedder` | `"llamacpp"` | A running `llama.cpp` server's `/embedding` endpoint. |
 | `OnnxEmbedder` | `"onnx"` | ONNX Runtime, **in-process**. Needs `-DRAGCPP_WITH_ONNX=ON`. |
 | `GgufEmbedder` | `"gguf"` | GGUF via llama.cpp, **in-process**. Needs `-DRAGCPP_WITH_LLAMA=ON`. |

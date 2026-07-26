@@ -20,6 +20,7 @@
 
 #include "rag/plugin/registry.hpp"
 #include "rag/plugin/loader.hpp"
+#include "rag/plugin/builder.hpp"
 
 #include "rag/dense/embedder.hpp"
 #include "rag/rerank/reranker.hpp"
@@ -31,9 +32,8 @@ namespace rag::plugin {
 // library build. The engine calls this automatically.
 void ensure_builtins_registered() noexcept;
 
-// Convenience aliases for the registries every app touches.
-using AnyEmbedder = ::rag::dense::AnyEmbedder;
-using AnyReranker = ::rag::rerank::AnyReranker;
+// Convenience aliases for the registries every app touches. (AnyEmbedder /
+// AnyReranker are defined in builder.hpp, included above.)
 using EmbedderRegistry = Registry<AnyEmbedder>;
 using RerankerRegistry = Registry<AnyReranker>;
 

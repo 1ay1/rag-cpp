@@ -32,7 +32,8 @@ int usage() {
         "  ragcpp query <db.ragdb> \"<query>\" [-k N] [--mmr]\n"
         "  ragcpp serve <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]\n"
         "  ragcpp eval  <beir-dir> [--split=test]\n"
-        "  ragcpp info  <db.ragdb>\n");
+        "  ragcpp info  <db.ragdb>\n"
+        "  ragcpp list  [embedders|rerankers]\n");
     return 2;
 }
 
@@ -204,6 +205,28 @@ int cmd_info(const std::vector<std::string>& args) {
     return 0;
 }
 
+// List every registered backend and the config keys it takes — the user-facing
+// face of the plugin registry's describe(). Answers "what can I put in a config?"
+// without reading source. A plugin dir can be loaded first so third-party names
+// show up too: `ragcpp list embedders --plugins=./plugins`.
+int cmd_list(const std::vector<std::string>& args) {
+    rag::plugin::ensure_builtins_registered();
+    if (std::string dir = opt(args, "--plugins", ""); !dir.empty())
+        (void)rag::plugin::load_plugin_dir(dir);
+
+    std::string which = args.empty() || args[0].rfind("--", 0) == 0 ? "" : args[0];
+    auto dump = [](const char* title, auto&& rows) {
+        std::printf("%s:\n", title);
+        for (const auto& [name, desc] : rows)
+            std::printf("  %-14s %s\n", name.c_str(), desc.empty() ? "(no description)" : desc.c_str());
+    };
+    if (which.empty() || which == "embedders")
+        dump("embedders", rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().describe());
+    if (which.empty() || which == "rerankers")
+        dump("rerankers", rag::plugin::Registry<rag::plugin::AnyReranker>::instance().describe());
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -215,5 +238,6 @@ int main(int argc, char** argv) {
     if (cmd == "serve") return cmd_serve(args);
     if (cmd == "eval")  return cmd_eval(args);
     if (cmd == "info")  return cmd_info(args);
+    if (cmd == "list")  return cmd_list(args);
     return usage();
 }

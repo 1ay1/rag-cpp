@@ -42,16 +42,60 @@ library**. A backend registers a factory under a string name; anything
 downstream (a config file, the CLI, the C ABI, a REST server) builds it by name
 from a JSON blob — with **zero compile-time knowledge** of the backend.
 
-### Register a factory
+### Register a backend — one function, no boilerplate
+
+The ergonomic way (`rag/plugin/builder.hpp`): return your **concept type** from a
+`Config -> Result<T>` lambda. The `AnyEmbedder` wrap, the non-throwing config
+parsing, and the `describe()` help text are all handled. No macro, so no
+comma-in-braces trap.
 
 ```cpp
-#include <rag/plugin/plugin.hpp>
+#include <rag/plugin/plugin.hpp>   // pulls in builder.hpp
 
+rag::plugin::register_embedder(
+    "my_embed",                                         // name used in config
+    "my custom embedder (keys: dim)",                   // shown by `ragcpp list`
+    [](rag::plugin::Config c) -> rag::Result<MyEmbedder> {
+        return MyEmbedder{c.get<std::size_t>("dim", 384)};
+    });
+```
+
+`Config` is a total, non-throwing view over the spec:
+
+| Call | Behaviour |
+|------|-----------|
+| `c.get("model", "bge")` | value or default; wrong type falls back to default |
+| `c.require<std::string>("api_key")` | `Result<T>` — typed error if absent; just propagate it |
+| `c.has("dim")` | presence test |
+| `c.sub("primary")` | a nested component spec (feed to `resolve<>()`) |
+
+Building a nested sub-component (what decorators do) is one call:
+`rag::plugin::resolve<AnyEmbedder>(spec)`.
+
+The same shape works for rerankers via `register_reranker(...)`.
+
+<details><summary>The raw macro (escape hatch)</summary>
+
+If you want to bypass the helper and hand-roll the factory (returning `AnyEmbedder`
+directly, no description), the `RAG_REGISTER` macro is still there. Note commas
+inside `{}`-brace-init confuse the preprocessor — construct via a named local.
+
+```cpp
 RAG_REGISTER(rag::plugin::AnyEmbedder, "my_embed",
     [](const nlohmann::json& cfg) -> rag::Result<rag::plugin::AnyEmbedder> {
-        auto dim = cfg.value("dim", 384);
-        return rag::plugin::AnyEmbedder{MyEmbedder{static_cast<std::size_t>(dim)}};
+        return rag::plugin::AnyEmbedder{MyEmbedder{cfg.value("dim", 384)}};
     });
+```
+</details>
+
+### See everything that's registered
+
+`describe()` returns `(name, help)` for every backend, which the CLI surfaces:
+
+```sh
+ragcpp list                       # all embedders + rerankers, with config keys
+ragcpp list embedders
+ragcpp list embedders --plugins=./plugins   # include third-party .so backends
 ```
 
 ### Build by name
@@ -66,10 +110,15 @@ engine.with_embedder(std::move(*emb));
 engine.with_embedder_spec(config["embedder"]);       // {"type": "ollama", ...}
 ```
 
-Built-in embedder names: `hash`, `ollama`, `openai`, `llamacpp`, and the
-in-process **local** models `onnx` and `gguf` (see below). Composition
-decorators: `retry`, `fallback`. Polyglot transports: `process`, `http`, `rest`.
-Built-in reranker names: `cross_encoder` (with `wire` = `tei` | `cohere` | `jina`).
+Built-in embedder names: `hash`, `ollama`, `openai`, `voyage`, `together`,
+`llamacpp`, and the in-process **local** models `onnx` and `gguf` (see below).
+Composition decorators: `retry`, `fallback`. Polyglot transports: `process`,
+`http`, `rest`. Built-in reranker names: `cross_encoder` (with `wire` = `tei` |
+`cohere` | `jina`). Run `ragcpp list` to see them all with their config keys.
+
+Adding a hosted provider that speaks the OpenAI `/v1/embeddings` shape (Voyage,
+Together, …) is ~6 lines over the `openai` backend — see `voyage` / `together`
+in `src/plugin/builtins.cpp` for the pattern.
 
 ### Local (in-process) embedders are just names too
 

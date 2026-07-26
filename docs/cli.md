@@ -9,6 +9,7 @@ ragcpp query <db.ragdb> "<query>" [-k N] [--mmr]
 ragcpp serve <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]
 ragcpp eval  <beir-dir> [--split=test]
 ragcpp info  <db.ragdb>
+ragcpp list  [embedders|rerankers] [--plugins=DIR]
 ```
 
 ---
@@ -77,6 +78,20 @@ ragcpp info corpus.ragdb
 
 Prints document/chunk counts, index geometry, embedder identity, and other
 metadata from the `.ragdb` header — without rebuilding anything.
+
+## `list` — show registered backends
+
+```sh
+ragcpp list                                  # all embedders + rerankers
+ragcpp list embedders
+ragcpp list embedders --plugins=./plugins    # include third-party .so backends
+```
+
+Lists every backend the plugin registry knows about, each with the config keys it
+takes — the user-facing face of the registry's `describe()`. Answers "what can I
+put in a config?" without reading source. With `--plugins=DIR` it loads every
+shared library in `DIR` first, so third-party backends show up too. See
+[`PLUGINS.md`](../PLUGINS.md).
 
 ---
 

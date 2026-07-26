@@ -48,6 +48,13 @@ class Registry {
 public:
     using Factory = std::function<Result<Interface>(const Json& config)>;
 
+    // A one-line human description of what a registered factory builds and the
+    // config keys it reads. Optional; enables `describe()` for --help / discovery.
+    struct Entry {
+        Factory     factory;
+        std::string description;   // e.g. "OpenAI embeddings API (keys: model, api_key, dim)"
+    };
+
     // The process-wide registry for this Interface. Meyers singleton: the
     // static local is initialized on first use, so self-registering plugins in
     // other translation units / shared objects all target the same instance.
@@ -59,8 +66,15 @@ public:
     // Register (or replace) a factory under `name`. Returns false if it
     // replaced an existing entry (useful for detecting accidental clobber).
     bool register_factory(std::string name, Factory factory) {
+        return register_described(std::move(name), std::move(factory), {});
+    }
+
+    // Register with a human description for introspection. Same semantics as
+    // register_factory; the description shows up in describe().
+    bool register_described(std::string name, Factory factory, std::string description) {
         std::lock_guard lk(mu_);
-        auto [it, inserted] = factories_.insert_or_assign(std::move(name), std::move(factory));
+        auto [it, inserted] = factories_.insert_or_assign(
+            std::move(name), Entry{std::move(factory), std::move(description)});
         (void)it;
         return inserted;
     }
@@ -79,7 +93,7 @@ public:
             if (it == factories_.end())
                 return fail<Interface>(Errc::not_found,
                                        "no registered factory named '" + std::string(name) + "'");
-            f = it->second; // copy under lock, invoke unlocked (factory may recurse)
+            f = it->second.factory; // copy under lock, invoke unlocked (factory may recurse)
         }
         return f(config);
     }
@@ -118,6 +132,18 @@ public:
         return out;
     }
 
+    // (name, description) pairs, sorted by name. Powers `--help` / `rag list`:
+    // a user can see every registered backend AND what config it takes without
+    // reading source. Descriptions are empty for factories registered via the
+    // bare register_factory / RAG_REGISTER path.
+    [[nodiscard]] std::vector<std::pair<std::string, std::string>> describe() const {
+        std::lock_guard lk(mu_);
+        std::vector<std::pair<std::string, std::string>> out;
+        out.reserve(factories_.size());
+        for (const auto& [k, e] : factories_) out.emplace_back(k, e.description);
+        return out;
+    }
+
     [[nodiscard]] std::size_t size() const {
         std::lock_guard lk(mu_);
         return factories_.size();
@@ -126,7 +152,7 @@ public:
 private:
     Registry() = default;
     mutable std::mutex mu_;
-    std::map<std::string, Factory, std::less<>> factories_;
+    std::map<std::string, Entry, std::less<>> factories_;
 };
 
 // Static self-registration helper. Construct one at namespace scope to register

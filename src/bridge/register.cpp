@@ -83,13 +83,17 @@ Result<AnyReranker> make_remote_reranker(const Json& c) {
 void ensure_bridge_registered() noexcept {
     static const bool once = [] {
         auto& er = plugin::Registry<AnyEmbedder>::instance();
-        er.register_factory("process", make_remote_embedder);
-        er.register_factory("http",    make_remote_embedder);
-        er.register_factory("rest",    make_remote_embedder);
+        const std::string emb_desc =
+            "out-of-process embedder over a bridge (keys: cmd/args for process, url for http/rest)";
+        er.register_described("process", make_remote_embedder, emb_desc);
+        er.register_described("http",    make_remote_embedder, emb_desc);
+        er.register_described("rest",    make_remote_embedder, emb_desc);
         auto& rr = plugin::Registry<AnyReranker>::instance();
-        rr.register_factory("process", make_remote_reranker);
-        rr.register_factory("http",    make_remote_reranker);
-        rr.register_factory("rest",    make_remote_reranker);
+        const std::string rr_desc =
+            "out-of-process reranker over a bridge (keys: cmd/args for process, url for http/rest)";
+        rr.register_described("process", make_remote_reranker, rr_desc);
+        rr.register_described("http",    make_remote_reranker, rr_desc);
+        rr.register_described("rest",    make_remote_reranker, rr_desc);
         return true;
     }();
     (void)once;

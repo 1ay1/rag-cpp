@@ -2174,6 +2174,84 @@ TEST(plugin_reranker_registered) {
     CHECK(rag::plugin::Registry<rag::plugin::AnyReranker>::instance().contains("cross_encoder"));
 }
 
+TEST(plugin_describe_carries_config_hints) {
+    // describe() powers `ragcpp list` / --help: every built-in must self-document
+    // the config keys it takes, so a user can discover the config surface without
+    // reading source. Assert a few known backends have non-empty descriptions.
+    rag::plugin::ensure_builtins_registered();
+    auto rows = rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().describe();
+    std::map<std::string, std::string> by_name(rows.begin(), rows.end());
+    REQUIRE(by_name.count("hash"));
+    CHECK(!by_name["hash"].empty());
+    CHECK(!by_name["ollama"].empty());
+    CHECK(!by_name["fallback"].empty());
+    // The description should mention at least one config key by name.
+    CHECK(by_name["ollama"].find("model") != std::string::npos);
+}
+
+TEST(plugin_new_hosted_providers_registered) {
+    // "Really add more": voyage / together were added as ~6-line registrations
+    // over the OpenAI-compatible backend. They must be reachable by name and
+    // constructible (no network is touched at construction).
+    rag::plugin::ensure_builtins_registered();
+    auto v = rag::plugin::make_embedder(
+        nlohmann::json{{"type", "voyage"}, {"api_key", "k"}, {"dim", 512}});
+    REQUIRE(v.has_value());
+    CHECK_EQ(v->dimension(), 512u);
+    auto t = rag::plugin::make_embedder(
+        nlohmann::json{{"type", "together"}, {"api_key", "k"}});
+    REQUIRE(t.has_value());
+}
+
+TEST(plugin_together_requires_api_key) {
+    // require<>() surfaces a typed error the factory just propagates.
+    auto t = rag::plugin::make_embedder(nlohmann::json{{"type", "together"}});
+    CHECK(!t.has_value());
+    CHECK_EQ(t.error().code, rag::Errc::invalid_argument);
+}
+
+TEST(plugin_config_view_is_total) {
+    // The Config wrapper never throws: missing -> default, wrong type -> default,
+    // require -> typed error, sub -> nested json or error. (Config holds a
+    // reference to the spec, which in real use is the const Json& a factory is
+    // handed and which outlives the call; here we keep it in a named local.)
+    nlohmann::json spec{{"dim", 128}, {"name", "x"}, {"inner", {{"type", "hash"}}}};
+    rag::plugin::Config c{spec};
+    CHECK_EQ(c.get<int>("dim", 7), 128);
+    CHECK_EQ(c.get<int>("absent", 7), 7);       // missing -> default
+    CHECK_EQ(c.get<int>("name", 7), 7);         // wrong type -> default, no throw
+    CHECK_EQ(c.get("name", "def"), "x");
+    CHECK(c.has("dim"));
+    CHECK(!c.has("absent"));
+    auto req = c.require<int>("dim");
+    REQUIRE(req.has_value());
+    CHECK_EQ(*req, 128);
+    auto missing = c.require<int>("absent");
+    CHECK(!missing.has_value());
+    auto sub = c.sub("inner");
+    REQUIRE(sub.has_value());
+    CHECK_EQ((*sub)["type"].get<std::string>(), "hash");
+    CHECK(!c.sub("absent").has_value());
+}
+
+TEST(plugin_register_embedder_helper_wraps_concept) {
+    // register_embedder accepts a factory returning a bare concept MODEL and
+    // wraps it in AnyEmbedder for you. Register a throwaway backend and build it.
+    rag::plugin::register_embedder(
+        "unit_test_helper_embedder", "test-only (keys: dim)",
+        [](rag::plugin::Config c) -> rag::Result<rag::dense::HashEmbedder> {
+            return rag::dense::HashEmbedder{c.get<std::size_t>("dim", 32)};
+        });
+    auto e = rag::plugin::make_embedder(
+        nlohmann::json{{"type", "unit_test_helper_embedder"}, {"dim", 48}});
+    REQUIRE(e.has_value());
+    CHECK_EQ(e->dimension(), 48u);
+    // ...and it is self-described.
+    auto rows = rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().describe();
+    std::map<std::string, std::string> by_name(rows.begin(), rows.end());
+    CHECK(by_name["unit_test_helper_embedder"].find("test-only") != std::string::npos);
+}
+
 TEST(plugin_local_embedders_registered_by_name) {
     // onnx/gguf are in-process local backends. They must be reachable BY NAME
     // like every network backend, so config/CLI/C-ABI can select them without

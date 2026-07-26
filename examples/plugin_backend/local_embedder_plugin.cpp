@@ -19,6 +19,7 @@
 // Or via this repo's CMake (target: local_ngram_plugin).
 
 #include <rag/plugin/plugin.hpp>
+#include <rag/plugin/builder.hpp>
 #include <rag/core/concepts.hpp>
 #include <rag/dense/embedder.hpp>
 
@@ -97,21 +98,20 @@ static_assert(rag::Embedder<LocalNgramEmbedder>,
 } // namespace
 
 // ── Registration ─────────────────────────────────────────────────────────────
-// Convention 1: a static registrar. Its constructor runs on dlopen and the name
-// "local_ngram" appears in the AnyEmbedder registry. Config knobs:
-//   {"type":"local_ngram", "dim":384, "ngram":3}
-RAG_REGISTER(rag::plugin::AnyEmbedder, "local_ngram",
-    [](const nlohmann::json& cfg) -> rag::Result<rag::plugin::AnyEmbedder> {
-        auto dim   = cfg.value("dim", 384);
-        auto ngram = cfg.value("ngram", 3);
-        if (dim <= 0)
-            return rag::fail<rag::plugin::AnyEmbedder>(
-                rag::Errc::invalid_argument, "local_ngram: dim must be positive");
-        LocalNgramEmbedder model(static_cast<std::size_t>(dim), static_cast<std::size_t>(ngram));
-        return rag::plugin::AnyEmbedder{std::move(model)};
-    });
-
-// Convention 2 (optional): an explicit hook called by load_plugin after dlopen,
-// for toolchains that would strip the "unused" static registrar above. No-op
-// here because the registrar already ran, but present to show the contract.
-extern "C" void rag_plugin_register() { /* registrars already ran on load */ }
+// The ergonomic way (rag/plugin/builder.hpp): return your concept type from a
+// Config -> Result<T> lambda. The AnyEmbedder wrap, the not-throwing config
+// parsing, and the describe() text are all handled — no macro, no comma trap.
+// Registered from rag_plugin_register(), which load_plugin() calls after dlopen.
+extern "C" void rag_plugin_register() {
+    rag::plugin::register_embedder(
+        "local_ngram",
+        "in-process character n-gram feature-hash embedder, no deps (keys: dim, ngram)",
+        [](rag::plugin::Config c) -> rag::Result<LocalNgramEmbedder> {
+            int dim   = c.get("dim", 384);
+            int ngram = c.get("ngram", 3);
+            if (dim <= 0)
+                return rag::fail<LocalNgramEmbedder>(
+                    rag::Errc::invalid_argument, "local_ngram: dim must be positive");
+            return LocalNgramEmbedder(static_cast<std::size_t>(dim), static_cast<std::size_t>(ngram));
+        });
+}
