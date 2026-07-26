@@ -9,11 +9,13 @@
 // memory.
 
 #include "rag/loaders/ooxml.hpp"
+#include "rag/loaders/loaders.hpp"   // html_to_text, reused for EPUB XHTML parts
 
 #include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
 
 namespace rag::loaders {
 
@@ -428,23 +430,35 @@ std::string ooxml_xml_to_text(std::string_view xml) {
             std::string_view name = local_name(tag);
 
             // Structure-bearing elements. Paragraph and line breaks become
-            // newlines so the chunker still sees document structure.
+            // newlines so the chunker still sees document structure. The set
+            // spans BOTH OOXML (w:/a: prefixes) and OpenDocument (text:/table:
+            // prefixes): local_name() has already stripped the prefix, and the
+            // ODF names do not collide with the OOXML ones, so one pass reads
+            // .docx and .odt alike.
             //
-            // Tables need care: a cell contains its own <w:p>, so treating
+            // Tables need care: a cell contains its own paragraph, so treating
             // every paragraph as a newline explodes a 2x2 table into four
             // lines and the row — the unit that actually means something,
-            // since it is one record — is destroyed. Inside a <w:tbl> a
-            // paragraph is therefore a TAB and only <w:tr> ends the line, so a
-            // row survives as "Metric\tValue", which reads as a record and
+            // since it is one record — is destroyed. Inside a table a
+            // paragraph is therefore a TAB and only a table ROW ends the line,
+            // so a row survives as "Metric\tValue", which reads as a record and
             // retrieves as one.
-            if (name == "tbl") { table_depth += closing ? -1 : 1; if (table_depth < 0) table_depth = 0; newline(); }
-            else if (name == "tr") newline();
-            else if (name == "p" || name == "br" || name == "sectPr")
+            //
+            //   OOXML:  tbl / tr / tc      ODF: table / table-row / table-cell
+            if (name == "tbl" || name == "table")
+                { table_depth += closing ? -1 : 1; if (table_depth < 0) table_depth = 0; newline(); }
+            else if (name == "tr" || name == "table-row") newline();
+            else if (name == "p" || name == "br" || name == "sectPr" ||
+                     name == "h" || name == "line-break")
                 { if (table_depth > 0) tab(); else newline(); }
-            else if (name == "tab" || name == "tc")
+            else if (name == "tab" || name == "tc" || name == "table-cell")
                 tab();
             // Deleted text and field instructions are not document content.
-            else if (name == "delText" || name == "instrText")
+            // OOXML: delText / instrText.  ODF marks deletions inside
+            // <text:tracked-changes>; the visible document does not include
+            // them, so skip that subtree.
+            else if (name == "delText" || name == "instrText" ||
+                     name == "tracked-changes")
                 skipping = !closing;
 
             i = end + 1;
@@ -627,6 +641,155 @@ Result<std::string> ooxml_to_text(std::string_view bytes) {
     if (excel) return xlsx_to_text(bytes);
     if (ppt) return pptx_to_text(bytes);
     return fail<std::string>(Errc::parse_error, "zip is not an OOXML document");
+}
+
+// ─── OpenDocument ────────────────────────────────────────────────────────
+Result<std::string> odf_to_text(std::string_view bytes) {
+    // The whole body lives in content.xml for .odt, .ods and .odp alike. The
+    // shared xml_to_text understands text:p / text:h / table:* so paragraphs,
+    // headings and table rows survive; a spreadsheet's rows come through the
+    // same table path as a Word table, i.e. one record per line.
+    auto content = zip_read_name(bytes, "content.xml");
+    if (!content) return std::unexpected(content.error());
+    std::string text = ooxml_xml_to_text(*content);
+    if (text.empty())
+        return fail<std::string>(Errc::parse_error, "odf: content.xml held no text");
+    return text;
+}
+
+// ─── EPUB ────────────────────────────────────────────────────────────
+namespace {
+
+// Pull an attribute value out of a start tag: attr("idref=\"x\"", "idref") -> x.
+std::string attr_value(std::string_view tag, std::string_view name) {
+    std::size_t p = 0;
+    while ((p = tag.find(name, p)) != std::string_view::npos) {
+        std::size_t after = p + name.size();
+        // Require the match to be a whole attribute name (preceded by space).
+        if (p != 0 && tag[p - 1] != ' ' && tag[p - 1] != '\t') { p = after; continue; }
+        while (after < tag.size() && (tag[after] == ' ' || tag[after] == '=')) ++after;
+        if (after >= tag.size()) return {};
+        char q = tag[after];
+        if (q != '"' && q != '\'') { p = after; continue; }
+        std::size_t end = tag.find(q, after + 1);
+        if (end == std::string_view::npos) return {};
+        return std::string(tag.substr(after + 1, end - after - 1));
+    }
+    return {};
+}
+
+// Resolve a spine href relative to the OPF's directory (hrefs are relative to
+// the package file, which is usually under OEBPS/ or similar).
+std::string join_path(std::string_view base_dir, std::string_view href) {
+    if (href.empty()) return {};
+    if (href.front() == '/') return std::string(href.substr(1));
+    if (base_dir.empty()) return std::string(href);
+    std::string out = std::string(base_dir);
+    if (out.back() != '/') out.push_back('/');
+    out += href;
+    // Normalise a single leading "../" against base if present (rare in EPUBs).
+    return out;
+}
+
+} // namespace
+
+Result<std::string> epub_to_text(std::string_view bytes) {
+    auto entries = zip_entries(bytes);
+    if (!entries) return std::unexpected(entries.error());
+
+    // Prefer reading order from the OPF package: META-INF/container.xml points
+    // to the .opf, whose <spine> lists <itemref idref> in order, each idref
+    // resolving through <manifest><item id href> to an XHTML file. When any of
+    // that is missing or malformed, fall back to every (x)html part sorted by
+    // name, which is close enough for retrieval.
+    std::vector<std::string> order;
+    std::string opf_path;
+    if (auto container = zip_read_name(bytes, "META-INF/container.xml")) {
+        std::string_view c = *container;
+        std::size_t rf = c.find("<rootfile");
+        if (rf != std::string_view::npos) {
+            std::size_t end = c.find('>', rf);
+            if (end != std::string_view::npos)
+                opf_path = attr_value(c.substr(rf, end - rf), "full-path");
+        }
+    }
+    if (!opf_path.empty()) {
+        if (auto opf = zip_read_name(bytes, opf_path)) {
+            std::string_view o = *opf;
+            std::string base_dir;
+            if (auto slash = opf_path.rfind('/'); slash != std::string::npos)
+                base_dir = opf_path.substr(0, slash);
+            // id -> href from the manifest.
+            std::unordered_map<std::string, std::string> manifest;
+            std::size_t p = 0;
+            while ((p = o.find("<item ", p)) != std::string_view::npos) {
+                std::size_t end = o.find('>', p);
+                if (end == std::string_view::npos) break;
+                std::string_view tag = o.substr(p, end - p);
+                std::string id = attr_value(tag, "id"), href = attr_value(tag, "href");
+                if (!id.empty() && !href.empty()) manifest[id] = href;
+                p = end + 1;
+            }
+            // spine itemrefs give the order.
+            std::size_t sp = o.find("<spine");
+            std::size_t send = o.find("</spine>", sp == std::string_view::npos ? 0 : sp);
+            p = (sp == std::string_view::npos) ? 0 : sp;
+            while (p < o.size() && (send == std::string_view::npos || p < send)) {
+                std::size_t ir = o.find("<itemref", p);
+                if (ir == std::string_view::npos || (send != std::string_view::npos && ir >= send)) break;
+                std::size_t end = o.find('>', ir);
+                if (end == std::string_view::npos) break;
+                std::string idref = attr_value(o.substr(ir, end - ir), "idref");
+                if (auto it = manifest.find(idref); it != manifest.end())
+                    order.push_back(join_path(base_dir, it->second));
+                p = end + 1;
+            }
+        }
+    }
+    if (order.empty()) {
+        for (const auto& e : *entries) {
+            std::string_view n = e.name;
+            auto ends = [&](const char* s){ std::string_view suf(s); return n.size() >= suf.size() && n.compare(n.size()-suf.size(), suf.size(), suf) == 0; };
+            if (ends(".xhtml") || ends(".html") || ends(".htm")) order.push_back(e.name);
+        }
+        std::sort(order.begin(), order.end());
+    }
+
+    std::string out;
+    for (const auto& name : order) {
+        auto part = zip_read_name(bytes, name);
+        if (!part) continue;
+        std::string t = html_to_text(*part);
+        if (t.empty()) continue;
+        if (!out.empty()) out += "\n\n";
+        out += t;
+    }
+    if (out.empty()) return fail<std::string>(Errc::parse_error, "epub: no readable content documents");
+    return out;
+}
+
+// ─── One door for every ZIP-container document ──────────────────────────────
+Result<std::string> zip_document_to_text(std::string_view bytes) {
+    auto entries = zip_entries(bytes);
+    if (!entries) return std::unexpected(entries.error());
+    bool ooxml = false, odf = false, epub = false, mimetype_epub = false;
+    for (const auto& e : *entries) {
+        if (e.name == "word/document.xml" || e.name.rfind("xl/worksheets/", 0) == 0 ||
+            e.name.rfind("ppt/slides/slide", 0) == 0) ooxml = true;
+        else if (e.name == "content.xml") odf = true;
+        else if (e.name == "META-INF/container.xml") epub = true;
+        else if (e.name == "mimetype") mimetype_epub = true;
+    }
+    // EPUB and OOXML are the most specific signatures; ODF's content.xml is
+    // generic enough that OOXML wins if both somehow appear.
+    if (ooxml) return ooxml_to_text(bytes);
+    if (epub || mimetype_epub) {
+        if (auto r = epub_to_text(bytes)) return r;   // else fall through
+    }
+    if (odf) return odf_to_text(bytes);
+    if (epub || mimetype_epub) return epub_to_text(bytes);
+    return fail<std::string>(Errc::parse_error,
+        "zip is not a recognised document (not OOXML, OpenDocument, or EPUB)");
 }
 
 } // namespace rag::loaders

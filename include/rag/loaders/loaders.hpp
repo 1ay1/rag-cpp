@@ -32,8 +32,16 @@ struct LoadedDoc {
     Metadata    meta;
 };
 
-// ─── Single-source extractors ─────────────────────────────────────────────────
+// ─── Single-source extractors ──────────────────────────────────────
 [[nodiscard]] std::string html_to_text(std::string_view html);
+
+// RTF -> text, in-process. Handles the control words that carry text structure
+// (\par, \line, \tab, \cell), \'hh hex byte escapes, unicode \uN, and skips
+// the destination groups ({\*\...}, fonts, stylesheets, pictures) that hold no
+// document text. It is not a full RTF reader — it extracts the words, which is
+// all retrieval wants — so a self-contained .rtf loader needs no textutil.
+[[nodiscard]] std::string rtf_to_text(std::string_view rtf);
+
 [[nodiscard]] Result<std::string> pdf_to_text(const std::filesystem::path& path); // needs `pdftotext`
 
 // Load one file, choosing the extractor from its extension. Returns unavailable
@@ -83,13 +91,14 @@ struct DirOptions {
         ".c",".h",".cpp",".hpp",".cc",".cxx",".py",".js",".ts",".tsx",".jsx",
         ".go",".rs",".java",".rb",".php",".cs",".swift",".kt",".scala",".sh",
         ".json",".yaml",".yml",".toml",".sql",
-        // Office. Extracted in-process — no dependency, see ooxml.hpp.
-        ".docx",".xlsx",".pptx",
-        // Legacy binary Office and friends, via an external converter when one
-        // is installed. Listed here so they are ATTEMPTED: a corpus that
-        // silently skipped every .doc looked, to its owner, like a corpus that
-        // had indexed them.
-        ".doc",".xls",".ppt",".rtf",".odt",".epub",
+        // Office and e-book formats extracted IN-PROCESS — no dependency.
+        // OOXML, OpenDocument (LibreOffice/OpenOffice) and EPUB are all ZIP of
+        // XML; RTF is a control-word stream. See ooxml.hpp / rtf_to_text.
+        ".docx",".xlsx",".pptx",".odt",".ods",".odp",".epub",".rtf",
+        // Legacy binary Office, via an external converter when one is installed.
+        // Listed here so they are ATTEMPTED: a corpus that silently skipped
+        // every .doc looked, to its owner, like one that had indexed them.
+        ".doc",".xls",".ppt",
     };
     std::vector<std::string> exclude_dirs = {
         ".git","node_modules","build","dist","target","__pycache__",".venv","venv",

@@ -83,6 +83,142 @@ std::string html_to_text(std::string_view html) {
     return clean;
 }
 
+// ─── RTF → text (in-process) ──────────────────────────────────────────────────
+std::string rtf_to_text(std::string_view rtf) {
+    // RTF is a stream of {groups}, \control words, and literal text. Text
+    // retrieval wants the literal text plus the few control words that are
+    // structure (\par, \line, \tab, \cell). Everything else — font tables,
+    // colour tables, stylesheets, embedded pictures, revision metadata — lives
+    // in "destination" groups that carry no reading content, so those are
+    // skipped wholesale.
+    static const std::unordered_set<std::string> kSkipDest = {
+        "fonttbl","colortbl","stylesheet","info","pict","object","header",
+        "footer","footnote","annotation","themedata","colorschememapping",
+        "latentstyles","datastore","generator","filetbl","listtable",
+        "listoverridetable","revtbl","rsidtbl","mmath","xmlnstbl"};
+
+    std::string out;
+    out.reserve(rtf.size() / 2);
+    const std::size_t n = rtf.size();
+
+    struct Group { bool skip; };
+    std::vector<Group> stack;
+    stack.push_back({false});
+    auto skipping = [&] { return stack.back().skip; };
+    // A \* before a control word marks the whole group as an ignorable
+    // destination unless the reader understands it; treat the next control word
+    // as a destination name.
+    bool pending_optional_dest = false;
+
+    auto emit = [&](char c) { if (!skipping()) out.push_back(c); };
+
+    std::size_t i = 0;
+    while (i < n) {
+        char c = rtf[i];
+        if (c == '{') { stack.push_back({skipping()}); ++i; continue; }
+        if (c == '}') { if (stack.size() > 1) stack.pop_back(); ++i; continue; }
+        if (c == '\\') {
+            // Escape or control word.
+            if (i + 1 < n) {
+                char d = rtf[i + 1];
+                if (d == '\\' || d == '{' || d == '}') { emit(d); i += 2; continue; }
+                if (d == '\'' ) {   // \'hh : one byte in the document codepage
+                    if (i + 3 < n) {
+                        auto hex = [](char x)->int{ if(x>='0'&&x<='9')return x-'0'; x|=0x20; if(x>='a'&&x<='f')return x-'a'+10; return -1; };
+                        int hi = hex(rtf[i+2]), lo = hex(rtf[i+3]);
+                        if (hi >= 0 && lo >= 0) {
+                            unsigned byte = static_cast<unsigned>((hi<<4)|lo);
+                            // RTF \'hh is a codepage byte, not UTF-8. Map the
+                            // 0x80..0xFF range through CP1252 (a superset of
+                            // Latin-1 for the printable high range) to a Unicode
+                            // code point, then emit UTF-8 -- so caf\'e9 comes out
+                            // as UTF-8 "cafe-acute" rather than a lone 0xE9 byte
+                            // that corrupts the string.
+                            unsigned long cp = byte;
+                            if (byte >= 0x80) {
+                                static const unsigned short cp1252[32] = {
+                                    0x20AC,0x0081,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,
+                                    0x02C6,0x2030,0x0160,0x2039,0x0152,0x008D,0x017D,0x008F,
+                                    0x0090,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,
+                                    0x02DC,0x2122,0x0161,0x203A,0x0153,0x009D,0x017E,0x0178};
+                                cp = (byte < 0xA0) ? cp1252[byte - 0x80] : byte;
+                            }
+                            if (!skipping()) {
+                                if (cp < 0x80) out.push_back(static_cast<char>(cp));
+                                else if (cp < 0x800) { out.push_back(char(0xC0|(cp>>6))); out.push_back(char(0x80|(cp&0x3F))); }
+                                else { out.push_back(char(0xE0|(cp>>12))); out.push_back(char(0x80|((cp>>6)&0x3F))); out.push_back(char(0x80|(cp&0x3F))); }
+                            }
+                        }
+                        i += 4; continue;
+                    }
+                    i += 2; continue;
+                }
+                if (d == '*') { pending_optional_dest = true; i += 2; continue; }
+                if (!std::isalpha(static_cast<unsigned char>(d))) {
+                    // A control SYMBOL like \~ (nbsp) or \- (opt hyphen): skip.
+                    i += 2; continue;
+                }
+                // Control WORD: letters then an optional signed number.
+                std::size_t j = i + 1;
+                while (j < n && std::isalpha(static_cast<unsigned char>(rtf[j]))) ++j;
+                std::string word(rtf.substr(i + 1, j - (i + 1)));
+                bool neg = false; long param = 0; bool has_param = false;
+                if (j < n && rtf[j] == '-') { neg = true; ++j; }
+                std::size_t ps = j;
+                while (j < n && std::isdigit(static_cast<unsigned char>(rtf[j]))) { param = param*10 + (rtf[j]-'0'); ++j; }
+                has_param = (j > ps);
+                if (neg) param = -param;
+                // A control word's numeric parameter is delimited by exactly one
+                // space, which is consumed as syntax. But for \uN the fallback
+                // char (if the generator emitted one, e.g. \u9731?) sits BEFORE
+                // that space, so decide the fallback skip from the char at `j`
+                // before eating the delimiter.
+                bool u_had_inline_fallback = (word == "u" && has_param && j < n &&
+                                              rtf[j] != ' ' && rtf[j] != '\\' &&
+                                              rtf[j] != '{' && rtf[j] != '}');
+                if (word == "u" && has_param && u_had_inline_fallback) ++j;   // drop the fallback char
+                if (j < n && rtf[j] == ' ') ++j;
+
+                if (pending_optional_dest) {
+                    // {\*\word ...} : the whole group is an unknown destination.
+                    stack.back().skip = true;
+                    pending_optional_dest = false;
+                } else if (kSkipDest.contains(word)) {
+                    stack.back().skip = true;
+                } else if (word == "par" || word == "line" || word == "sect" || word == "page") {
+                    if (!skipping() && !out.empty() && out.back() != '\n') out.push_back('\n');
+                } else if (word == "tab" || word == "cell" || word == "row") {
+                    emit('\t');
+                } else if (word == "u" && has_param) {
+                    // \uN : a Unicode code point (may be negative = +65536).
+                    long cp = param < 0 ? param + 65536 : param;
+                    if (!skipping() && cp > 0 && cp <= 0x10FFFF) {
+                        if (cp < 0x80) out.push_back(static_cast<char>(cp));
+                        else if (cp < 0x800) { out.push_back(char(0xC0|(cp>>6))); out.push_back(char(0x80|(cp&0x3F))); }
+                        else { out.push_back(char(0xE0|(cp>>12))); out.push_back(char(0x80|((cp>>6)&0x3F))); out.push_back(char(0x80|(cp&0x3F))); }
+                    }
+                    // The fallback char, when present, was already skipped above.
+                }
+                // else: an ignored formatting control word (\b, \fs20, ...).
+                i = j; continue;
+            }
+            ++i; continue;
+        }
+        if (c == '\r' || c == '\n') { ++i; continue; }   // RTF newlines are not text
+        emit(c);
+        ++i;
+    }
+
+    // Collapse runs of blank lines, trim trailing whitespace per line.
+    std::string clean; clean.reserve(out.size());
+    int nl = 0;
+    for (char ch : out) {
+        if (ch == '\n') { if (++nl <= 2) clean.push_back(ch); }
+        else { nl = 0; clean.push_back(ch); }
+    }
+    return clean;
+}
+
 // ─── PDF → text (via pdftotext) ───────────────────────────────────────────────
 Result<std::string> pdf_to_text(const fs::path& path) {
     // pdftotext <in> - : write extracted text to stdout.

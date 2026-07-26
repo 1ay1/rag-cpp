@@ -2256,6 +2256,177 @@ TEST(ooxml_xml_to_text_preserves_structure) {
     CHECK(t.find("Metric\tValue") != std::string::npos);
 }
 
+// The SAME xml_to_text must also read OpenDocument element names, since .odt/
+// .ods/.odp carry structure as text:h / text:p / table:table-row/cell rather
+// than the OOXML w:/a: names. One extractor, both worlds.
+TEST(xml_to_text_reads_opendocument_element_names) {
+    const std::string xml =
+        "<office:document-content xmlns:office='urn:x'>"
+        "<text:h>Chapter One</text:h>"
+        "<text:p>A paragraph of body text.</text:p>"
+        "<table:table><table:table-row>"
+        "<table:table-cell><text:p>Region</text:p></table:table-cell>"
+        "<table:table-cell><text:p>Revenue</text:p></table:table-cell>"
+        "</table:table-row></table:table>"
+        "</office:document-content>";
+    const std::string t = rag::loaders::ooxml_xml_to_text(xml);
+    CHECK(t.find("Chapter One") != std::string::npos);
+    CHECK(t.find("A paragraph of body text.") != std::string::npos);
+    // ODF table rows must collapse to one record per line, exactly like OOXML.
+    CHECK(t.find("Region\tRevenue") != std::string::npos);
+}
+
+// Windows text files are frequently UTF-16 (Notepad) or carry a UTF-8 BOM
+// (Excel CSV export). Reading them as bytes shows NUL bytes and gets the file
+// rejected as "binary"; a BOM means it is text and must decode instead.
+TEST(extract_bytes_decodes_utf16_and_utf8_bom) {
+    // UTF-16LE BOM (FF FE) + "Hi" + newline + "Yo".
+    std::string u16;
+    u16 += '\xFF'; u16 += '\xFE';
+    for (char c : std::string("Hi\nYo")) { u16 += c; u16 += '\0'; }
+    auto r16 = rag::loaders::extract_bytes(u16, "notepad.txt");
+    REQUIRE(r16.has_value());
+    CHECK(r16->text.find("Hi") != std::string::npos);
+    CHECK(r16->text.find("Yo") != std::string::npos);
+    // The decoded text is UTF-8: no interior NUL bytes survive.
+    CHECK(r16->text.find('\0') == std::string::npos);
+
+    // UTF-8 BOM (EF BB BF) is stripped, the rest passes through.
+    std::string u8 = "\xEF\xBB\xBF";
+    u8 += "plain ascii after a bom";
+    auto r8 = rag::loaders::extract_bytes(u8, "excel.csv");
+    REQUIRE(r8.has_value());
+    CHECK(r8->text == "plain ascii after a bom");
+}
+
+namespace {
+// Build a minimal ZIP using STORED (method 0, no compression) so the test needs
+// no deflate encoder. Real .odt/.epub use deflate, but zip_read handles both,
+// and STORED exercises the exact same central-directory + dispatch path.
+std::string make_stored_zip(const std::vector<std::pair<std::string,std::string>>& files) {
+    auto put16 = [](std::string& s, std::uint16_t v){ s += char(v & 0xFF); s += char((v >> 8) & 0xFF); };
+    auto put32 = [](std::string& s, std::uint32_t v){ for (int i=0;i<4;i++) s += char((v >> (8*i)) & 0xFF); };
+    std::string out, central;
+    std::vector<std::uint32_t> offsets;
+    for (auto& [name, data] : files) {
+        offsets.push_back(static_cast<std::uint32_t>(out.size()));
+        put32(out, 0x04034b50);           // local file header sig
+        put16(out, 20); put16(out, 0); put16(out, 0);   // ver, flags, method=0 (stored)
+        put16(out, 0); put16(out, 0);     // time, date
+        put32(out, 0);                    // crc (ignored by our reader for stored)
+        put32(out, static_cast<std::uint32_t>(data.size()));   // comp size
+        put32(out, static_cast<std::uint32_t>(data.size()));   // uncomp size
+        put16(out, static_cast<std::uint16_t>(name.size())); put16(out, 0);
+        out += name; out += data;
+    }
+    std::uint32_t cd_off = static_cast<std::uint32_t>(out.size());
+    for (std::size_t i = 0; i < files.size(); ++i) {
+        const auto& [name, data] = files[i];
+        put32(central, 0x02014b50);       // central dir header sig
+        put16(central, 20); put16(central, 20); put16(central, 0); put16(central, 0);
+        put16(central, 0); put16(central, 0);
+        put32(central, 0);
+        put32(central, static_cast<std::uint32_t>(data.size()));
+        put32(central, static_cast<std::uint32_t>(data.size()));
+        put16(central, static_cast<std::uint16_t>(name.size()));
+        put16(central, 0); put16(central, 0); put16(central, 0); put16(central, 0);
+        put32(central, 0);
+        put32(central, offsets[i]);
+        central += name;
+    }
+    out += central;
+    put32(out, 0x06054b50);               // end of central dir
+    put16(out, 0); put16(out, 0);
+    put16(out, static_cast<std::uint16_t>(files.size()));
+    put16(out, static_cast<std::uint16_t>(files.size()));
+    put32(out, static_cast<std::uint32_t>(central.size()));
+    put32(out, cd_off);
+    put16(out, 0);
+    return out;
+}
+} // namespace
+
+TEST(odf_document_extracts_in_process) {
+    std::string content =
+        "<office:document-content xmlns:office='x'>"
+        "<text:h>Title</text:h><text:p>Body about vectors.</text:p>"
+        "</office:document-content>";
+    std::string zip = make_stored_zip({{"mimetype","application/vnd.oasis.opendocument.text"},
+                                       {"content.xml", content}});
+    // Sniffed straight from bytes, no extension needed.
+    auto r = rag::loaders::extract_bytes(zip, "renamed.bin");
+    REQUIRE(r.has_value());
+    CHECK(r->text.find("Title") != std::string::npos);
+    CHECK(r->text.find("Body about vectors.") != std::string::npos);
+    // And the dedicated entry point agrees.
+    auto direct = rag::loaders::odf_to_text(zip);
+    REQUIRE(direct.has_value());
+    CHECK(direct->find("Title") != std::string::npos);
+}
+
+TEST(epub_extracts_in_spine_reading_order) {
+    // The manifest lists ch2 before ch1, but the spine says ch1 then ch2 —
+    // extraction must follow the spine, or the book reads out of order.
+    std::string container =
+        "<container><rootfiles><rootfile full-path='OEBPS/content.opf'/></rootfiles></container>";
+    std::string opf =
+        "<package><manifest>"
+        "<item id='ch2' href='b.xhtml'/><item id='ch1' href='a.xhtml'/>"
+        "</manifest><spine><itemref idref='ch1'/><itemref idref='ch2'/></spine></package>";
+    std::string a = "<html><body><p>FIRST chapter content.</p></body></html>";
+    std::string b = "<html><body><p>SECOND chapter content.</p></body></html>";
+    std::string zip = make_stored_zip({
+        {"mimetype", "application/epub+zip"},
+        {"META-INF/container.xml", container},
+        {"OEBPS/content.opf", opf},
+        {"OEBPS/a.xhtml", a},
+        {"OEBPS/b.xhtml", b}});
+    auto r = rag::loaders::epub_to_text(zip);
+    REQUIRE(r.has_value());
+    auto first = r->find("FIRST");
+    auto second = r->find("SECOND");
+    REQUIRE(first != std::string::npos);
+    REQUIRE(second != std::string::npos);
+    CHECK(first < second);   // spine order honoured
+}
+
+TEST(zip_that_is_not_a_document_is_rejected_cleanly) {
+    // A plain archive (or a .jar) has no document text; indexing its compressed
+    // bytes would be silent noise, so it must error, not "succeed" with garbage.
+    std::string zip = make_stored_zip({{"readme.txt", "just some files in a zip"}});
+    auto r = rag::loaders::zip_document_to_text(zip);
+    CHECK(!r.has_value());
+    auto r2 = rag::loaders::extract_bytes(zip, "archive.zip");
+    CHECK(!r2.has_value());
+}
+
+TEST(rtf_to_text_strips_control_words_and_decodes_escapes) {
+    const std::string rtf =
+        "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Arial;}}"
+        "{\\colortbl;\\red0\\green0\\blue0;}"
+        "{\\*\\generator Riched20}"
+        "\\f0\\fs24 Plain text here.\\par "
+        "A \\b bold\\b0  word and caf\\'e9.\\par "
+        "Smart \\'93quotes\\'94 here.\\par "
+        "Col1\\tab Col2\\par}";
+    const std::string t = rag::loaders::rtf_to_text(rtf);
+    CHECK(t.find("Plain text here.") != std::string::npos);
+    // Formatting control words are dropped, their text kept.
+    CHECK(t.find("bold word") != std::string::npos);
+    // The font table / colour table / generator destinations carry no text.
+    CHECK(t.find("Arial") == std::string::npos);
+    CHECK(t.find("Riched20") == std::string::npos);
+    // \'e9 (Latin-1 e-acute) decodes to UTF-8, not a raw 0xE9 byte.
+    CHECK(t.find("caf\xC3\xA9") != std::string::npos);
+    // \'93 / \'94 live in the CP1252 0x80-0x9F range where the byte is NOT its
+    // own Unicode value: they must map to U+201C/U+201D (curly quotes), which
+    // is the case the plain-Latin-1 path gets wrong.
+    CHECK(t.find("\xE2\x80\x9Cquotes\xE2\x80\x9D") != std::string::npos);
+    // \par is a newline, \tab is a tab.
+    CHECK(t.find("Col1\tCol2") != std::string::npos);
+    CHECK(t.find('\n') != std::string::npos);
+}
+
 TEST(inflate_rejects_malformed_streams_without_reading_out_of_bounds) {
     // Each of these is a different way a corrupt member can try to walk off the
     // end of the buffer. All must be errors, none may crash.

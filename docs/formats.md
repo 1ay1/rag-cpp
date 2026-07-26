@@ -121,34 +121,48 @@ smaller index. Details in
 
 ## Office documents
 
-`.docx`, `.xlsx` and `.pptx` are ZIP archives of XML. rag-cpp reads them
-**in-process with no dependency at all** — it owns a ZIP central-directory
-reader and a DEFLATE decompressor (RFC 1951, fixed and dynamic Huffman). The
-argument for owning rather than linking: a loader that pulls in three transitive
-dependencies is one nobody enables in a hardened build, and it becomes dead
-code.
+`.docx`, `.xlsx` and `.pptx` are ZIP archives of XML. So are OpenDocument
+(`.odt`, `.ods`, `.odp` — LibreOffice / OpenOffice) and `.epub`. rag-cpp reads
+every one of them **in-process with no dependency at all** — it owns a ZIP
+central-directory reader and a DEFLATE decompressor (RFC 1951, fixed and dynamic
+Huffman), and one XML-to-text pass that recognises both the OOXML (`w:`/`a:`) and
+the OpenDocument (`text:`/`table:`) element names. The argument for owning rather
+than linking: a loader that pulls in three transitive dependencies is one nobody
+enables in a hardened build, and it becomes dead code.
 
 ```cpp
-auto text = rag::loaders::ooxml_to_text(bytes);   // sniffs which format
-auto doc  = rag::loaders::docx_to_text(bytes);    // or be explicit
+auto text = rag::loaders::zip_document_to_text(bytes); // sniffs OOXML/ODF/EPUB
+auto doc  = rag::loaders::docx_to_text(bytes);         // or be explicit
+auto odf  = rag::loaders::odf_to_text(bytes);
+auto book = rag::loaders::epub_to_text(bytes);
 ```
 
 What is preserved, because retrieval actually uses it:
 
-- **Word** — paragraphs, line breaks, footnotes and endnotes. Table **rows stay
-  on one line** (cells tab-separated), because a row is one record and
-  exploding a 2×2 table into four lines destroys the association between label
-  and value. Tracked deletions and field instructions are dropped.
-- **Excel** — the **shared-string table is resolved**. Excel interns repeated
-  strings and references them by index, so a naive tag-stripper extracts a grid
-  of integers, confidently and wrongly. Each row becomes a tab-separated line
-  under a sheet heading.
-- **PowerPoint** — slides in **presentation order** (not archive order), each
-  under a `## Slide N` heading so "what was on slide 12" is answerable, plus
-  speaker notes, which are often where the substance is.
+- **Word / OpenDocument text** — paragraphs, headings, line breaks, footnotes.
+  Table **rows stay on one line** (cells tab-separated), because a row is one
+  record and exploding a 2×2 table into four lines destroys the association
+  between label and value. Tracked deletions and field instructions are dropped.
+- **Excel / OpenDocument spreadsheet** — the **shared-string table is resolved**.
+  Excel interns repeated strings and references them by index, so a naive
+  tag-stripper extracts a grid of integers, confidently and wrongly. Each row
+  becomes a tab-separated line under a sheet heading.
+- **PowerPoint / OpenDocument presentation** — slides in **presentation order**
+  (not archive order), each under a `## Slide N` heading so "what was on slide
+  12" is answerable, plus speaker notes, which are often where the substance is.
+- **EPUB** — chapters in **spine reading order** (from the OPF package, not
+  archive order), each XHTML content document stripped to text.
 
 Entities are decoded, including numeric references, emitted as UTF-8 so
-documents in any script survive.
+documents in any script survive. `.rtf` is also read in-process — control words
+stripped, `\'hh` codepage bytes and `\uN` escapes decoded to UTF-8, font and
+style tables skipped — with `textutil`/`unrtf` kept only as a fallback.
+
+**Encodings.** A file that begins with a Unicode byte-order mark (UTF-8, or
+UTF-16 LE/BE — what Windows Notepad and Excel CSV export write) is decoded to
+UTF-8 rather than rejected. Without this, a UTF-16 file's first NUL byte gets it
+thrown out as "binary", which is how half of Windows-authored corpora silently
+fail to index.
 
 ## Everything else
 
@@ -159,14 +173,15 @@ auto r = rag::loaders::extract_file(path);
 
 | Group | Formats | How |
 |-------|---------|-----|
-| We own it | txt, md, html, csv, source code, docx, xlsx, pptx | in-process, no dependency |
-| A tool owns it | pdf, doc, xls, ppt, rtf, odt, epub | external converter if installed |
+| We own it | txt, md, html, csv, source code, docx, xlsx, pptx, **odt, ods, odp, epub, rtf**, UTF-16/BOM text | in-process, no dependency |
+| A tool owns it | pdf, doc, xls, ppt | external converter if installed |
 | Needs a model | scanned PDFs | detected and reported; **no OCR bundled** |
 
 The legacy binary formats (`.doc` is an OLE compound file — a filesystem inside
-a file) are delegated to `antiword` / `catdoc` / `textutil` / `pandoc`,
-whichever is present. A half-working in-house parser for them would be worse
-than none, because it produces plausible garbage that silently poisons an index.
+a file, `.xls`/`.ppt` likewise) are delegated to `antiword` / `catdoc` /
+`textutil` / `xls2csv` / `catppt`, whichever is present. A half-working in-house
+parser for them would be worse than none, because it produces plausible garbage
+that silently poisons an index.
 
 `capabilities()` reports what this machine can actually do, before you ingest
 ten thousand files and find out afterwards:

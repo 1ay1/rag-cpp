@@ -79,6 +79,24 @@ struct ZipEntry {
 // still extracts correctly.
 [[nodiscard]] Result<std::string> ooxml_to_text(std::string_view bytes);
 
+// ─── OpenDocument (LibreOffice / OpenOffice) ──────────────────────────────────
+// .odt / .ods / .odp are also ZIP archives of XML, with the body in
+// `content.xml` and structure carried by text:/table: elements. Extraction
+// reuses the same ZIP reader and the shared xml_to_text (which recognises the
+// ODF element names), so these formats are in-process and dependency-free too.
+[[nodiscard]] Result<std::string> odf_to_text(std::string_view bytes);
+
+// ─── EPUB ─────────────────────────────────────────────────────────────────────
+// An .epub is a ZIP of XHTML content documents. Extraction reads the spine
+// order from the OPF package when present (so chapters read in reading order),
+// falls back to sorted XHTML parts otherwise, and strips each to text.
+[[nodiscard]] Result<std::string> epub_to_text(std::string_view bytes);
+
+// The one entry point for any ZIP-container document: sniffs OOXML vs ODF vs
+// EPUB from the archive contents and dispatches. Returns parse_error if the
+// zip is a container we do not understand (a .jar, a plain archive).
+[[nodiscard]] Result<std::string> zip_document_to_text(std::string_view bytes);
+
 // Is this buffer a ZIP container? Cheap magic-number check.
 [[nodiscard]] bool looks_like_zip(std::string_view bytes) noexcept;
 
