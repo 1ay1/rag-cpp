@@ -1,0 +1,158 @@
+# CI for rag-cpp.
+#
+# The job that matters here is `pinned-sdk`. rag-cpp resolves the RCP C++ SDK in
+# three steps — an explicit -DRAGCPP_RCP_SDK_DIR, then a SIBLING ../rcp/sdk/cpp
+# checkout, then FetchContent of the pinned tag — and on any developer machine
+# the sibling wins, because co-developing the two repos is the normal workflow.
+#
+# The consequence is that the pin was dead code. Nothing had ever exercised
+# RAGCPP_RCP_SDK_TAG, so it could have named a deleted ref, a force-pushed tag,
+# or an API-incompatible SDK, and every local build would still be green. The
+# first person to find out would be someone cloning the repo — which is to say,
+# every new user, and nobody else.
+#
+# `pinned-sdk` therefore builds from a directory with NO sibling rcp/, asserts
+# that the SDK actually came from the pinned tag, and runs the suite plus
+# protocol conformance against it. It is the only job here that tests the build
+# a stranger gets.
+#
+# Deliberately NOT -Werror: this job answers "does the pinned SDK still work",
+# and it must not go red because a new compiler release invented a warning.
+# Warnings are a separate job with a separate signal.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The pin can break with nothing in this repo changing — a deleted or
+  # force-pushed upstream tag is invisible to push-triggered CI — so also check
+  # it on a schedule.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── The job this file exists for ───────────────────────────────────────────
+  pinned-sdk:
+    name: clean clone (FetchContent pin)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out into a directory with no sibling rcp/
+        uses: actions/checkout@v4
+        with:
+          path: solo/rag-cpp
+
+      - name: Prove the sibling path cannot win
+        working-directory: solo/rag-cpp
+        run: |
+          # Without this guard the job could silently test the DEVELOPER path
+          # and report success for a pin it never touched.
+          if [ -e ../rcp ]; then
+            echo "::error::a sibling rcp/ checkout exists; this job would not test the pin"
+            exit 1
+          fi
+          echo "no sibling rcp/ — FetchContent is the only way to resolve the SDK"
+
+      - name: Configure
+        working-directory: solo/rag-cpp
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Assert the SDK came from the pinned tag
+        working-directory: solo/rag-cpp
+        run: |
+          # Configuring successfully proves little on its own. This checks the
+          # SDK was FETCHED (so resolution really used the pin) and that the
+          # checked-out ref is the tag CMakeLists names, so a drifting or
+          # force-pushed pin fails loudly instead of silently building
+          # something else.
+          src=build/_deps/rcp-src
+          if [ ! -d "$src" ]; then
+            echo "::error::SDK was not fetched — resolution did not use the pin"
+            exit 1
+          fi
+          want=$(grep -m1 'set(RAGCPP_RCP_SDK_TAG' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/')
+          got=$(git -C "$src" describe --tags --exact-match 2>/dev/null || git -C "$src" rev-parse HEAD)
+          echo "pin wants: $want"
+          echo "fetched  : $got ($(git -C "$src" rev-parse --short HEAD))"
+          if [ "$want" != "$got" ]; then
+            echo "::error::fetched SDK ref '$got' is not the pinned tag '$want'"
+            exit 1
+          fi
+
+      - name: Build
+        working-directory: solo/rag-cpp
+        run: cmake --build build -j 8
+
+      - name: Test
+        working-directory: solo/rag-cpp
+        run: ctest --test-dir build --output-on-failure
+
+      # Compiling and passing unit tests would not prove the SDK's WIRE
+      # behaviour survived the pin — rag-cpp is the reference RCP
+      # implementation, so that is the property worth guarding. The spec is
+      # cloned at the SAME tag as the SDK so the two cannot drift apart.
+      - name: Conformance against the pinned SDK
+        working-directory: solo/rag-cpp
+        run: |
+          tag=$(grep -m1 'set(RAGCPP_RCP_SDK_TAG' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/')
+          git clone --depth 1 --branch "$tag" https://github.com/1ay1/rcp.git /tmp/rcp-spec
+          mkdir -p corpus
+          cp README.md ARCHITECTURE.md FORMAT.md corpus/
+          ./build/cli/ragcpp index corpus ci.ragdb --ext=.md
+          python3 /tmp/rcp-spec/conformance/check.py -- \
+            ./build/cli/ragcpp serve ci.ragdb --all --write
+
+  # ── Ordinary build matrix ──────────────────────────────────────────────────
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux / gcc
+            os: ubuntu-latest
+          # macOS also exercises the Metal backend, which is ON by default
+          # there. Its shaders are compiled at runtime by the driver and GitHub
+          # macOS runners are virtualized without a usable GPU — so this proves
+          # the RUNTIME-availability fallback works, which is precisely the path
+          # a user without a GPU takes. Both halves matter: `no-metal` below
+          # tests the code being COMPILED out, this tests it compiled IN and
+          # declining at run time.
+          - name: macos / clang + metal
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build -j 8
+      - run: ctest --test-dir build --output-on-failure
+
+  # A GPU-less build is a first-class configuration, not an afterthought: the
+  # batch scoring path has a CPU fallback that has to stay correct, and nothing
+  # on a developer Mac ever compiles with Metal off.
+  no-metal:
+    name: macos / metal disabled
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DRAGCPP_WITH_METAL=OFF
+      - run: cmake --build build -j 8
+      - run: ctest --test-dir build --output-on-failure
+
+  # Warnings get their own job so that a new compiler release inventing a
+  # diagnostic cannot take down the pin check or the test matrix. Pinned to the
+  # platform where -Werror was actually verified clean; widen it only after
+  # confirming the same on the other toolchains.
+  warnings:
+    name: macos / -Werror
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DRAGCPP_WERROR=ON
+      - run: cmake --build build -j 8

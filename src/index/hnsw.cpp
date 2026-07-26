@@ -256,15 +256,21 @@ void HnswIndex::search_layer_into(std::span<const float> q, std::span<const std:
         // is pointer-chasing and this hides most of the miss latency. Prefetch
         // whichever representation sim() will actually read, in the same order
         // it checks them.
-        if (!pq_codes_.empty() && !adc.empty())
+        //
+        // The braces are load-bearing for the READER, not the compiler: each
+        // arm is a bare `for` containing a bare `if`, so an unbraced `else`
+        // visually attaches to the inner `if` while actually binding to the
+        // outer one. -Wdangling-else flags exactly this.
+        if (!pq_codes_.empty() && !adc.empty()) {
             for (std::uint32_t nb : links)
                 if (nb < nodes_.size()) __builtin_prefetch(pq_codes_.data() + nb * pq_m_, 0, 1);
-        else if (!q8_.empty())
+        } else if (!q8_.empty()) {
             for (std::uint32_t nb : links)
                 if (nb < nodes_.size()) __builtin_prefetch(q8_.data() + nb * dim_, 0, 1);
-        else
+        } else {
             for (std::uint32_t nb : links)
                 if (nb < nodes_.size()) __builtin_prefetch(store_.data() + nb * dim_, 0, 1);
+        }
 
         for (std::uint32_t nb : links) {
             if (nb >= nodes_.size()) continue;
