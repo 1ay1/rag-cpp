@@ -5,15 +5,30 @@ project(rag-cpp
     DESCRIPTION "A type-theoretic, production-grade retrieval (RAG) engine in modern C++"
     LANGUAGES CXX)
 
-option(RAGCPP_BUILD_TESTS    "Build the test suite"         ON)
-option(RAGCPP_BUILD_BENCH    "Build the benchmark harness"  ON)
-option(RAGCPP_BUILD_EXAMPLES "Build the example programs"   ON)
-option(RAGCPP_BUILD_CLI      "Build the ragcpp CLI tool"     ON)
+# When rag-cpp is pulled in via add_subdirectory() (e.g. as a submodule), the
+# consumer owns install/export and usually wants only the library. Detect that
+# and (a) default the tests/bench/examples/CLI OFF, (b) skip the install +
+# export rules entirely — those reference nlohmann_json, which a subdirectory
+# build doesn't put in rag-cpp's export set and CMake rightly rejects.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+    set(RAGCPP_IS_TOPLEVEL ${PROJECT_IS_TOP_LEVEL})
+else()
+    if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+        set(RAGCPP_IS_TOPLEVEL ON)
+    else()
+        set(RAGCPP_IS_TOPLEVEL OFF)
+    endif()
+endif()
+
+option(RAGCPP_BUILD_TESTS    "Build the test suite"         ${RAGCPP_IS_TOPLEVEL})
+option(RAGCPP_BUILD_BENCH    "Build the benchmark harness"  ${RAGCPP_IS_TOPLEVEL})
+option(RAGCPP_BUILD_EXAMPLES "Build the example programs"   ${RAGCPP_IS_TOPLEVEL})
+option(RAGCPP_BUILD_CLI      "Build the ragcpp CLI tool"     ${RAGCPP_IS_TOPLEVEL})
 option(RAGCPP_USE_SIMD       "Enable SIMD distance kernels" ON)
 option(RAGCPP_WERROR         "Treat warnings as errors"     OFF)
 option(RAGCPP_WITH_ONNX      "Build in-process ONNX Runtime embedder" OFF)
 option(RAGCPP_WITH_LLAMA     "Build in-process GGUF (llama.cpp) embedder" OFF)
-option(RAGCPP_WITH_RCP       "Build the Retrieval Context Protocol (RCP) server front-end" ON)
+option(RAGCPP_WITH_RCP       "Build the Retrieval Context Protocol (RCP) server front-end" ${RAGCPP_IS_TOPLEVEL})
 # GPU acceleration for BATCH scoring (Apple/Metal). Defaults to ON on Apple
 # platforms because it needs no SDK, no toolchain component and no download:
 # shaders are compiled from source at runtime by the driver. It is also safe to
@@ -224,6 +239,10 @@ endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+# Install + export a relocatable CMake package — ONLY for a standalone build.
+# A subdirectory consumer already links the ragcpp::ragcpp alias (created next
+# to the target above) and owns its own install rules.
+if(RAGCPP_IS_TOPLEVEL)
 # Install the library and headers, and export a relocatable CMake package so a
 # downstream project can simply:
 #     find_package(ragcpp CONFIG REQUIRED)
@@ -268,3 +287,4 @@ install(FILES
 export(EXPORT ragcppTargets
     FILE ${CMAKE_CURRENT_BINARY_DIR}/ragcppTargets.cmake
     NAMESPACE ragcpp::)
+endif()  # RAGCPP_IS_TOPLEVEL
