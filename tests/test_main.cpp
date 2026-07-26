@@ -832,10 +832,17 @@ TEST(vector_store_builds_graph_above_threshold_and_finds_self) {
     REQUIRE(s.build().has_value());
     CHECK(s.is_graph_built());
     CHECK(s.memory_bytes() > 0);
-    // Self-query returns self as #1 at ~1.0 on the graph path.
+    // Self-query returns self as #1 at ~1.0 on the graph path. HNSW is an
+    // APPROXIMATE index: at the configured ef a self-query can, on some
+    // float-codegen/thread-scheduling combinations, walk to a neighbourhood
+    // that misses the query's own node and rank it below a near-duplicate --
+    // observed as an intermittent 3/4 on Linux gcc while macOS clang stayed
+    // 4/4. The invariant under test is "the graph path finds self", not "recall
+    // at exactly ef=accurate", so pass an explicit high ef to make self-recall
+    // deterministic instead of leaving it to codegen luck.
     std::size_t self_hits = 0;
     for (std::uint32_t i : {7u, 100u, 999u, 2500u}) {
-        auto h = s.search(vecs[i], 1);
+        auto h = s.search(vecs[i], 1, /*ef=*/256);
         if (!h.empty() && h[0].id == i) ++self_hits;
     }
     CHECK_EQ(self_hits, std::size_t{4});
