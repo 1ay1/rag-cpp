@@ -252,6 +252,24 @@ dense (HNSW):  ~0.14 ms/query
 
 ## Documentation
 
+Full guides live in [**`docs/`**](docs/README.md). Start there if you're new.
+
+**Guides**
+
+- [Getting Started](docs/getting-started.md) — install, first index, first query (CLI + library).
+- [Retrieval](docs/retrieval.md) — hybrid BM25 + dense, HNSW, fusion, filtering, quantization.
+- [The Pipeline](docs/pipeline.md) — composable stages; `standard` / `quality` / `context` factories; custom stages.
+- [Embedders](docs/embedders.md) — every backend, the retry/fallback decorators, the `HttpTransport` seam.
+- [Advanced Retrieval](docs/advanced-retrieval.md) — SPLADE, ColBERT, RAPTOR, HyDE, CRAG, GraphRAG.
+- [Configuration](docs/configuration.md) — every `CorpusConfig` / `HnswConfig` tunable.
+- [The CLI](docs/cli.md) — full `ragcpp` command reference.
+- [Serving over RCP](docs/rcp-server.md) — turning an `Engine` into a conformant RCP/1 server.
+- [Persistence](docs/persistence.md) — the `.ragdb` container and the write-ahead log.
+- [The C API & bindings](docs/c-api.md) — the flat C ABI and driving it from Python/Rust/Go.
+- [GPU acceleration](docs/gpu.md) — the optional Metal batch-scoring backend.
+
+**Reference**
+
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layers, seams, invariants.
 - [`PLUGINS.md`](PLUGINS.md) — the three extension axes: concepts, `AnyX`, and the
   load-time plugin registry (register backends by name / from a shared library).
