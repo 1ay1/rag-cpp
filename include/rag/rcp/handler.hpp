@@ -99,6 +99,17 @@ struct Options {
     // a reply means "on disk", not "in RAM until something goes wrong".
     std::string persist_path;
 
+    // Where to keep the write-ahead log. Empty ⇒ no log, and every mutation
+    // pays a full snapshot rewrite to be durable (see persist()).
+    std::string wal_path;
+
+    // Checkpoint (full snapshot + log truncation) once the log exceeds this.
+    // The trade is purely between write latency and recovery time: a bigger
+    // log means fewer snapshots but a longer replay on restart. 64 MB is a few
+    // hundred thousand documents — seconds of replay — while keeping the
+    // amortized snapshot cost per write negligible.
+    std::size_t checkpoint_bytes = 64ull * 1024 * 1024;
+
     // Fluent setters (return *this) — reads like a spec at the call site.
     Options& named(std::string n, std::string v) { name = std::move(n); version = std::move(v); return *this; }
     Options& with_reranker(rerank::AnyReranker r) { reranker = std::make_shared<rerank::AnyReranker>(std::move(r)); return *this; }
@@ -110,6 +121,9 @@ struct Options {
     Options& with_feedback(bool on = true) { enable_feedback = on; return *this; }
     Options& with_memory(bool on = true)   { enable_memory = on; return *this; }
     Options& persisting_to(std::string path) { persist_path = std::move(path); return *this; }
+    Options& with_wal(std::string path, std::size_t checkpoint_at = 64ull * 1024 * 1024) {
+        wal_path = std::move(path); checkpoint_bytes = checkpoint_at; return *this;
+    }
     Options& filter_on(std::string field, std::string type = "keyword") {
         filter_fields[std::move(field)] = std::move(type); return *this;
     }
@@ -324,11 +338,34 @@ private:
     // true after a restart. Reply-then-persist would make every mutation a
     // promise the server might not keep.
     //
+    // HOW that durability is achieved depends on whether a write-ahead log is
+    // attached, and the difference is large enough to matter:
+    //
+    //   * With a WAL, the mutation was ALREADY made durable inside the corpus
+    //     call, by appending one small record and syncing it. That costs about
+    //     0.04 ms and does not grow with the corpus. All this method does then
+    //     is checkpoint occasionally, to keep replay time bounded.
+    //   * Without one, the only way to be honest is to rewrite the whole
+    //     snapshot — 25 ms on a 20k-document corpus, 69.7 ms on 50k, growing
+    //     forever, for a document that took 0.007 ms to insert.
+    //
     // A save failure is reported as the method failing. Returning success on a
     // write that did not reach disk is worse than an error — the client has no
     // way to learn it needs to retry.
     [[nodiscard]] Result persist() {
         if (opts_.persist_path.empty()) return Json(nullptr);
+
+        if (engine_.corpus().has_wal()) {
+            // Durability is already satisfied. Checkpoint only when the log has
+            // grown past a threshold, so the O(corpus) snapshot is amortized
+            // over many writes instead of paid on each one.
+            if (engine_.corpus().wal_bytes() < opts_.checkpoint_bytes) return Json(nullptr);
+            if (auto s = engine_.corpus().checkpoint(opts_.persist_path); !s)
+                return wire_fail(::rcp::errc::BackendUnavailable,
+                                 "checkpoint failed: " + s.error().message);
+            return Json(nullptr);
+        }
+
         if (auto s = engine_.save(opts_.persist_path); !s)
             return wire_fail(::rcp::errc::BackendUnavailable,
                              "index mutated but could not be persisted: " + s.error().message);

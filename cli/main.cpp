@@ -142,6 +142,21 @@ int cmd_serve(const std::vector<std::string>& args) {
         // opened from, so a mutation that was acknowledged is a mutation that
         // survives a restart.
         opts.persisting_to(args[0]);
+
+        // ...and do it through a write-ahead log, so "acknowledged" costs an
+        // O(record) append instead of an O(corpus) snapshot rewrite. Measured:
+        // index/add over RCP on a 20k-document corpus went from 25.1 ms to
+        // 0.25 ms, and the old cost grew with the corpus while the new one does
+        // not. The log sits beside the index as <db>.wal.
+        //
+        // Opened AFTER the engine loads, because open_wal replays any log left
+        // by a previous crash into the corpus — that replay IS the recovery.
+        const std::string wal_path = args[0] + ".wal";
+        if (auto w = engine->corpus().open_wal(wal_path); !w) {
+            std::printf("wal error: %s\n", w.error().message.c_str());
+            return 1;
+        }
+        opts.with_wal(wal_path);
     }
     if (flag(args, "--graph")) opts.with_graph(true);
     // memory/* and feedback/* are backed entirely by the engine itself — they

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <random>
@@ -2396,6 +2397,164 @@ TEST(gpu_disable_is_honoured) {
     std::vector<float> out(40000 * 16, 7.0f);
     CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, dim, out));
     CHECK_EQ(out[0], 7.0f);          // declined means UNTOUCHED, not partial
+}
+
+// ── Write-ahead log ───────────────────────────────────────────────────────
+
+TEST(wal_replays_mutations_into_a_fresh_corpus) {
+    const std::string db  = "/tmp/ragcpp_wal_replay.ragdb";
+    const std::string log = "/tmp/ragcpp_wal_replay.wal";
+    std::remove(db.c_str()); std::remove(log.c_str());
+
+    {
+        rag::index::Corpus c;
+        REQUIRE(c.add_document("base.txt", "base document about retrieval").has_value());
+        REQUIRE(c.build().has_value());
+        REQUIRE(c.save(db).has_value());
+        REQUIRE(c.open_wal(log).has_value());
+        // These are never save()d — only the log knows about them.
+        REQUIRE(c.add_document("a.txt", "alpha document about retrieval").has_value());
+        REQUIRE(c.add_document("b.txt", "bravo document about retrieval").has_value());
+        auto gone = c.add_document("c.txt", "charlie document about retrieval");
+        REQUIRE(gone.has_value());
+        REQUIRE(c.remove_document(*gone).has_value());
+        CHECK(c.wal_bytes() > 0);
+    }
+
+    // Recovery: load the (stale) snapshot, then replay.
+    auto rec = rag::index::Corpus::load(db);
+    REQUIRE(rec.has_value());
+    CHECK_EQ(rec->live_document_count(), std::size_t{1});     // snapshot alone
+    REQUIRE(rec->open_wal(log).has_value());
+
+    CHECK_EQ(rec->live_document_count(), std::size_t{3});     // base + a + b
+    CHECK(rec->find_by_uri("a.txt").has_value());
+    CHECK(rec->find_by_uri("b.txt").has_value());
+    CHECK(!rec->find_by_uri("c.txt").has_value());            // delete replayed too
+
+    // Replayed documents must be RETRIEVABLE, not merely present — replay goes
+    // through add_document precisely so chunking and indexing happen too.
+    const auto hits = rec->lexical_search("alpha document", 5);
+    CHECK(!hits.empty());
+
+    std::remove(db.c_str()); std::remove(log.c_str());
+}
+
+TEST(wal_replay_is_not_re_logged) {
+    // Recovery must not append what it just read. Without a guard, every
+    // restart would double the log and replay time would grow without bound
+    // even on an idle server.
+    const std::string db  = "/tmp/ragcpp_wal_double.ragdb";
+    const std::string log = "/tmp/ragcpp_wal_double.wal";
+    std::remove(db.c_str()); std::remove(log.c_str());
+
+    std::uint64_t first = 0;
+    {
+        rag::index::Corpus c;
+        REQUIRE(c.build().has_value());
+        REQUIRE(c.save(db).has_value());
+        REQUIRE(c.open_wal(log).has_value());
+        for (int i = 0; i < 10; ++i)
+            REQUIRE(c.add_document("d" + std::to_string(i), "body " + std::to_string(i)).has_value());
+        first = c.wal_bytes();
+    }
+    CHECK(first > 0);
+
+    for (int restart = 0; restart < 3; ++restart) {
+        auto rec = rag::index::Corpus::load(db);
+        REQUIRE(rec.has_value());
+        REQUIRE(rec->open_wal(log).has_value());
+        CHECK_EQ(rec->live_document_count(), std::size_t{10});   // not 20, not 40
+        CHECK_EQ(rec->wal_bytes(), first);                       // log did not grow
+    }
+
+    std::remove(db.c_str()); std::remove(log.c_str());
+}
+
+TEST(wal_tolerates_a_torn_tail_but_not_inner_corruption) {
+    const std::string log = "/tmp/ragcpp_wal_torn.wal";
+    std::remove(log.c_str());
+    {
+        rag::store::Wal w;
+        REQUIRE(w.open(log).has_value());
+        for (int i = 0; i < 5; ++i) {
+            rag::store::WalRecord r;
+            r.op = rag::store::WalOp::add_document;
+            r.uri = "u" + std::to_string(i);
+            r.text = "body " + std::to_string(i);
+            REQUIRE(w.append(r).has_value());
+        }
+    }
+    const auto full = rag::store::Wal::replay(log);
+    REQUIRE(full.has_value());
+    CHECK_EQ(full->size(), std::size_t{5});
+
+    // A crash mid-append leaves a partial trailing record. That write was never
+    // acknowledged, so dropping it is correct — and it must NOT be reported as
+    // corruption, or every crash would become an unrecoverable database.
+    const auto whole = std::filesystem::file_size(log);
+    for (std::size_t cut : {std::size_t{3}, std::size_t{11}, std::size_t{20}}) {
+        std::filesystem::resize_file(log, whole - cut);
+        const auto torn = rag::store::Wal::replay(log);
+        REQUIRE(torn.has_value());                 // recovers, does not fail
+        CHECK(torn->size() == std::size_t{4});     // the intact prefix survives
+        for (std::size_t i = 0; i < torn->size(); ++i)
+            CHECK_EQ((*torn)[i].uri, "u" + std::to_string(i));
+        std::filesystem::resize_file(log, whole);
+        // restore the truncated bytes for the next iteration
+        std::remove(log.c_str());
+        rag::store::Wal w;
+        REQUIRE(w.open(log).has_value());
+        for (int i = 0; i < 5; ++i) {
+            rag::store::WalRecord r;
+            r.op = rag::store::WalOp::add_document;
+            r.uri = "u" + std::to_string(i);
+            r.text = "body " + std::to_string(i);
+            REQUIRE(w.append(r).has_value());
+        }
+    }
+
+    // Corruption in the MIDDLE is a different thing entirely: that record was
+    // acknowledged, and silently dropping it would lose a write the client was
+    // told had succeeded. It must be an error.
+    {
+        std::fstream f(log, std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(20);                 // inside the first record's payload
+        char junk = '\xEE';
+        f.write(&junk, 1);
+    }
+    const auto bad = rag::store::Wal::replay(log);
+    CHECK(!bad.has_value());
+
+    std::remove(log.c_str());
+}
+
+TEST(wal_checkpoint_snapshots_then_truncates) {
+    const std::string db  = "/tmp/ragcpp_wal_ckpt.ragdb";
+    const std::string log = "/tmp/ragcpp_wal_ckpt.wal";
+    std::remove(db.c_str()); std::remove(log.c_str());
+
+    rag::index::Corpus c;
+    REQUIRE(c.build().has_value());
+    REQUIRE(c.save(db).has_value());
+    REQUIRE(c.open_wal(log).has_value());
+    for (int i = 0; i < 25; ++i)
+        REQUIRE(c.add_document("d" + std::to_string(i), "body " + std::to_string(i)).has_value());
+    CHECK(c.wal_bytes() > 0);
+
+    REQUIRE(c.checkpoint(db).has_value());
+    CHECK_EQ(c.wal_bytes(), std::uint64_t{0});      // log discarded...
+
+    // ...and the snapshot must contain everything the log did, or the
+    // truncation just destroyed acknowledged writes. This is the ordering the
+    // implementation is careful about: save() fully durable BEFORE truncate().
+    auto rec = rag::index::Corpus::load(db);
+    REQUIRE(rec.has_value());
+    CHECK_EQ(rec->live_document_count(), std::size_t{25});
+    REQUIRE(rec->open_wal(log).has_value());
+    CHECK_EQ(rec->live_document_count(), std::size_t{25});   // replay adds nothing
+
+    std::remove(db.c_str()); std::remove(log.c_str());
 }
 
 int main() {

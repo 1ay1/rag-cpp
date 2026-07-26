@@ -32,6 +32,8 @@ void Corpus::move_from(Corpus&& o) {
     dirty_     = o.dirty_;
     epoch_     = o.epoch_;
     deleted_docs_ = std::move(o.deleted_docs_);
+    wal_       = std::move(o.wal_);
+    replaying_ = o.replaying_;
     relink_meta();   // borrowed pointers now point at OUR docs_ storage
     meta_stale_ = false;
 }
@@ -54,6 +56,17 @@ Result<DocId> Corpus::upsert_document(std::string uri, std::string text, Metadat
 
 Result<DocId> Corpus::add_document_locked(std::string uri, std::string text, Metadata meta,
                                           std::string title) {
+    // Log BEFORE mutating. If the append fails, nothing has changed and the
+    // caller gets an honest error; logging after the mutation would leave a
+    // corpus that has a document its log does not, so a crash would silently
+    // roll it back after the client was told it succeeded.
+    if (wal_.is_open() && !replaying_) {
+        store::WalRecord rec;
+        rec.op = store::WalOp::add_document;
+        rec.uri = uri; rec.title = title; rec.text = text; rec.meta = meta;
+        if (auto w = wal_.append(rec); !w) return std::unexpected(w.error());
+    }
+
     DocId did{static_cast<std::uint32_t>(docs_.size())};
     Document doc;
     doc.id = did; doc.uri = std::move(uri); doc.title = std::move(title);
@@ -231,6 +244,13 @@ Result<void> Corpus::remove_document_locked(DocId id) {
     ensure_linked();
     if (id.get() >= docs_.size() || deleted_docs_.count(id.get()))
         return fail<void>(Errc::not_found, "remove_document: unknown or already-deleted id");
+    // Logged only after the validity check, so a no-op delete writes nothing.
+    if (wal_.is_open() && !replaying_) {
+        store::WalRecord rec;
+        rec.op = store::WalOp::remove_document;
+        rec.doc_id = id.get();
+        if (auto w = wal_.append(rec); !w) return w;
+    }
     deleted_docs_.insert(id.get());
     ++epoch_;
     // Tombstone the doc's chunks in the HNSW graph so dense search skips them.
@@ -441,6 +461,73 @@ Result<void> Corpus::save(const std::string& path) const {
     st.published = at_epoch;
     st.any       = true;
     return {};
+}
+
+// ─── Write-ahead log ────────────────────────────────────────────────────
+Result<void> Corpus::open_wal(const std::string& path, store::SyncMode mode) {
+    std::unique_lock lk(mu_);
+
+    // REPLAY FIRST, then open for appending.
+    //
+    // Replay runs through the ordinary mutation paths rather than poking at
+    // docs_/chunks_ directly, so recovery produces exactly the corpus the
+    // original run had — same chunking, same ids, same index state. `replaying_`
+    // stops those calls from logging what they are reading; without it every
+    // restart would double the log.
+    auto records = store::Wal::replay(path);
+    if (!records) return std::unexpected(records.error());
+
+    if (!records->empty()) {
+        replaying_ = true;
+        for (const auto& rec : *records) {
+            if (rec.op == store::WalOp::add_document) {
+                // Replayed as an UPSERT for the same reason index/add is one:
+                // a log may contain several writes to the same uri, and the
+                // last must win rather than accumulate duplicates.
+                std::optional<DocId> existing;
+                if (!rec.uri.empty()) existing = find_by_uri_locked(rec.uri);
+                if (existing) (void)remove_document_locked(*existing);
+                if (auto r = add_document_locked(rec.uri, rec.text, rec.meta, rec.title); !r) {
+                    replaying_ = false;
+                    return std::unexpected(r.error());
+                }
+            } else {
+                // A delete of a document the snapshot never had is not an
+                // error: the log can outlive the doc it refers to.
+                (void)remove_document_locked(DocId{rec.doc_id});
+            }
+        }
+        replaying_ = false;
+        if (auto b = build_locked(); !b) return b;
+    }
+
+    return wal_.open(path, mode);
+}
+
+bool Corpus::has_wal() const noexcept {
+    std::shared_lock lk(mu_);
+    return wal_.is_open();
+}
+
+std::uint64_t Corpus::wal_bytes() const noexcept {
+    std::shared_lock lk(mu_);
+    return wal_.size_bytes();
+}
+
+Result<void> Corpus::checkpoint(const std::string& path) {
+    // save() takes its own lock and does the snapshot/publish dance, so it runs
+    // OUTSIDE the write lock here — taking mu_ around it would deadlock (mu_ is
+    // not recursive) and would also block writers for the whole serialization,
+    // which is exactly what the snapshot/publish split was built to avoid.
+    if (auto s = save(path); !s) return s;
+
+    // Only now is it safe to drop the log. save() has fsync'd the snapshot and
+    // renamed it into place, so every record in the log is represented on disk.
+    // Truncating first would leave a window in which a crash loses mutations
+    // that were already acknowledged.
+    std::unique_lock lk(mu_);
+    if (!wal_.is_open()) return {};
+    return wal_.truncate();
 }
 
 Corpus::PathState& Corpus::path_state(const std::string& path) {
