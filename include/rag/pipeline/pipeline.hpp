@@ -103,6 +103,14 @@ public:
     Result<Context> process(Context ctx) const override;
 };
 
+// The DETERMINISTIC feature reranker used inside standard()/quality()/context()
+// — blends the fused rank score with lexical query-term coverage (a calibrated
+// signal that rescues fusion when one retriever dominates). Exposed as a public
+// factory so a consumer assembling a CUSTOM pipeline (e.g. one that prepends
+// PrfExpandStage AND appends both MMR and ParentStitch) can drop in the exact
+// same accuracy-preserving rerank the built-in pipelines use, no model needed.
+[[nodiscard]] StagePtr make_feature_rerank_stage(std::string label = "feature_rerank");
+
 // Pseudo-Relevance Feedback (RM3-lite): run an initial retrieval, harvest the
 // top terms from the top-`fb_docs` chunks, append the best `fb_terms` to the
 // query, and let the NEXT retrieve stage use the expanded query. Classic recall

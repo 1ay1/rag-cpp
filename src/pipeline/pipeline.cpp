@@ -272,6 +272,10 @@ Result<void> feature_rerank(std::string_view query, std::vector<Hit>& cands,
 }
 } // namespace
 
+StagePtr make_feature_rerank_stage(std::string label) {
+    return std::make_shared<RerankStage>(std::move(label), feature_rerank);
+}
+
 Pipeline Pipeline::standard() { return standard_with(HybridRetrieveConfig{}); }
 
 Pipeline Pipeline::standard_with(HybridRetrieveConfig cfg) {
