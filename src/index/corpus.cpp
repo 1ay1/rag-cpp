@@ -30,6 +30,7 @@ void Corpus::move_from(Corpus&& o) {
     bm25_      = std::move(o.bm25_);
     hnsw_      = std::move(o.hnsw_);
     dirty_     = o.dirty_;
+    epoch_     = o.epoch_;
     deleted_docs_ = std::move(o.deleted_docs_);
     relink_meta();   // borrowed pointers now point at OUR docs_ storage
     meta_stale_ = false;
@@ -90,6 +91,7 @@ Result<DocId> Corpus::add_document_locked(std::string uri, std::string text, Met
     // query without an explicit build().
     meta_stale_ = true;
     dirty_      = true;
+    ++epoch_;
     return did;
 }
 
@@ -184,6 +186,7 @@ Result<void> Corpus::build_locked() {
         }
     }
     dirty_ = false;
+    ++epoch_;
     return {};
 }
 
@@ -229,6 +232,7 @@ Result<void> Corpus::remove_document_locked(DocId id) {
     if (id.get() >= docs_.size() || deleted_docs_.count(id.get()))
         return fail<void>(Errc::not_found, "remove_document: unknown or already-deleted id");
     deleted_docs_.insert(id.get());
+    ++epoch_;
     // Tombstone the doc's chunks in the HNSW graph so dense search skips them.
     if (hnsw_)
         for (const auto& ch : chunks_)
@@ -381,15 +385,77 @@ bool Corpus::passes_locked(ChunkId id, const MetaFilter& f) const {
 // BM25 (inverted index), HNSW (ANN graph). CRC-verified on load.
 // ─────────────────────────────────────────────────────────────────────────────
 Result<void> Corpus::save(const std::string& path) const {
-    // A shared lock is enough and is what we want: save() only READS the
-    // corpus, so concurrent queries continue while a snapshot is written, and
-    // only writers are held off. That is what makes the snapshot consistent —
-    // no document can be appended halfway through serializing the arrays.
-    std::shared_lock lk(mu_);
-    return save_locked(path);
+    // save() splits into two phases that want very different lock treatment.
+    //
+    //   1. SNAPSHOT — walk docs_/chunks_/bm25_/hnsw_ and pack them into section
+    //      blobs. This touches corpus state, so it must hold a lock, and the
+    //      lock is what makes the snapshot consistent: no document can be
+    //      appended halfway through serializing the arrays.
+    //
+    //   2. WRITE — concatenate those blobs, CRC the result, write it to a temp
+    //      file, fsync, rename, fsync the directory. This touches NO corpus
+    //      state whatsoever; the Container owns its own copies.
+    //
+    // Phase 2 is the expensive one — measured on a 20k-doc corpus it is ~24 of
+    // the ~28 ms, almost all of it CRC and the big concatenating copy — and it
+    // used to run with the shared lock still held. Readers did not care (they
+    // share it too), but every WRITER blocked for the whole thing: an
+    // add_document() concurrent with a save loop measured 6.0 ms mean against
+    // 0.001 ms uncontended. Dropping the lock between the phases takes that
+    // stall down to just the snapshot.
+    store::Container snap;
+    std::uint64_t    at_epoch = 0;
+    {
+        std::shared_lock lk(mu_);
+        auto s = snapshot_locked();
+        if (!s) return std::unexpected(s.error());
+        snap     = std::move(*s);
+        at_epoch = epoch_;
+    }
+
+    // PUBLISH, in epoch order.
+    //
+    // Splitting the phases means two concurrent save()s can interleave as:
+    // A snapshots at epoch 10, B snapshots at epoch 20, B renames, A renames —
+    // and the file on disk goes BACKWARDS to epoch 10.
+    //
+    // This is rare but real, and it took an honest harness to see it. A loop
+    // that loads the file while savers and a writer run showed nothing at all
+    // with 3-8 savers on 8 cores: the savers stay roughly in lockstep, so their
+    // renames happen to come out in snapshot order. Only when the savers are
+    // OVERSUBSCRIBED (16 and 32 threads on 8 cores, so the scheduler preempts
+    // one between its snapshot and its rename) does the on-disk doc count go
+    // backwards — 2 and 4 times per 300 loads. With this gate: 0, at 16, 32 and
+    // 64 savers.
+    //
+    // The rename is therefore serialized and gated on the epoch that last
+    // reached this path. A snapshot that lost the race is DROPPED, not written:
+    // its content is a strict prefix of what is already there, so discarding it
+    // loses nothing, and reporting success is honest — the caller asked for the
+    // state at their save() call to be durable, and a newer state that contains
+    // it is on disk.
+    auto& st = path_state(path);
+    std::lock_guard pk(st.mu);
+    if (st.any && st.published > at_epoch) return {};
+    if (auto r = snap.write_file(path); !r) return r;
+    st.published = at_epoch;
+    st.any       = true;
+    return {};
 }
 
-Result<void> Corpus::save_locked(const std::string& path) const {
+Corpus::PathState& Corpus::path_state(const std::string& path) {
+    // The registry lock is held only long enough to find/insert the entry; the
+    // per-path lock — which is what the slow file I/O runs under — is taken by
+    // the caller. node-based map so references stay valid as it grows.
+    static std::mutex registry_mu;
+    static std::unordered_map<std::string, std::unique_ptr<PathState>> registry;
+    std::lock_guard lk(registry_mu);
+    auto& slot = registry[path];
+    if (!slot) slot = std::make_unique<PathState>();
+    return *slot;
+}
+
+Result<store::Container> Corpus::snapshot_locked() const {
     ensure_linked();
     store::Container c;
     std::uint32_t flags = 0;
@@ -441,8 +507,29 @@ Result<void> Corpus::save_locked(const std::string& path) const {
     c.put(store::Tag::bm25, bm25_.serialize());
     if (hnsw_) { c.put(store::Tag::hnsw, hnsw_->serialize()); flags |= store::kHasHnsw; }
 
+    // TOMB — soft-delete tombstones.
+    //
+    // These are NOT derivable from anything else in the file. A tombstoned
+    // document keeps its row in DOCS and its rows in CHNK and its postings in
+    // BM25 (that is what "soft" means — ids stay stable so no other structure
+    // has to be rewritten); the ONLY thing that hides it from results is
+    // membership in deleted_docs_. Omitting this section therefore resurrects
+    // every deleted document on the next load, fully searchable.
+    //
+    // Written sorted so the file is byte-identical for identical corpora —
+    // deleted_docs_ is an unordered_set, whose iteration order is not stable.
+    // Skipped entirely when empty so the common case costs zero bytes.
+    if (!deleted_docs_.empty()) {
+        std::vector<std::uint32_t> ids(deleted_docs_.begin(), deleted_docs_.end());
+        std::sort(ids.begin(), ids.end());
+        store::Writer w;
+        w.u<std::uint32_t>(static_cast<std::uint32_t>(ids.size()));
+        for (std::uint32_t id : ids) w.u<std::uint32_t>(id);
+        c.put(store::Tag::tomb, std::move(w.data()));
+    }
+
     c.set_flags(flags);
-    return c.write_file(path);
+    return c;
 }
 
 Result<Corpus> Corpus::load(const std::string& path) {
@@ -525,6 +612,15 @@ Result<Corpus> Corpus::load(const std::string& path) {
         auto idx = HnswIndex::deserialize(*h);
         if (!idx) return std::unexpected(idx.error());
         c.hnsw_ = std::move(*idx);
+    }
+    // TOMB (optional; absent in format minor 0 and when nothing is deleted).
+    if (const std::string* t = cont->get(store::Tag::tomb)) {
+        store::Reader r(*t);
+        std::uint32_t n; if (!r.u(n)) return fail<Corpus>(Errc::corrupt_index, "tomb count");
+        for (std::uint32_t i = 0; i < n; ++i) {
+            std::uint32_t id; if (!r.u(id)) return fail<Corpus>(Errc::corrupt_index, "tomb id");
+            c.deleted_docs_.insert(id);
+        }
     }
     return c;
 }

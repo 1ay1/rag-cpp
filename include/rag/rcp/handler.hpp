@@ -89,6 +89,16 @@ struct Options {
     // metadata keys a client may filter on.
     Json filter_fields = Json::object();
 
+    // Where to persist mutations. Empty ⇒ the corpus is served from memory and
+    // index/add + index/delete are LOST when the process exits.
+    //
+    // This is not a nicety. A server that advertises `index.writable` is telling
+    // the client its writes are accepted; a client that deletes a document and
+    // is served that document again after a restart has been lied to. Setting
+    // this makes every successful mutation durable before its reply is sent, so
+    // a reply means "on disk", not "in RAM until something goes wrong".
+    std::string persist_path;
+
     // Fluent setters (return *this) — reads like a spec at the call site.
     Options& named(std::string n, std::string v) { name = std::move(n); version = std::move(v); return *this; }
     Options& with_reranker(rerank::AnyReranker r) { reranker = std::make_shared<rerank::AnyReranker>(std::move(r)); return *this; }
@@ -99,6 +109,7 @@ struct Options {
     Options& with_index(bool writable)     { enable_index = true; index_writable = writable; return *this; }
     Options& with_feedback(bool on = true) { enable_feedback = on; return *this; }
     Options& with_memory(bool on = true)   { enable_memory = on; return *this; }
+    Options& persisting_to(std::string path) { persist_path = std::move(path); return *this; }
     Options& filter_on(std::string field, std::string type = "keyword") {
         filter_fields[std::move(field)] = std::move(type); return *this;
     }
@@ -305,6 +316,25 @@ public:
     }
 
 private:
+    // Commit the corpus to opts_.persist_path, if one was configured.
+    //
+    // Called on the success path of every mutating method, BEFORE its reply is
+    // sent. That ordering is the whole point: a client that receives
+    // {"deleted":1} has been told the deletion happened, and it must still be
+    // true after a restart. Reply-then-persist would make every mutation a
+    // promise the server might not keep.
+    //
+    // A save failure is reported as the method failing. Returning success on a
+    // write that did not reach disk is worse than an error — the client has no
+    // way to learn it needs to retry.
+    [[nodiscard]] Result persist() {
+        if (opts_.persist_path.empty()) return Json(nullptr);
+        if (auto s = engine_.save(opts_.persist_path); !s)
+            return wire_fail(::rcp::errc::BackendUnavailable,
+                             "index mutated but could not be persisted: " + s.error().message);
+        return Json(nullptr);
+    }
+
     // Shared tail of retrieve: rerank (if asked + backed), minScore, trim to k,
     // tokenBudget packing, and the wire result with usage telemetry.
     [[nodiscard]] Result
@@ -556,6 +586,7 @@ public:
         }
         auto b = engine_.build();
         if (!b) return std::unexpected(to_wire(b.error()));
+        if (auto p = persist(); !p) return std::unexpected(p.error());
         return Json{{"ids", std::move(ids)}, {"chunks", engine_.corpus().chunk_count()}};
     }
 
@@ -574,6 +605,9 @@ public:
                 else if (idj.is_number_integer()) target = DocId{idj.get<std::uint32_t>()};
                 if (target && engine_.corpus().remove_document(*target)) ++deleted;
             }
+        // Persist only when something changed — a no-op delete (the idempotent
+        // repeat §7.11 explicitly allows) should not rewrite the whole index.
+        if (deleted) { if (auto p = persist(); !p) return std::unexpected(p.error()); }
         return Json{{"deleted", deleted}};
     }
 

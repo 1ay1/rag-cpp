@@ -38,7 +38,11 @@ namespace rag::store {
 
 constexpr char        kMagic[8]       = {'R','A','G','D','B',0,0,0};
 constexpr std::uint16_t kFormatMajor  = 1;   // incompatible change ⇒ bump; readers reject mismatched major
-constexpr std::uint16_t kFormatMinor  = 0;   // additive change ⇒ bump; older readers still work
+constexpr std::uint16_t kFormatMinor  = 1;   // additive change ⇒ bump; older readers still work
+//   minor 1: added the TOMB section (persisted soft-delete tombstones). A
+//   minor-0 reader skips the unknown tag and sees exactly what it saw before
+//   this existed — i.e. deleted documents come back — which is the pre-existing
+//   behaviour, not a new regression.
 
 enum Flags : std::uint32_t {
     kHasHnsw       = 1u << 0,
@@ -53,6 +57,7 @@ enum class Tag : std::uint32_t {
     embed  = 0x42444D45,  // "EMBD" — chunk embeddings (parallel to chunks)
     bm25   = 0x35324D42,  // "BM25" — serialized inverted index
     hnsw   = 0x57534E48,  // "HNSW" — serialized ANN graph
+    tomb   = 0x424D4F54,  // "TOMB" — tombstoned (soft-deleted) DocId values
 };
 
 // CRC32 (IEEE 802.3) over a byte range.

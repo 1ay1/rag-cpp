@@ -393,6 +393,94 @@ TEST(save_overwrite_leaves_a_loadable_index) {
     std::remove(path.c_str());
 }
 
+// ─── soft-deletes survive a save/load round-trip ────────────────────────────
+//
+// A tombstoned document keeps its DOCS row, its CHNK rows and its BM25
+// postings — that is what makes the delete cheap and ids stable. The ONLY
+// thing hiding it is membership in the tombstone set, so if that set is not
+// persisted, every deleted document comes back alive and searchable on the
+// next load. That is silent, unbounded data resurrection: a client deletes a
+// document through index/delete, the server saves and restarts, and the
+// document is being served again.
+TEST(tombstones_survive_save_load) {
+    const std::string path = "/tmp/ragcpp_tombstone_test.ragdb";
+    std::remove(path.c_str());
+
+    rag::index::Corpus a;
+    REQUIRE(a.add_document("keep.txt", "retrieval augmented generation alpha").has_value());
+    auto gone = a.add_document("gone.txt", "retrieval augmented generation bravo");
+    REQUIRE(gone.has_value());
+    REQUIRE(a.build().has_value());
+    REQUIRE(a.remove_document(*gone).has_value());
+    CHECK_EQ(a.live_document_count(), std::size_t{1});
+    CHECK_EQ(a.lexical_search("retrieval augmented", 10).size(), std::size_t{1});
+    REQUIRE(a.save(path).has_value());
+
+    auto b = rag::index::Corpus::load(path);
+    REQUIRE(b.has_value());
+    CHECK(b->is_deleted(*gone));
+    CHECK_EQ(b->live_document_count(), std::size_t{1});
+
+    // The decisive assertion: the deleted document must not be RETRIEVABLE.
+    auto hits = b->lexical_search("retrieval augmented", 10);
+    CHECK_EQ(hits.size(), std::size_t{1});
+    for (const auto& h : hits) CHECK_EQ(b->resolve(h).uri, std::string{"keep.txt"});
+
+    std::remove(path.c_str());
+}
+
+// ─── concurrent save()s never publish out of order ──────────────────────────
+//
+// save() serializes its snapshot under a shared lock and then writes+renames
+// with the lock RELEASED (so writers are not blocked for the whole file I/O).
+// That opens a window in which an older snapshot's rename can land after a
+// newer one's, moving the on-disk state backwards. Documents are only added
+// here, so the on-disk count must be monotonic.
+//
+// Savers are deliberately oversubscribed relative to cores: with only a few
+// they stay in lockstep and the reordering never shows up.
+TEST(concurrent_saves_never_move_the_file_backwards) {
+    const std::string path = "/tmp/ragcpp_saveorder_test.ragdb";
+    std::remove(path.c_str());
+
+    rag::index::Corpus corpus;
+    for (int i = 0; i < 400; ++i)
+        REQUIRE(corpus.add_document("seed" + std::to_string(i), "seed document " + std::to_string(i)).has_value());
+    REQUIRE(corpus.build().has_value());
+    REQUIRE(corpus.save(path).has_value());
+
+    std::atomic<bool> stop{false};
+    const unsigned savers = std::max(4u, std::thread::hardware_concurrency() * 2);
+    std::vector<std::thread> ts;
+    for (unsigned t = 0; t < savers; ++t)
+        ts.emplace_back([&, t] {
+            std::this_thread::sleep_for(std::chrono::microseconds(37 * t));
+            while (!stop.load(std::memory_order_relaxed)) (void)corpus.save(path);
+        });
+    std::thread writer([&] {
+        for (int i = 0; i < 2000 && !stop.load(std::memory_order_relaxed); ++i)
+            (void)corpus.add_document("new" + std::to_string(i), "new document " + std::to_string(i));
+    });
+
+    std::size_t high_water = 0;
+    long regressions = 0, observed = 0;
+    for (int i = 0; i < 60; ++i) {
+        auto r = rag::index::Corpus::load(path);
+        if (!r) continue;                       // torn reads are write_file's job, tested above
+        const std::size_t n = r->document_count();
+        ++observed;
+        if (n < high_water) ++regressions;
+        else high_water = n;
+    }
+    stop = true;
+    writer.join();
+    for (auto& t : ts) t.join();
+
+    CHECK(observed > 0);
+    CHECK_EQ(regressions, 0L);
+    std::remove(path.c_str());
+}
+
 // Concurrent upserts of the SAME uri must never produce a duplicate — RCP
 // §7.10 requires an explicit id to replace, not duplicate. Spelling the upsert
 // as find-then-remove-then-add at the call site takes the lock three times, so

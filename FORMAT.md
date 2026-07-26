@@ -60,6 +60,7 @@ payloads). Load fails with `corrupt_index` if it does not match.
 | `EMBD`    | `0x42444D45`| chunk embeddings, parallel to `CHNK` |
 | `BM25`    | `0x35324D42`| serialized inverted index (its own magic `2BM1`, versioned) |
 | `HNSW`    | `0x57534E48`| serialized ANN graph (its own magic `HNW1`, versioned) |
+| `TOMB`    | `0x424D4F54`| soft-deleted document ids (added in minor 1; omitted when empty) |
 
 ### `DOCS` payload
 
@@ -101,6 +102,21 @@ Opaque, self-describing blobs produced by `Bm25Index::serialize()` /
 `HnswIndex::serialize()`. Each carries its own 4-byte magic and version and is
 independently CRC-independent (the container CRC covers them). Their internal
 layouts are versioned separately and documented in their headers.
+
+### `TOMB` payload (present iff at least one document is soft-deleted)
+
+```
+u32 tomb_count
+repeat tomb_count:
+    u32 doc_id         # ascending
+```
+
+`remove_document` is a *soft* delete: the document keeps its `DOCS` row, its
+`CHNK` rows and its `BM25` postings, so every id in the file stays stable and no
+other section has to be rewritten. Membership in this set is the only thing that
+hides it from results, so a file without `TOMB` serves every deleted document
+again. Ids are written ascending so the same corpus always produces the same
+bytes.
 
 ## Compatibility policy
 

@@ -134,7 +134,15 @@ int cmd_serve(const std::vector<std::string>& args) {
 
     rag::rcp::Options opts;
     opts.named("ragcpp", "1.0");
-    if (flag(args, "--write")) opts.with_index(true);
+    if (flag(args, "--write")) {
+        opts.with_index(true);
+        // A writable index that never writes anything back is a lie to the
+        // client: index/add and index/delete were accepted, acknowledged, and
+        // then lost when the process exited. Persist to the same file we were
+        // opened from, so a mutation that was acknowledged is a mutation that
+        // survives a restart.
+        opts.persisting_to(args[0]);
+    }
     if (flag(args, "--graph")) opts.with_graph(true);
     // memory/* and feedback/* are backed entirely by the engine itself — they
     // need no external model, no API key and no extra process. Leaving them off

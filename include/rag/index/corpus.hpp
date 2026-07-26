@@ -23,6 +23,7 @@
 #include "rag/dense/embedder.hpp"
 #include "rag/index/hnsw.hpp"
 #include "rag/lexical/bm25.hpp"
+#include "rag/store/container.hpp"
 #include "rag/text/chunker.hpp"
 #include "rag/text/semantic_chunker.hpp"
 
@@ -214,6 +215,28 @@ private:
     // them lazily, before any accessor can hand one out. Mutable + const
     // ensure_linked() because this is memoization, not observable state.
     mutable bool                      meta_stale_ = false;
+
+    // Monotonic count of structural mutations (add/upsert/remove/build). Every
+    // snapshot records the epoch it was taken at, so save() can refuse to
+    // publish a snapshot older than one already on disk. Guarded by mu_ like
+    // the rest of the structure.
+    std::uint64_t                     epoch_ = 0;
+
+    // Serializes the PUBLISH step of save() (the temp-file write + rename) and
+    // remembers the newest epoch that has reached disk, PER DESTINATION PATH.
+    //
+    // Static because two different Corpus objects can legitimately target the
+    // same path, so the ordering hazard is a property of the path, not of the
+    // object. Per-path rather than one global lock because the publish step is
+    // the expensive half of a save — a single mutex would make a host serving
+    // several corpora serialize their file I/O against each other for no
+    // reason, trading one stall for another.
+    struct PathState {
+        std::mutex    mu;
+        std::uint64_t published = 0;
+        bool          any       = false;
+    };
+    static PathState& path_state(const std::string& path);
     std::unordered_set<std::uint32_t> deleted_docs_;   // tombstoned DocId values
 
     [[nodiscard]] Result<void> embed_pending();
@@ -239,7 +262,10 @@ private:
     [[nodiscard]] Result<std::vector<Hit>>
     dense_search_locked(std::string_view query, std::size_t k, const MetaFilter& filter) const;
     [[nodiscard]] Result<void>    build_locked();
-    [[nodiscard]] Result<void>    save_locked(const std::string& path) const;
+    // Pack the whole corpus into container sections. Caller must hold at least a
+    // shared lock; the returned Container owns copies, so the caller can (and
+    // should) release the lock before paying for CRC + file I/O.
+    [[nodiscard]] Result<store::Container> snapshot_locked() const;
 
     // Repair borrowed meta pointers if a preceding add_document() invalidated
     // them. Called by every read path that can expose a Chunk.
