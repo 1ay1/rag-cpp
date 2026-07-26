@@ -90,9 +90,8 @@ std::vector<Chunk> chunk_code(DocId doc, std::string_view ext, const std::string
     auto flush = [&](std::size_t start, std::size_t stop, const std::string& ctx) {
         if (stop <= start) return;
         std::string text;
-        std::size_t chars = 0;
         for (std::size_t i = start; i < stop && i < lines.size(); ++i) {
-            text += lines[i]; text += '\n'; chars += lines[i].size() + 1;
+            text += lines[i]; text += '\n';
         }
         while (!text.empty() && (text.back()=='\n'||text.back()==' ')) text.pop_back();
         if (text.empty()) return;
