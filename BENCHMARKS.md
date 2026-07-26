@@ -190,6 +190,39 @@ are the claim** — languages that exist nowhere on the internet, with no parser
 no grammar, and no file extension, chunked correctly on their own conventions
 the first time they are seen.
 
+### Does integrity translate to retrieval?
+
+Definition integrity is a necessary condition for good code retrieval, not a
+sufficient one — a chunker could keep every function whole and still lose the
+retrieval race if its chunks made worse targets for a natural-language query.
+The only honest way to know is to measure retrieval end to end, so
+`bench/code_retrieval_bench.cpp` does exactly that on **CodeSearchNet** (the
+Python test split — 517 files reconstructed from real GitHub repositories, and
+**4005 queries**, each a function's docstring paired with the function it
+documents). One embedder (all-MiniLM-L6-v2), one corpus, one query set; the
+**only** thing that varies between the two arms is how files were cut into
+chunks. A hit is the retrieved chunk overlapping the documented function's line
+span in the correct file, scored against **every** chunk in the corpus (the
+realistic setting — the user searches the corpus, not one known file).
+
+| Chunking | chunks | MRR@10 | R@1 | R@5 | R@10 |
+|----------|--------|--------|-----|-----|------|
+| **`--source`** (definition-aligned) | **4632** | **0.8193** | **0.7328** | **0.9336** | **0.9600** |
+| windows (the language-blind fallback) | 7034 | 0.7507 | 0.6517 | 0.8859 | 0.9283 |
+
+Structure-aware chunking wins on every metric — **+0.069 MRR@10** and **+8.1
+points Recall@1**, the biggest gain exactly at the top rank where it matters —
+while producing a **34% smaller index** (4632 vs 7034 chunks). It is cheaper
+*and* better, for the same reason integrity predicted: a fixed window either
+splits a function (retrieving the signature without the logic) or merges it with
+unrelated neighbours (diluting the match), and both failures cost rank.
+
+```sh
+# corpus + manifest are produced offline from CodeSearchNet; see the bench header
+./build/bench/ragcpp_code_retrieval_bench <corpus-dir> <manifest.json> \
+    --model=model.onnx --tokenizer=tokenizer.json
+```
+
 The negative controls matter more than the positives, because the dangerous
 failure is not missing structure but **hallucinating** it — prose chunked as if
 it were code is strictly worse than the prose chunker:

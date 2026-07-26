@@ -112,6 +112,13 @@ failure is not missing structure, it is **hallucinating** it:
 ./build/bench/ragcpp_structure_bench
 ```
 
+Integrity is necessary but not sufficient, so it is also measured **end to end**:
+`bench/code_retrieval_bench.cpp` retrieves over 517 real files and 4005 queries
+from CodeSearchNet, and `--source` chunking beats the window fallback on every
+metric — **MRR@10 0.8193 vs 0.7507**, **Recall@1 0.7328 vs 0.6517** — in a 34%
+smaller index. Details in
+[BENCHMARKS.md](../BENCHMARKS.md#does-integrity-translate-to-retrieval).
+
 ## Office documents
 
 `.docx`, `.xlsx` and `.pptx` are ZIP archives of XML. rag-cpp reads them

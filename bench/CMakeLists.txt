@@ -42,3 +42,12 @@ target_link_libraries(ragcpp_beir_bench PRIVATE ragcpp)
 # numbers quoted in structure.hpp can be reproduced on any machine.
 add_executable(ragcpp_structure_bench structure_bench.cpp)
 target_link_libraries(ragcpp_structure_bench PRIVATE ragcpp)
+
+# Does structure-aware chunking RETRIEVE better on real code, or only keep
+# definitions intact? Reconstructs real files from CodeSearchNet, chunks them
+# two ways over one embedder, and measures MRR/Recall of retrieving the
+# function a docstring documents. Needs an ONNX model (retrieval needs an
+# embedder); the corpus + manifest are produced offline, so unlike
+# structure_bench this one is NOT self-contained.
+add_executable(ragcpp_code_retrieval_bench code_retrieval_bench.cpp)
+target_link_libraries(ragcpp_code_retrieval_bench PRIVATE ragcpp)
