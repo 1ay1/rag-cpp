@@ -131,6 +131,41 @@ void quantize_sq8(std::span<const float> v, std::span<std::int8_t> out) noexcept
     }
 }
 
+#if defined(RAGCPP_X86)
+// Hoisted into its own target-attributed function for the same reason
+// dot_avx2 is: AVX2 intrinsics are `always_inline`, and inlining one into a
+// function compiled for the BASELINE ISA is a hard error, not a fallback
+// ("inlining failed in call to always_inline ... target specific option
+// mismatch"). Writing the block inline behind a runtime has_avx2() check
+// compiles fine on ARM — where the whole branch is preprocessed away — and
+// fails on every x86-64 build. That is exactly how it shipped: this file did
+// not compile on x86-64 at all until CI ran on Linux.
+//
+// The runtime check stays where it is; the attribute only tells the compiler
+// it may EMIT AVX2 here, it does not decide whether we CALL it.
+__attribute__((target("avx2")))
+std::int32_t dot_sq8_avx2(const std::int8_t* a, const std::int8_t* b, std::size_t n) noexcept {
+    __m256i acc = _mm256_setzero_si256();
+    std::size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
+        const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
+        // Sign-extend to int16 and multiply-add pairs into int32.
+        const __m256i alo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
+        const __m256i blo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
+        const __m256i ahi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
+        const __m256i bhi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(alo, blo));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(ahi, bhi));
+    }
+    alignas(32) std::int32_t buf[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(buf), acc);
+    std::int32_t sum = buf[0]+buf[1]+buf[2]+buf[3]+buf[4]+buf[5]+buf[6]+buf[7];
+    for (; i < n; ++i) sum += static_cast<std::int32_t>(a[i]) * static_cast<std::int32_t>(b[i]);
+    return sum;
+}
+#endif
+
 std::int32_t dot_sq8(const std::int8_t* a, const std::int8_t* b, std::size_t n) noexcept {
 #if defined(RAGCPP_NEON)
     {
@@ -152,26 +187,7 @@ std::int32_t dot_sq8(const std::int8_t* a, const std::int8_t* b, std::size_t n) 
         return sum;
     }
 #elif defined(RAGCPP_X86)
-    if (has_avx2()) {
-        __m256i acc = _mm256_setzero_si256();
-        std::size_t i = 0;
-        for (; i + 32 <= n; i += 32) {
-            const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
-            const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
-            // Sign-extend to int16 and multiply-add pairs into int32.
-            const __m256i alo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
-            const __m256i blo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
-            const __m256i ahi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
-            const __m256i bhi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(alo, blo));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(ahi, bhi));
-        }
-        alignas(32) std::int32_t buf[8];
-        _mm256_store_si256(reinterpret_cast<__m256i*>(buf), acc);
-        std::int32_t sum = buf[0]+buf[1]+buf[2]+buf[3]+buf[4]+buf[5]+buf[6]+buf[7];
-        for (; i < n; ++i) sum += static_cast<std::int32_t>(a[i]) * static_cast<std::int32_t>(b[i]);
-        return sum;
-    }
+    if (has_avx2()) return dot_sq8_avx2(a, b, n);
 #endif
     std::int32_t s = 0;
     for (std::size_t i = 0; i < n; ++i)
