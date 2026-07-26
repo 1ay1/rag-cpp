@@ -27,6 +27,7 @@ void Corpus::move_from(Corpus&& o) {
     cfg_       = std::move(o.cfg_);
     embedder_  = std::move(o.embedder_);
     contextualizer_ = std::move(o.contextualizer_);
+    propositionizer_ = std::move(o.propositionizer_);
     docs_      = std::move(o.docs_);
     chunks_    = std::move(o.chunks_);
     bm25_      = std::move(o.bm25_);
@@ -84,6 +85,11 @@ Result<DocId> Corpus::add_document_locked(std::string uri, std::string text, Met
     const Document& stored = docs_.back();
 
     auto new_chunks = [&] {
+        if (cfg_.chunking == CorpusConfig::Chunking::proposition)
+            // One chunk per atomic statement. The seam is optional: absent (or
+            // failing) it uses the deterministic sentence splitter, so ingest
+            // never depends on a model being reachable.
+            return text::proposition_chunk(did, stored.text, propositionizer_);
         if (cfg_.chunking != CorpusConfig::Chunking::semantic)
             return text::chunk_document(did, stored.text, cfg_.chunk);
         // Semantic chunking prefers the embedder (true topical drift) but must
@@ -247,6 +253,71 @@ constexpr auto hit_order = [](const Hit& a, const Hit& b) {
 };
 
 } // namespace
+
+std::string Corpus::Explanation::summary() const {
+    std::string s = "chunk " + std::to_string(chunk.get()) + ": lexical ";
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%.2f", lexical_score);
+    s += buf;
+    if (has_dense) {
+        std::snprintf(buf, sizeof buf, "%.3f", dense_score);
+        s += std::string(", dense ") + buf;
+    }
+    s += " (" + std::to_string(matched_terms) + "/" + std::to_string(query_terms) + " terms";
+    if (!terms.empty()) {
+        s += ": ";
+        const std::size_t show = std::min<std::size_t>(terms.size(), 4);
+        for (std::size_t i = 0; i < show; ++i) {
+            if (i) s += ", ";
+            std::snprintf(buf, sizeof buf, "%.2f", terms[i].contribution);
+            s += terms[i].term + " " + buf;
+        }
+        if (terms.size() > show) s += ", …";
+    }
+    s += ")";
+    return s;
+}
+
+Corpus::Explanation Corpus::explain(std::string_view query, ChunkId id) const {
+    std::shared_lock lk(mu_);
+    ensure_linked();
+    Explanation e;
+    e.chunk = id;
+
+    // finalize() is a lazy read-path repair elsewhere; explain() must see the
+    // same idf/avgdl the scorer would, or its numbers would not match a search.
+    // Same double-checked lazy_mu_ dance as lexical_search_locked, and for the
+    // same reason: this is a write under a shared lock.
+    if (!bm25_.finalized()) {
+        std::lock_guard lz(lazy_mu_);
+        if (!bm25_.finalized()) const_cast<Corpus*>(this)->bm25_.finalize();
+    }
+
+    auto terms = bm25_.tokenizer().tokenize(query);
+    std::sort(terms.begin(), terms.end());
+    terms.erase(std::unique(terms.begin(), terms.end()), terms.end());
+    e.query_terms = terms.size();
+    if (terms.empty()) return e;
+
+    const std::uint32_t cid = id.get();
+    if (cid >= chunks_.size()) return e;   // unknown chunk: an empty explanation
+
+    e.terms = bm25_.explain_doc(terms, cid);
+    e.matched_terms = e.terms.size();
+    for (const auto& t : e.terms) e.lexical_score += t.contribution;
+
+    // Dense half, when there is one. Reuses the stored chunk embedding rather
+    // than re-embedding its text, so the number is exactly what dense_search
+    // would have scored.
+    if (embedder_ && !chunks_[cid].embedding.empty()) {
+        if (auto qv = embedder_->embed_one(std::string(query))) {
+            dense::normalize(*qv);
+            e.dense_score = dense::dot(*qv, chunks_[cid].embedding);
+            e.has_dense = true;
+        }
+    }
+    return e;
+}
 
 void Corpus::ensure_packed() const {
     std::lock_guard lz(lazy_mu_);
@@ -731,6 +802,13 @@ Result<store::Container> Corpus::snapshot_locked() const {
         // holding two incompatible chunk granularities. Both are ingest policy
         // and both round-trip.
         m["contextual"]     = cfg_.contextual;
+        // The chunking MODE is ingest policy too, and was missing for exactly the
+        // same reason the geometry was: a corpus built with `proposition` (or
+        // `semantic`) reopened as `fixed` and chunked new documents on a
+        // different granularity from the ones already stored.
+        m["chunking"] = cfg_.chunking == CorpusConfig::Chunking::proposition ? "proposition"
+                      : cfg_.chunking == CorpusConfig::Chunking::semantic    ? "semantic"
+                                                                             : "fixed";
         m["chunk"] = { {"max_lines", cfg_.chunk.max_lines},
                        {"max_chars", cfg_.chunk.max_chars},
                        {"overlap_lines", cfg_.chunk.overlap_lines},
@@ -814,6 +892,12 @@ Result<Corpus> Corpus::load(const std::string& path) {
             c.cfg_.hnsw_threshold = m.value("hnsw_threshold", c.cfg_.hnsw_threshold);
             c.cfg_.embed_batch    = m.value("embed_batch", c.cfg_.embed_batch);
             c.cfg_.contextual     = m.value("contextual", c.cfg_.contextual);
+            if (m.contains("chunking")) {
+                const std::string mode = m.value("chunking", std::string("fixed"));
+                c.cfg_.chunking = mode == "proposition" ? CorpusConfig::Chunking::proposition
+                                : mode == "semantic"    ? CorpusConfig::Chunking::semantic
+                                                        : CorpusConfig::Chunking::fixed;
+            }
             if (m.contains("chunk")) {
                 const auto& ck = m["chunk"];
                 c.cfg_.chunk.max_lines       = ck.value("max_lines", c.cfg_.chunk.max_lines);

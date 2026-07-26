@@ -58,6 +58,23 @@ public:
     [[nodiscard]] float score_doc(const std::vector<std::string>& q_terms,
                                   std::uint32_t doc_id) const;
 
+    // Per-term breakdown of score_doc(): which query terms actually matched
+    // this document, and what each contributed to its BM25 score.
+    //
+    // This is the evidence behind a lexical hit. A retrieval system that can
+    // only say "score 7.3" is unauditable; one that can say "7.3, of which 5.1
+    // came from 'pneumonia' (idf 4.2, tf 3)" can be debugged, explained to a
+    // user, and tested. The terms are returned in DESCENDING contribution
+    // order, so the head of the vector is the reason the document ranked.
+    struct TermScore {
+        std::string   term;
+        float         contribution;  // this term's addend in the BM25 sum
+        float         idf;           // its inverse document frequency
+        std::uint32_t tf;            // its frequency in this document
+    };
+    [[nodiscard]] std::vector<TermScore>
+    explain_doc(const std::vector<std::string>& q_terms, std::uint32_t doc_id) const;
+
     // For each doc in `docs`, how many of the DISTINCT terms in `q_terms`
     // occur in it, written to `out` (same order, same size).
     //

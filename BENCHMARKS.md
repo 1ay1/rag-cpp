@@ -78,6 +78,28 @@ found it:
 | `feature_rerank` coverage weight 0.4 (a guess) | ArguAna nDCG@10 **0.3275** | **0.3628** |
 | MMR selection `O(k²n)` | k=100: **2727 ms/query** | **66 ms/query** |
 
+## Chunking strategy, measured
+
+`CorpusConfig::Chunking` offers `fixed` (structural), `semantic` (topic drift),
+and `proposition` (one atomic statement per chunk). Popular RAG guides recommend
+proposition chunking; on general IR benchmarks it **loses**, and by a lot.
+Measured with `Pipeline::standard()`:
+
+| Chunking | SciFact nDCG@10 | chunks | NFCorpus nDCG@10 | chunks |
+|----------|-----------------|--------|------------------|--------|
+| **`fixed`** (default) | **0.6809** | 5183 | **0.3261** | 3633 |
+| `semantic` | 0.6703 | 8866 | 0.3233 | 5195 |
+| `proposition` | 0.5887 | 62624 | 0.2895 | 56341 |
+
+That is **−0.092 / −0.037 nDCG@10 for a 12× larger index**. The mechanism is
+straightforward: BM25 scores a one-sentence chunk on almost no term evidence, and
+splitting a document into twelve pieces splits its term statistics with it.
+
+`proposition` is still shipped and reachable (`--proposition`, or
+`CorpusConfig::chunking`) because precision-per-unit is genuinely what
+claim-verification workloads want — but it is opt-in, it is not the default, and
+these numbers are why.
+
 ### The coverage-weight sweep
 
 `feature_rerank` blends `(1-w)·fusion + w·term_coverage`. The shipped default was

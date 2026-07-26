@@ -89,6 +89,45 @@ float Bm25Index::idf(std::size_t n_t) const {
                                              (static_cast<double>(n_t) + 0.5)));
 }
 
+std::vector<Bm25Index::TermScore>
+Bm25Index::explain_doc(const std::vector<std::string>& q_terms,
+                       std::uint32_t doc_id) const {
+    std::vector<TermScore> out;
+    auto dl_it = doc_len_.find(doc_id);
+    if (dl_it == doc_len_.end()) return out;
+    const float dl = static_cast<float>(dl_it->second);
+    const float avgdl = avgdl_ > 0 ? avgdl_ : 1.0f;
+    const float k1 = params_.k1, b = params_.b;
+
+    // Distinct terms only: a term repeated in the query contributes once to the
+    // BM25 sum, so listing it twice would double-count in the explanation.
+    std::vector<std::string> uniq = q_terms;
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+
+    out.reserve(uniq.size());
+    for (const auto& term : uniq) {
+        auto pit = postings_.find(term);
+        if (pit == postings_.end()) continue;
+        const auto& plist = pit->second;
+        auto it = std::lower_bound(plist.begin(), plist.end(), doc_id,
+            [](const Posting& p, std::uint32_t d) { return p.doc < d; });
+        if (it == plist.end() || it->doc != doc_id) continue;
+        // Identical arithmetic to score_doc: an explanation that does not sum to
+        // the score it explains is worse than no explanation at all.
+        const float f   = static_cast<float>(it->tf);
+        const float num = f * (k1 + 1.0f);
+        const float den = f + k1 * (1.0f - b + b * dl / avgdl);
+        const float id  = idf(plist.size());
+        out.push_back(TermScore{term, id * (num / den), id, it->tf});
+    }
+    std::sort(out.begin(), out.end(), [](const TermScore& a, const TermScore& b2) {
+        if (a.contribution != b2.contribution) return a.contribution > b2.contribution;
+        return a.term < b2.term;   // total order, so output is deterministic
+    });
+    return out;
+}
+
 void Bm25Index::term_coverage(const std::vector<std::string>& q_terms,
                               std::span<const std::uint32_t> docs,
                               std::vector<std::uint32_t>& out) const {

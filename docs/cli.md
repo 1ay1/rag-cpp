@@ -4,8 +4,8 @@ The `ragcpp` binary (built to `build/cli/ragcpp`) is a thin wrapper over the
 library. It has five subcommands.
 
 ```
-ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic] [--contextual]
-ragcpp query <db.ragdb> "<query>" [-k N] [--mmr]
+ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic] [--proposition] [--contextual]
+ragcpp query <db.ragdb> "<query>" [-k N] [--mmr] [--explain]
 ragcpp serve <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]
 ragcpp eval  <beir-dir> [--split=test]
 ragcpp info  <db.ragdb>
@@ -27,6 +27,7 @@ self-contained `<out.ragdb>`. Reopening it later never rebuilds.
 |------|--------|
 | `--ext=.md` | Restrict to a file **extension**. Accepts `.md`, `md`, and `*.md` alike. (The old `--glob` spelling still works but only ever matched by extension.) |
 | `--semantic` | Use the semantic chunker — place boundaries where the topic drifts, rather than at fixed token windows. More self-contained chunks on prose; costs a similarity pass. See [Configuration](configuration.md#chunking). |
+| `--proposition` | Index one **atomic statement** per chunk. Maximises precision-per-unit for claim-shaped queries — but it **loses on general IR**: −0.092 nDCG@10 on SciFact for a 12× larger index ([BENCHMARKS.md](../BENCHMARKS.md#chunking-strategy-measured)). Opt in only if you have measured a win on your data. |
 | `--contextual` | [Contextual Retrieval](configuration.md#contextual-retrieval): situate each chunk in its document before indexing. The CLI has no LLM binding, so this uses the deterministic extractive context. Costs ~3× ingest — measure before enabling. |
 
 ## `query` — search a corpus
@@ -41,6 +42,27 @@ Reopens `<db.ragdb>` and prints the top-`k` hits with scores and provenance.
 |------|---------|--------|
 | `-k N` | 10 | Number of results. |
 | `--mmr` | off | Use the `quality()` pipeline (MMR diversity) instead of `standard()`. See [The Pipeline](pipeline.md). |
+| `--explain` | off | Print **why** each hit ranked: the query terms it matched and what each contributed to its BM25 score. The contributions sum exactly to the score shown. |
+
+### Explaining a result
+
+```sh
+ragcpp query corpus.ragdb "hybrid retrieval fusion" -k 3 --explain
+```
+
+```
+  [6.441] ./docs/retrieval.md      pipeline runs them **concurrently** — hybrid latency is
+          chunk 9: lexical 6.44 (3/3 terms: fusion 4.07, hybrid 1.25, retriev 1.12)
+```
+
+Read it as: this chunk matched all three query terms, and `fusion` — the rarest,
+most discriminative of them — supplied most of the score. Note `retriev`: terms
+are shown **post-stemming**, which is exactly what makes a tokenizer mismatch
+visible rather than mysterious.
+
+The same data is available programmatically via `Corpus::explain(query, chunk)`,
+which returns per-term contributions, IDF, term frequency, and the dense cosine
+when an embedder is attached.
 
 ## `serve` — run an RCP server
 

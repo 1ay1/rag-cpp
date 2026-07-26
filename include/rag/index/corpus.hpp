@@ -51,7 +51,33 @@ struct CorpusConfig {
     // `semantic` uses the embedder when one is attached and falls back to
     // lexical (Jaccard) drift otherwise, so it never becomes a hard dependency
     // on an embedding backend.
-    enum class Chunking { fixed, semantic };
+    //
+    // `proposition` goes further and indexes ATOMIC STATEMENTS: one chunk per
+    // self-contained fact. It maximises precision — a retrieved unit carries
+    // exactly one claim, so nothing irrelevant rides along with it — which is
+    // what fact-checking and claim-verification workloads want.
+    //
+    // IT IS NOT A FREE WIN, AND ON GENERAL IR IT LOSES. MEASURED with
+    // Pipeline::standard() over BEIR (nDCG@10 / chunk count):
+    //
+    //             SciFact                    NFCorpus
+    //   fixed        0.6809  (  5183)          0.3261  ( 3633)
+    //   semantic     0.6703  (  8866)          0.3233  ( 5195)
+    //   proposition  0.5887  ( 62624)          0.2895  (56341)
+    //
+    // That is -0.092 and -0.037 nDCG@10 for a 12x larger index. The mechanism
+    // is straightforward: BM25 scores a one-sentence chunk on almost no term
+    // evidence, and splitting a document into 12 pieces splits its term
+    // statistics with it. Enable this only if your queries are claim-shaped and
+    // you have measured a win on YOUR data — the numbers above are the reason
+    // it is not the default and never will be.
+    //
+    // The built-in splitter is deterministic and dependency-free (sentence
+    // segmentation with pronoun-free heuristics). Set a propositionizer via
+    // set_propositionizer() to use an LLM instead; as with the contextualizer,
+    // a failing seam degrades to the deterministic splitter rather than
+    // failing ingest.
+    enum class Chunking { fixed, semantic, proposition };
     Chunking               chunking = Chunking::fixed;
     text::SemanticChunkOptions semantic{};
 
@@ -130,6 +156,18 @@ public:
     void set_contextualizer(text::Contextualizer c) { contextualizer_ = std::move(c); }
     [[nodiscard]] bool has_contextualizer() const noexcept {
         return static_cast<bool>(contextualizer_);
+    }
+
+    // Attach an LLM to split documents into atomic propositions. Only consulted
+    // when cfg.chunking is Chunking::proposition; without one, ingest uses the
+    // deterministic sentence splitter, which needs no model and never fails.
+    // A propositionizer that errors on a document falls back to that splitter
+    // for THAT document rather than failing the ingest — same contract as the
+    // contextualizer, for the same reason: a flaky model must not be able to
+    // reject a document.
+    void set_propositionizer(text::PropositionFn p) { propositionizer_ = std::move(p); }
+    [[nodiscard]] bool has_propositionizer() const noexcept {
+        return static_cast<bool>(propositionizer_);
     }
 
     // Ingest a document: chunk it, assign ids, index lexically, and (if an
@@ -266,6 +304,40 @@ public:
     }
     [[nodiscard]] const text::Tokenizer& tokenizer() const noexcept { return bm25_.tokenizer(); }
 
+    // The ingest policy in force — chunking mode and geometry, contextual flag,
+    // BM25 params. Needed to answer "what settings was this corpus built with?"
+    // after a load(), which is otherwise unanswerable: the config round-trips
+    // through META precisely so a reopened corpus keeps chunking new documents
+    // the way the stored ones were chunked.
+    [[nodiscard]] const CorpusConfig& config() const noexcept { return cfg_; }
+
+    // ── Explainability ──────────────────────────────────────────────────────
+    // Why did this chunk come back for this query?
+    //
+    // A ranked list with no justification is unauditable: you cannot tell a
+    // relevance bug from a tokenizer bug from a scoring bug, and you cannot show
+    // a user why they are reading what they are reading. This answers it with
+    // the actual evidence — which query terms matched, what each contributed to
+    // BM25, and the dense cosine when an embedder is attached.
+    //
+    // Costs one index lookup per query term plus (optionally) one embedding, so
+    // it is a debugging/UI call, not something to run inside a hot loop.
+    struct Explanation {
+        ChunkId                             chunk = ChunkId::invalid();
+        std::vector<lexical::Bm25Index::TermScore> terms;   // desc contribution
+        float  lexical_score = 0.0f;   // sum of terms[].contribution
+        float  dense_score   = 0.0f;   // cosine, 0 when no embedder
+        bool   has_dense     = false;
+        std::size_t matched_terms = 0; // distinct query terms present
+        std::size_t query_terms   = 0; // distinct query terms asked for
+
+        // One-line human summary, e.g.
+        //   "chunk 12: lexical 7.31 (3/4 terms: pneumonia 5.10, chest 1.42, ...)"
+        [[nodiscard]] std::string summary() const;
+    };
+
+    [[nodiscard]] Explanation explain(std::string_view query, ChunkId id) const;
+
     // Distinct-query-term coverage for a candidate set, answered from the
     // inverted index rather than by re-tokenizing each candidate's text.
     // See Bm25Index::term_coverage.
@@ -318,6 +390,7 @@ private:
     // deterministic extractive context". Not serialized — it is a backend
     // binding like embedder_, and the CONTEXT it produced is what persists.
     text::Contextualizer              contextualizer_;
+    text::PropositionFn               propositionizer_;
     std::vector<Document>             docs_;
     std::vector<Chunk>                chunks_;
     lexical::Bm25Index                bm25_{cfg_.bm25, cfg_.tokenize};

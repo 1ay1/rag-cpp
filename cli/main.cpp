@@ -1,7 +1,7 @@
 // cli/main.cpp — the `ragcpp` turnkey command-line tool.
 //
-//   ragcpp index  <dir> <out.ragdb> [--ext=.md] [--semantic]
-//   ragcpp query  <db.ragdb> "<query>" [-k N] [--mmr]
+//   ragcpp index  <dir> <out.ragdb> [--ext=.md] [--semantic] [--proposition]
+//   ragcpp query  <db.ragdb> "<query>" [-k N] [--mmr] [--explain]
 //   ragcpp serve  <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]
 //   ragcpp eval   <beir-dir> [--split=test]
 //   ragcpp info   <db.ragdb>
@@ -28,8 +28,8 @@ int usage() {
     std::printf(
         "ragcpp — a type-theoretic RAG engine\n\n"
         "usage:\n"
-        "  ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic] [--contextual]\n"
-        "  ragcpp query <db.ragdb> \"<query>\" [-k N] [--mmr]\n"
+        "  ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic] [--proposition] [--contextual]\n"
+        "  ragcpp query <db.ragdb> \"<query>\" [-k N] [--mmr] [--explain]\n"
         "  ragcpp serve <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]\n"
         "  ragcpp eval  <beir-dir> [--split=test]\n"
         "  ragcpp info  <db.ragdb>\n"
@@ -56,6 +56,9 @@ int cmd_index(const std::vector<std::string>& args) {
     rag::index::CorpusConfig ccfg;
     if (flag(args, "--semantic"))
         ccfg.chunking = rag::index::CorpusConfig::Chunking::semantic;
+    // --proposition wins if both are given: it is the more specific request.
+    if (flag(args, "--proposition"))
+        ccfg.chunking = rag::index::CorpusConfig::Chunking::proposition;
     // Contextual Retrieval (Anthropic 2024): situate each chunk in its document
     // before indexing. No model required — the CLI has no LLM binding, so this
     // uses the deterministic extractive context.
@@ -104,9 +107,16 @@ int cmd_query(const std::vector<std::string>& args) {
     }
     if (hits.size() > k) hits.resize(k);
     std::printf("query: %s  (%zu results)\n", q.c_str(), hits.size());
+    const bool explain = flag(args, "--explain");
     for (const auto& h : hits) {
         auto r = corpus->resolve(h);
         std::printf("  [%.3f] %-24s %.70s\n", h.score.get(), r.uri.c_str(), r.text.c_str());
+        // Why this hit ranked: the matched terms and their BM25 contributions.
+        // The contributions sum to the score printed above.
+        if (explain) {
+            auto e = corpus->explain(q, h.chunk);
+            std::printf("          %s\n", e.summary().c_str());
+        }
     }
     return 0;
 }

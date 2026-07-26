@@ -1099,6 +1099,107 @@ TEST(tombstone_and_metadata_filter_compose) {
     CHECK(!contains_doc(*hits, c, victim));
 }
 
+// ─── Proposition chunking and explainability ────────────────────────
+
+TEST(proposition_chunking_is_reachable_from_config) {
+    // proposition_chunk() shipped for a long time with no way to select it:
+    // CorpusConfig::Chunking had only {fixed, semantic}, so the function was
+    // dead code from any caller's point of view.
+    const std::string body =
+        "Aspirin reduces fever. It also thins the blood. Ibuprofen is a different drug. "
+        "Ibuprofen reduces inflammation. Paracetamol does not thin the blood.";
+
+    rag::index::CorpusConfig fixed_cfg;
+    rag::index::Corpus fixed{fixed_cfg};
+    REQUIRE(fixed.add_document("a", body).has_value());
+    REQUIRE(fixed.build().has_value());
+
+    rag::index::CorpusConfig prop_cfg;
+    prop_cfg.chunking = rag::index::CorpusConfig::Chunking::proposition;
+    rag::index::Corpus prop{prop_cfg};
+    REQUIRE(prop.add_document("a", body).has_value());
+    REQUIRE(prop.build().has_value());
+
+    // One chunk per atomic statement: strictly more chunks than the structural
+    // chunker produced for the same text.
+    CHECK(prop.chunk_count() > fixed.chunk_count());
+}
+
+TEST(chunking_mode_round_trips_through_meta) {
+    // The MODE is ingest policy, like the geometry that was fixed earlier: a
+    // corpus built with `proposition` that reopened as `fixed` would chunk newly
+    // added documents on a different granularity from the ones already stored.
+    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp")
+                     + "/ragcpp_chunkmode.ragdb";
+    {
+        rag::index::CorpusConfig cfg;
+        cfg.chunking = rag::index::CorpusConfig::Chunking::proposition;
+        rag::index::Corpus c{cfg};
+        REQUIRE(c.add_document("a", "One fact here. Another fact there.").has_value());
+        REQUIRE(c.build().has_value());
+        REQUIRE(c.save(path).has_value());
+    }
+    auto re = rag::index::Corpus::load(path);
+    REQUIRE(re.has_value());
+    CHECK(re->config().chunking == rag::index::CorpusConfig::Chunking::proposition);
+    std::remove(path.c_str());
+}
+
+TEST(explain_reconciles_with_the_search_score) {
+    // An explanation whose parts do not sum to the score it explains is worse
+    // than no explanation: it would send you hunting a scoring bug that is
+    // actually an explaining bug. The per-term contributions must add up to the
+    // score lexical_search actually returned.
+    rag::index::Corpus c;
+    REQUIRE(c.add_document("a", "Pneumonia inflames the air sacs in the lungs.").has_value());
+    REQUIRE(c.add_document("b", "A chest x-ray showed fluid in the lungs from pneumonia.").has_value());
+    REQUIRE(c.add_document("c", "Risotto is made by toasting rice and adding stock.").has_value());
+    REQUIRE(c.build().has_value());
+
+    const std::string q = "pneumonia lungs chest";
+    auto hits = c.lexical_search(q, 3);
+    REQUIRE(!hits.empty());
+    for (const auto& h : hits) {
+        auto e = c.explain(q, h.chunk);
+        CHECK_EQ(e.chunk.get(), h.chunk.get());
+        CHECK(std::fabs(e.lexical_score - h.score.get()) < 1e-4f);
+        CHECK(e.matched_terms > 0);
+        CHECK(e.matched_terms <= e.query_terms);
+        // Contributions are sorted descending, so the head is the reason it won.
+        for (std::size_t i = 1; i < e.terms.size(); ++i)
+            CHECK(e.terms[i - 1].contribution >= e.terms[i].contribution);
+        // And they sum to the reported lexical score.
+        float sum = 0.0f;
+        for (const auto& t : e.terms) sum += t.contribution;
+        CHECK(std::fabs(sum - e.lexical_score) < 1e-4f);
+    }
+}
+
+TEST(explain_handles_unknown_chunk_and_empty_query) {
+    rag::index::Corpus c;
+    REQUIRE(c.add_document("a", "some indexed text here").has_value());
+    REQUIRE(c.build().has_value());
+    // Unknown chunk id: an empty explanation, not a crash or a bogus score.
+    auto none = c.explain("text", rag::ChunkId{9999});
+    CHECK_EQ(none.matched_terms, std::size_t{0});
+    CHECK(none.terms.empty());
+    // Empty query: nothing to attribute.
+    auto empty = c.explain("", rag::ChunkId{0});
+    CHECK_EQ(empty.query_terms, std::size_t{0});
+    CHECK(empty.terms.empty());
+}
+
+TEST(explain_summary_is_human_readable) {
+    rag::index::Corpus c;
+    REQUIRE(c.add_document("a", "quantum entanglement links distant particles").has_value());
+    REQUIRE(c.build().has_value());
+    auto e = c.explain("quantum entanglement", rag::ChunkId{0});
+    auto s = e.summary();
+    CHECK(s.find("chunk 0") != std::string::npos);
+    CHECK(s.find("lexical") != std::string::npos);
+    CHECK(s.find("terms") != std::string::npos);
+}
+
 TEST(hnsw_presets_are_ordered_points_on_the_curve) {
     using C = rag::index::HnswConfig;
     // fast < balanced < accurate on the recall knobs; compact drops floats.
