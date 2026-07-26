@@ -1,6 +1,7 @@
 // rag/pipeline/pipeline.cpp — stage implementations + the standard pipeline.
 
 #include "rag/pipeline/pipeline.hpp"
+#include "rag/rerank/mmr.hpp"
 
 #include <algorithm>
 #include <thread>
@@ -242,6 +243,24 @@ Pipeline Pipeline::standard_with(HybridRetrieveConfig cfg) {
     p.add(std::make_shared<HybridRetrieveStage>(std::move(cfg)))
      .add(std::make_shared<FilterStage>())
      .add(std::make_shared<RerankStage>("feature_rerank", feature_rerank))
+     .add(std::make_shared<TopKStage>());
+    return p;
+}
+
+Pipeline Pipeline::quality(float mmr_lambda) {
+    return quality_with(HybridRetrieveConfig{}, mmr_lambda);
+}
+
+Pipeline Pipeline::quality_with(HybridRetrieveConfig cfg, float mmr_lambda) {
+    Pipeline p;
+    p.add(std::make_shared<HybridRetrieveStage>(std::move(cfg)))
+     .add(std::make_shared<FilterStage>())
+     .add(std::make_shared<RerankStage>("feature_rerank", feature_rerank))
+     // MMR runs on the RELEVANCE-ORDERED candidate pool, before the trim to k.
+     // Order matters: after TopKStage there would be nothing left to diversify
+     // — the duplicates it exists to displace would already have been kept and
+     // the alternatives already discarded.
+     .add(rerank::make_mmr_stage(mmr_lambda))
      .add(std::make_shared<TopKStage>());
     return p;
 }

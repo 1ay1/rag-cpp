@@ -88,14 +88,56 @@ mmr(const index::Corpus& corpus, std::span<const Hit> candidates, MmrConfig cfg)
     return out;
 }
 
+namespace {
+
+// MMR cannot be a RerankStage, and the reason is subtle enough that it shipped
+// broken: RerankStage RE-SORTS the candidates by score immediately after its
+// callback returns.
+//
+//     if (auto r = fn_(...); !r) return ...;
+//     std::sort(candidates, by descending score);      // <-- destroys MMR
+//
+// That is correct for a reranker, whose whole output IS the new scores. But
+// MMR does not rescore anything — it reorders, and its result is carried
+// entirely by the ORDER of the returned vector. Sorting by score afterwards
+// throws that away and restores the pure-relevance ranking, so the stage ran,
+// the trace showed it running, and the output was identical to no MMR at all
+// (measured: 2 of 4 distinct facets in the top 8, exactly the same as
+// standard()).
+//
+// A first-class stage owns its own Context and is not post-processed, so the
+// order it produces is the order that survives. It also gets access to ctx.k,
+// which the RerankStage callback signature does not carry — letting MMR select
+// the k slots that will actually be returned rather than permuting the whole
+// candidate pool.
+class MmrStage final : public pipeline::RetrievalStage {
+public:
+    MmrStage(float lambda, std::string label)
+        : lambda_(lambda), label_(std::move(label)) {}
+
+    std::string_view name() const noexcept override { return label_; }
+
+    Result<pipeline::Context> process(pipeline::Context ctx) const override {
+        if (!ctx.corpus || ctx.candidates.empty()) return ctx;
+        MmrConfig cfg;
+        cfg.lambda = lambda_;
+        // Select exactly the slots that will survive. A pool wider than k is
+        // what gives MMR alternatives to swap in.
+        cfg.k = ctx.k ? ctx.k : ctx.candidates.size();
+        ctx.candidates = mmr(*ctx.corpus, ctx.candidates, cfg);
+        return ctx;
+    }
+
+private:
+    float       lambda_;
+    std::string label_;
+};
+
+} // namespace
+
 pipeline::StagePtr
 make_mmr_stage(float lambda, std::string label) {
-    return std::make_shared<pipeline::RerankStage>(std::move(label),
-        [lambda](std::string_view, std::vector<Hit>& cands, const index::Corpus& corpus) -> Result<void> {
-            MmrConfig cfg; cfg.lambda = lambda; cfg.k = cands.size();
-            cands = mmr(corpus, cands, cfg);
-            return {};
-        });
+    return std::make_shared<MmrStage>(lambda, std::move(label));
 }
 
 } // namespace rag::rerank

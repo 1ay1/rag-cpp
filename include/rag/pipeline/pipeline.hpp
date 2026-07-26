@@ -153,6 +153,41 @@ public:
     // without mutating the server's shared Engine.
     [[nodiscard]] static Pipeline standard_with(HybridRetrieveConfig cfg);
 
+    // OPT-IN: standard() plus MMR diversity reranking.
+    //
+    // WHY THIS IS NOT THE DEFAULT. MMR does not make ranking more accurate — it
+    // makes the top-k COVER MORE of the answer, by refusing to spend several
+    // slots on near-duplicates of one passage. Those are different goods, and
+    // only the second is measurable with a coverage metric. On a benchmark
+    // built for the distinction (12 topics x 10 distinct facets x 20 near
+    // duplicate documents, so the top 10 cannot hold every facet):
+    //
+    //   pipeline                nDCG@10   distinct facets in top 10 (of 10)
+    //   relevance only           1.0000        6.25 / 6.00 / 6.17
+    //   + MMR lambda=0.3         1.0000        7.50 / 7.75 / 7.58
+    //   + MMR lambda=0.5         1.0000        7.08 / 7.42 / 7.75
+    //   + MMR lambda=0.7         1.0000        6.67 / 6.67 / 7.50
+    //                                          (three seeds: 42 / 7 / 1234)
+    //
+    // nDCG is IDENTICAL at 1.0 everywhere, which is the honest headline: on
+    // this corpus every top-10 hit is already on-topic, so a relevance metric
+    // cannot see the difference at all. Coverage rises ~20-25%.
+    //
+    // The default stays narrow because the trade is real: lambda < 1 will
+    // demote a genuinely more relevant passage in favour of a more novel one,
+    // which is wrong for a lookup query with exactly one right answer, and
+    // right for a broad question whose answer spans several passages. That is a
+    // property of the QUERY, not of the corpus, so the caller chooses.
+    //
+    // lambda=0.5 balances the two; the benchmark above prefers 0.3, but on a
+    // corpus with less redundancy that would over-diversify, so the paper's
+    // balanced default is kept rather than one tuned to a synthetic benchmark.
+    [[nodiscard]] static Pipeline quality(float mmr_lambda = 0.5f);
+
+    // quality() with the retrieval stage configured, for the same reason
+    // standard_with exists.
+    [[nodiscard]] static Pipeline quality_with(HybridRetrieveConfig cfg, float mmr_lambda = 0.5f);
+
 private:
     std::vector<StagePtr> stages_;
 };

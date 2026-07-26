@@ -2557,6 +2557,86 @@ TEST(wal_checkpoint_snapshots_then_truncates) {
     std::remove(db.c_str()); std::remove(log.c_str());
 }
 
+// ── Opt-in quality pipeline (MMR diversity) ──────────────────────────────
+
+namespace {
+
+// A corpus of `facets` distinct sub-answers, each duplicated `dupes` times.
+// Ranking by pure relevance fills the top-k with copies of one facet; the whole
+// point of MMR is to spend those slots on different facets instead.
+rag::Engine faceted_engine(int facets, int dupes) {
+    rag::Engine e;
+    for (int f = 0; f < facets; ++f)
+        for (int d = 0; d < dupes; ++d)
+            e.add("f" + std::to_string(f) + "_d" + std::to_string(d),
+                  "topicX facet" + std::to_string(f) + " content variant " + std::to_string(d));
+    e.build();
+    return e;
+}
+
+std::size_t distinct_facets(const std::vector<rag::SearchResult>& hits) {
+    std::set<std::string> f;
+    for (const auto& h : hits) f.insert(h.uri.substr(0, h.uri.find('_')));
+    return f.size();
+}
+
+} // namespace
+
+TEST(quality_pipeline_diversifies_more_than_standard) {
+    auto engine = faceted_engine(4, 10);
+
+    engine.with_pipeline(rag::pipeline::Pipeline::standard());
+    auto plain = engine.search("topicX", 8);
+    REQUIRE(plain.has_value());
+
+    engine.with_pipeline(rag::pipeline::Pipeline::quality());
+    auto diverse = engine.search("topicX", 8);
+    REQUIRE(diverse.has_value());
+
+    // Same number of results — diversity must not cost recall.
+    CHECK_EQ(plain->size(), diverse->size());
+    // ...but strictly more of the answer covered. Measured 2/4 vs 4/4.
+    CHECK(distinct_facets(*diverse) > distinct_facets(*plain));
+}
+
+TEST(mmr_lambda_actually_controls_diversity) {
+    // The lambda knob must have real range: at 1.0 MMR is pure relevance, and
+    // as it falls the diversity term must visibly displace near-duplicates. A
+    // knob that does nothing is worse than no knob, because callers tune it and
+    // believe the result.
+    auto engine = faceted_engine(4, 10);
+
+    engine.with_pipeline(rag::pipeline::Pipeline::quality(1.0f));   // pure relevance
+    auto relevance_only = engine.search("topicX", 8);
+    REQUIRE(relevance_only.has_value());
+
+    engine.with_pipeline(rag::pipeline::Pipeline::quality(0.2f));   // diversity-heavy
+    auto diversified = engine.search("topicX", 8);
+    REQUIRE(diversified.has_value());
+
+    CHECK(distinct_facets(*diversified) > distinct_facets(*relevance_only));
+    CHECK_EQ(diversified->size(), std::size_t{8});    // still returns a full k
+}
+
+TEST(quality_pipeline_matches_standard_when_lambda_is_one) {
+    // lambda=1 is pure relevance, so quality() must degenerate EXACTLY to
+    // standard(). If it does not, MMR is perturbing the ranking even when it
+    // was told not to — which would make the diversity knob untrustworthy.
+    auto engine = faceted_engine(4, 10);
+
+    engine.with_pipeline(rag::pipeline::Pipeline::standard());
+    auto plain = engine.search("topicX", 8);
+    REQUIRE(plain.has_value());
+
+    engine.with_pipeline(rag::pipeline::Pipeline::quality(1.0f));
+    auto lam1 = engine.search("topicX", 8);
+    REQUIRE(lam1.has_value());
+
+    REQUIRE(plain->size() == lam1->size());
+    for (std::size_t i = 0; i < plain->size(); ++i)
+        CHECK_EQ((*plain)[i].uri, (*lam1)[i].uri);
+}
+
 int main() {
     std::printf("Running %zu test cases...\n", registry().size());
     for (auto& c : registry()) {
