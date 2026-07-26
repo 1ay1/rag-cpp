@@ -1,6 +1,8 @@
 build/
 build-*/
 .cache/
+.agentty/
+*.agentty_rag_cache.bin
 *.o
 *.a
 compile_commands.json
