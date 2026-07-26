@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -170,6 +171,27 @@ public:
     // top-k were filtered out.
     [[nodiscard]] Result<std::vector<Hit>>
     dense_search(std::string_view query, std::size_t k, const MetaFilter& filter) const;
+
+    // Dense search for MANY queries at once, one result list per query.
+    //
+    // This is the entry point the GPU backend exists for, and the reason it is
+    // a distinct method rather than a loop over dense_search(): scoring q
+    // queries against n candidates is a [q x dim] * [dim x n] matrix product,
+    // which has q times the arithmetic intensity of q separate scans. A single
+    // scan is bandwidth-bound (measured ~47 GB/s on an M1, f32 and f16 alike),
+    // so no amount of kernel tuning helps it; the batch is where a GPU can
+    // actually win. Callers that have several queries in hand — RAG-Fusion /
+    // multi-query, HyDE with several hypotheticals, offline evaluation — should
+    // use this rather than looping.
+    //
+    // Routing is automatic and conservative: this uses the GPU only when there
+    // is no HNSW graph to walk (a graph walk is pointer-chasing and must never
+    // be offloaded), no metadata filter, the batch clears
+    // gpu::min_batch_work(), and a GPU is present. Otherwise it runs the same
+    // threaded NEON path a loop would, so it is never SLOWER than looping.
+    [[nodiscard]] Result<std::vector<std::vector<Hit>>>
+    dense_search_batch(std::span<const std::string> queries, std::size_t k,
+                       const MetaFilter& filter = {}) const;
 
     // ── Resolution / access ─────────────────────────────────────────────────
     [[nodiscard]] const Chunk*    chunk(ChunkId id) const;
@@ -381,6 +403,27 @@ private:
     [[nodiscard]] Result<std::vector<Hit>>
     dense_search_locked(std::string_view query, std::size_t k, const MetaFilter& filter) const;
     [[nodiscard]] Result<void>    build_locked();
+
+    // A contiguous [rows x dim] copy of every embedded chunk's vector, plus the
+    // chunk id each row came from.
+    //
+    // This exists because gpu::score_batch() needs one contiguous matrix while
+    // chunks_ stores each embedding in its own vector. Packing PER CALL was
+    // measured and is a losing trade: at n=200k, dim=384 the pack alone costs
+    // 37 ms against a 46.7 ms CPU scan, so a 32-query batch went 1.70x -> 0.73x
+    // once the copy was counted. It has to be amortized or not done at all.
+    //
+    // Built lazily on first batch use and invalidated by any structural
+    // mutation (via epoch_), so a corpus that never runs a batch query never
+    // pays the memory. Guarded by lazy_mu_, like the other read-path repairs.
+    mutable std::vector<float>         packed_;
+    mutable std::vector<std::uint32_t> packed_ids_;
+    mutable std::size_t                packed_dim_   = 0;
+    mutable std::uint64_t              packed_epoch_ = 0;
+    mutable bool                       packed_valid_ = false;
+
+    // Ensure packed_ reflects the current chunks_. Caller must hold mu_.
+    void ensure_packed() const;
     // Pack the whole corpus into container sections. Caller must hold at least a
     // shared lock; the returned Container owns copies, so the caller can (and
     // should) release the lock before paying for CRC + file I/O.

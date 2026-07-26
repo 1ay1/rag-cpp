@@ -2384,6 +2384,204 @@ TEST(gpu_score_batch_validates_and_routes) {
     CHECK(rag::gpu::min_batch_work() > 0);
 }
 
+// ── Batch dense search (the GPU's production entry point) ─────────────────
+
+// A corpus big enough that the batch path is worth taking, with HNSW disabled
+// so the brute-force scan (the only offloadable shape) is what runs.
+rag::index::Corpus batch_corpus(std::size_t docs, std::size_t dim) {
+    rag::index::CorpusConfig cfg;
+    cfg.hnsw_threshold = 1'000'000;    // force the scan path
+    rag::index::Corpus c{cfg};
+    auto emb = rag::plugin::make_embedder(nlohmann::json{{"type", "hash"}, {"dim", dim}});
+    c.set_embedder(std::move(*emb));
+    for (std::size_t i = 0; i < docs; ++i)
+        c.add_document("d" + std::to_string(i),
+                       "retrieval document number " + std::to_string(i) +
+                       " about vectors graphs indexes and ranking");
+    (void)c.build();
+    return c;
+}
+
+TEST(dense_batch_matches_the_per_query_path_exactly) {
+    // This is the test that matters. dense_search_batch may route to the GPU,
+    // to a packed CPU scan, or to the plain loop, and the caller must not be
+    // able to tell which happened. Anything else makes acceleration a
+    // correctness risk rather than a performance choice.
+    //
+    // THE SIZE HERE IS LOAD-BEARING. The first version of this test used 4000
+    // chunks and passed while never once reaching the GPU: score_batch declines
+    // below gpu::min_batch_work() (2G multiply-adds), so it was silently
+    // asserting that the CPU path equals itself. Driving the real API at 200k
+    // chunks is what exposed the tie-order bug below. The corpus is sized from
+    // min_batch_work() rather than hardcoded so it cannot drift out of range.
+    const std::size_t dim = 384;
+    const std::size_t nq  = 32;
+    const std::size_t need = rag::gpu::min_batch_work() / (nq * dim) + 1000;
+    if (!rag::gpu::available()) return;    // CPU-only machines: covered below
+
+    auto c = batch_corpus(need, dim);
+    std::vector<std::string> queries;
+    for (std::size_t i = 0; i < nq; ++i)
+        queries.push_back("vectors ranking indexes " + std::to_string(i));
+
+    // Confirm the batch really is big enough to be offloaded, so a future
+    // threshold change turns this into a failure rather than a silent no-op.
+    CHECK(nq * c.chunk_count() * dim >= rag::gpu::min_batch_work());
+
+    auto batched = c.dense_search_batch(queries, 10);
+    REQUIRE(batched.has_value());
+    REQUIRE(batched->size() == queries.size());
+
+    for (std::size_t q = 0; q < queries.size(); ++q) {
+        auto one = c.dense_search(queries[q], 10);
+        REQUIRE(one.has_value());
+        REQUIRE((*batched)[q].size() == one->size());
+        for (std::size_t i = 0; i < one->size(); ++i) {
+            // Exact same ids in the same ORDER — not just the same set. Ties
+            // are common with a hash embedder, and an unstable sort made these
+            // two paths disagree on tied hits until dense scoring got a total
+            // order (score desc, then chunk id asc).
+            CHECK_EQ((*batched)[q][i].chunk.get(), (*one)[i].chunk.get());
+            CHECK(std::fabs((*batched)[q][i].score.get() - (*one)[i].score.get()) < 1e-4f);
+        }
+    }
+}
+
+TEST(dense_ranking_breaks_ties_deterministically) {
+    // Documents with identical text score identically, so their relative order
+    // is decided entirely by the tiebreak. Without one, std::partial_sort's
+    // instability leaks the scan's internal layout into the ranking and the
+    // same query returns different orders on different paths/thread counts.
+    rag::index::CorpusConfig cfg;
+    cfg.hnsw_threshold = 1'000'000;
+    rag::index::Corpus c{cfg};
+    auto emb = rag::plugin::make_embedder(nlohmann::json{{"type", "hash"}, {"dim", 64}});
+    c.set_embedder(std::move(*emb));
+    for (std::size_t i = 0; i < 5000; ++i)
+        c.add_document("d" + std::to_string(i), "identical body text for every document");
+    (void)c.build();
+
+    auto first = c.dense_search("identical body text", 10);
+    REQUIRE(first.has_value());
+    REQUIRE(first->size() == 10);
+
+    // Every score is tied, so the ids must come back ascending — and must be
+    // the same on a repeat run.
+    for (std::size_t i = 1; i < first->size(); ++i)
+        CHECK((*first)[i - 1].chunk.get() < (*first)[i].chunk.get());
+
+    for (int rep = 0; rep < 5; ++rep) {
+        auto again = c.dense_search("identical body text", 10);
+        REQUIRE(again.has_value());
+        for (std::size_t i = 0; i < first->size(); ++i)
+            CHECK_EQ((*again)[i].chunk.get(), (*first)[i].chunk.get());
+    }
+}
+
+TEST(dense_batch_honours_filters_and_the_graph) {
+    // The GPU path is only valid for an unfiltered, graph-less scan. With a
+    // filter, results must still be filtered; with HNSW built, the graph must
+    // still be the thing that answers. Both route to the per-query path, and
+    // the point of the test is that routing away does not change the ANSWER.
+    rag::index::CorpusConfig cfg;
+    cfg.hnsw_threshold = 1'000'000;
+    rag::index::Corpus c{cfg};
+    auto emb = rag::plugin::make_embedder(nlohmann::json{{"type", "hash"}, {"dim", 64}});
+    c.set_embedder(std::move(*emb));
+    for (std::size_t i = 0; i < 2000; ++i)
+        c.add_document("d" + std::to_string(i), "document about retrieval and vectors",
+                       {{"lang", i % 2 ? "en" : "fr"}});
+    (void)c.build();
+
+    rag::index::MetaFilter en = [](const rag::Metadata& m) {
+        auto it = m.find("lang");
+        return it != m.end() && it->second == "en";
+    };
+    std::vector<std::string> queries{"retrieval", "vectors"};
+    auto filtered = c.dense_search_batch(queries, 10, en);
+    REQUIRE(filtered.has_value());
+    REQUIRE(filtered->size() == 2);
+    for (const auto& list : *filtered) {
+        CHECK(!list.empty());
+        for (const auto& h : list) {
+            const rag::Chunk* ch = c.chunk(h.chunk);
+            REQUIRE(ch != nullptr);
+            REQUIRE(ch->meta != nullptr);
+            CHECK_EQ(ch->meta->at("lang"), std::string("en"));
+        }
+    }
+}
+
+TEST(dense_batch_sees_documents_added_after_it_ran) {
+    // The packed mirror is a cache keyed on the corpus epoch. If it were not
+    // invalidated on mutation, a batch query would keep answering from a
+    // snapshot taken before the write — stale results that no per-query search
+    // would ever return.
+    auto c = batch_corpus(2500, 64);
+    std::vector<std::string> q{"zzunique marker phrase"};
+
+    auto before = c.dense_search_batch(q, 5);
+    REQUIRE(before.has_value());
+    const std::size_t chunks_before = c.chunk_count();
+
+    c.add_document("marker", "zzunique marker phrase appears only here");
+    (void)c.build();
+    CHECK(c.chunk_count() > chunks_before);
+
+    auto after = c.dense_search_batch(q, 5);
+    REQUIRE(after.has_value());
+    // The new document must be reachable, and must agree with the single-query
+    // path, which has no cache at all.
+    auto single = c.dense_search(q[0], 5);
+    REQUIRE(single.has_value());
+    REQUIRE(!(*after)[0].empty());
+    CHECK_EQ((*after)[0][0].chunk.get(), (*single)[0].chunk.get());
+}
+
+TEST(dense_batch_rejects_a_corpus_without_an_embedder) {
+    rag::index::Corpus c;
+    c.add_document("a", "text");
+    std::vector<std::string> q{"text"};
+    auto r = c.dense_search_batch(q, 5);
+    CHECK(!r.has_value());
+
+    // An empty batch is not an error; it is an empty answer.
+    auto e = c.dense_search_batch(std::vector<std::string>{}, 5);
+    CHECK(e.has_value());
+    CHECK(e->empty());
+}
+
+TEST(dense_batch_matches_with_gpu_disabled) {
+    // The same equivalence must hold on the pure-CPU path, so this test is not
+    // silently vacuous on a machine without a GPU (and so the GPU arm above is
+    // not the only thing ever exercised on a machine with one).
+    //
+    // ORDERING HAZARD: gpu::disable() is a one-way latch with process-global
+    // scope — there is no re-enable, by design (a caller that turned the GPU
+    // off did so because something was wrong with it). So this test compares
+    // against a result captured BEFORE it flips the latch, and the existing
+    // gpu_disable_is_honoured test relies on the same property. Any test that
+    // needs a live GPU must therefore run before this one; tests run in
+    // registration order, so keep GPU-dependent cases above this line.
+    auto c = batch_corpus(3000, 64);
+    std::vector<std::string> queries{"vectors", "ranking", "indexes and graphs"};
+
+    auto with_gpu = c.dense_search_batch(queries, 8);
+    REQUIRE(with_gpu.has_value());
+
+    rag::gpu::disable();
+    CHECK(!rag::gpu::available());
+    auto without = c.dense_search_batch(queries, 8);
+    REQUIRE(without.has_value());
+
+    REQUIRE(with_gpu->size() == without->size());
+    for (std::size_t q = 0; q < without->size(); ++q) {
+        REQUIRE((*with_gpu)[q].size() == (*without)[q].size());
+        for (std::size_t i = 0; i < (*without)[q].size(); ++i)
+            CHECK_EQ((*with_gpu)[q][i].chunk.get(), (*without)[q][i].chunk.get());
+    }
+}
+
 TEST(gpu_disable_is_honoured) {
     // Runs last by construction: disable() is deliberately a ONE-WAY switch, so
     // this test permanently turns the GPU off for the process. A reversible

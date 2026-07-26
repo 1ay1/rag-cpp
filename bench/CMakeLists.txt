@@ -17,3 +17,9 @@ target_link_libraries(ragcpp_gpu_bench PRIVATE ragcpp)
 # CorpusConfig::contextual can be reproduced on any machine.
 add_executable(ragcpp_contextual_bench contextual_bench.cpp)
 target_link_libraries(ragcpp_contextual_bench PRIVATE ragcpp)
+
+# dense_search_batch vs the per-query loop, through the real Corpus API. Also
+# checks the two paths return IDENTICAL rankings, which is how the tied-score
+# ordering bug was found. Runs anywhere; without a GPU it reports ~1.0x.
+add_executable(ragcpp_batch_bench batch_bench.cpp)
+target_link_libraries(ragcpp_batch_bench PRIVATE ragcpp)

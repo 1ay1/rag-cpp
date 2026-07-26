@@ -2,6 +2,7 @@
 
 #include "rag/index/corpus.hpp"
 #include "rag/dense/simd.hpp"
+#include "rag/gpu/device.hpp"
 #include "rag/store/container.hpp"
 #include "rag/util/parallel.hpp"
 
@@ -37,6 +38,13 @@ void Corpus::move_from(Corpus&& o) {
     replaying_ = o.replaying_;
     relink_meta();   // borrowed pointers now point at OUR docs_ storage
     meta_stale_ = false;
+    // The packed mirror is a cache keyed on epoch_, and epoch_ came from `o`.
+    // Not invalidating it here would let a stale (or empty) matrix be accepted
+    // as current, because the epoch it was stamped with is now ours too.
+    packed_valid_ = false;
+    packed_.clear();
+    packed_ids_.clear();
+    packed_dim_ = 0;
 }
 
 Result<DocId> Corpus::add_document(std::string uri, std::string text, Metadata meta, std::string title) {
@@ -220,6 +228,120 @@ Result<void> Corpus::build_locked() {
     return {};
 }
 
+namespace {
+
+// Ranking order for the dense scan: score descending, chunk id ascending.
+//
+// The id tiebreak is not cosmetic. std::partial_sort is NOT stable, so a
+// comparator that only looks at score leaves tied hits in an order decided by
+// the algorithm's internals — which means the ranking depends on how the
+// candidate list happened to be laid out. That made the parallel scan and the
+// batched/GPU scan return the SAME SET in DIFFERENT ORDERS, caught by driving
+// both paths on a 200k-chunk corpus where a hash embedder produces many exact
+// score ties. Identical scores are common in practice (duplicate passages,
+// quantized vectors), so ties must resolve to something stable that does not
+// depend on the execution path or the thread count.
+constexpr auto hit_order = [](const Hit& a, const Hit& b) {
+    if (a.score.get() != b.score.get()) return a.score.get() > b.score.get();
+    return a.chunk.get() < b.chunk.get();
+};
+
+} // namespace
+
+void Corpus::ensure_packed() const {
+    std::lock_guard lz(lazy_mu_);
+    if (packed_valid_ && packed_epoch_ == epoch_) return;
+
+    packed_.clear();
+    packed_ids_.clear();
+    packed_dim_ = 0;
+    for (const auto& ch : chunks_)
+        if (!ch.embedding.empty()) { packed_dim_ = ch.embedding.size(); break; }
+
+    if (packed_dim_ != 0) {
+        packed_.reserve(chunks_.size() * packed_dim_);
+        packed_ids_.reserve(chunks_.size());
+        for (const auto& ch : chunks_) {
+            // Skip ragged rows rather than packing a matrix whose stride lies.
+            // A mixed-dimension corpus is already broken, but it must not turn
+            // into an out-of-bounds GPU read.
+            if (ch.embedding.size() != packed_dim_) continue;
+            packed_.insert(packed_.end(), ch.embedding.begin(), ch.embedding.end());
+            packed_ids_.push_back(ch.id.get());
+        }
+    }
+    packed_epoch_ = epoch_;
+    packed_valid_ = true;
+}
+
+Result<std::vector<std::vector<Hit>>>
+Corpus::dense_search_batch(std::span<const std::string> queries, std::size_t k,
+                           const MetaFilter& filter) const {
+    std::shared_lock lk(mu_);
+    // Empty in, empty out — checked BEFORE the embedder, because asking zero
+    // questions is not a question a missing embedder can fail to answer.
+    if (queries.empty()) return std::vector<std::vector<Hit>>{};
+    if (!embedder_) return fail<std::vector<std::vector<Hit>>>(Errc::unavailable, "no embedder");
+    ensure_linked();
+
+    // The GPU path is only reachable for a plain, unfiltered, graph-less scan.
+    // Everything else falls back to running the existing per-query path, which
+    // is exactly what a caller would have written by hand — so this method is
+    // never worse than the loop it replaces.
+    const bool scan_path = !hnsw_ && !filter;
+    if (scan_path) {
+        ensure_packed();
+        const std::size_t n   = packed_ids_.size();
+        const std::size_t dim = packed_dim_;
+        const std::size_t nq  = queries.size();
+
+        if (n > 0 && dim > 0 && gpu::available() && nq * n * dim >= gpu::min_batch_work()) {
+            // Embed every query first; a partial batch is not worth salvaging.
+            std::vector<float> qmat;
+            qmat.reserve(nq * dim);
+            bool ok = true;
+            for (const auto& q : queries) {
+                auto qv = embedder_->embed_one(q);
+                if (!qv || qv->size() != dim) { ok = false; break; }
+                dense::normalize(*qv);
+                qmat.insert(qmat.end(), qv->begin(), qv->end());
+            }
+
+            if (ok) {
+                std::vector<float> scores(nq * n);
+                if (gpu::score_batch(packed_, qmat, dim, scores)) {
+                    std::vector<std::vector<Hit>> out(nq);
+                    for (std::size_t q = 0; q < nq; ++q) {
+                        // Partial top-k per query over that query's score row.
+                        const float* row = scores.data() + q * n;
+                        std::vector<Hit> hits;
+                        hits.reserve(n);
+                        for (std::size_t i = 0; i < n; ++i)
+                            hits.push_back(Hit{ChunkId{packed_ids_[i]}, Score{row[i]}});
+                        const std::size_t want = std::min(k, hits.size());
+                        std::partial_sort(hits.begin(), hits.begin() + (long)want, hits.end(),
+                                          hit_order);
+                        hits.resize(want);
+                        out[q] = std::move(hits);
+                    }
+                    return out;
+                }
+                // score_batch declining is a ROUTING answer, not an error: fall
+                // through to the CPU path below rather than failing the query.
+            }
+        }
+    }
+
+    std::vector<std::vector<Hit>> out;
+    out.reserve(queries.size());
+    for (const auto& q : queries) {
+        auto r = dense_search_locked(q, k, filter);
+        if (!r) return std::unexpected(r.error());
+        out.push_back(std::move(*r));
+    }
+    return out;
+}
+
 std::vector<Hit> Corpus::lexical_search(std::string_view query, std::size_t k) const {
     std::shared_lock lk(mu_);
     return lexical_search_locked(query, k);
@@ -354,7 +476,7 @@ Result<std::vector<Hit>> Corpus::dense_search_locked(std::string_view query, std
 
     const std::size_t kk = std::min(k, hits.size());
     std::partial_sort(hits.begin(), hits.begin() + static_cast<std::ptrdiff_t>(kk), hits.end(),
-        [](const Hit& a, const Hit& b) { return a.score.get() > b.score.get(); });
+                      hit_order);
     hits.resize(kk);
     return hits;
 }
