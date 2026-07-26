@@ -143,15 +143,30 @@ endif()
 # engine over stdio or HTTP. The SDK is header-only C++23. Prefer a local
 # checkout (RAGCPP_RCP_SDK_DIR, or the sibling ~/projects/rcp/sdk/cpp) so the
 # two repos co-develop; fall back to FetchContent for a standalone build.
+set(RAGCPP_RCP_SDK_TAG "v1.0.1" CACHE STRING
+    "Git tag of the RCP SDK to fetch when no local checkout is present")
 if(RAGCPP_WITH_RCP)
     if(RAGCPP_RCP_SDK_DIR AND EXISTS "${RAGCPP_RCP_SDK_DIR}/include/rcp.hpp")
         add_subdirectory(${RAGCPP_RCP_SDK_DIR} ${CMAKE_BINARY_DIR}/rcp-sdk)
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../rcp/sdk/cpp/include/rcp.hpp")
         add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../rcp/sdk/cpp ${CMAKE_BINARY_DIR}/rcp-sdk)
     else()
+        # PINNED to a tag, not `main`.
+        #
+        # Tracking a branch means the protocol layer of every clean build is
+        # whatever the SDK happened to look like that morning — a build that
+        # succeeds today can fail, or worse silently change wire behaviour,
+        # tomorrow, with nothing in this repository having changed. rag-cpp is
+        # the reference RCP implementation, so a reproducible build of it is
+        # part of what it demonstrates.
+        #
+        # v1.0.1 is the first tag containing the C++ SDK fix for a malformed
+        # request terminating the server process; v1.0.0 still has that bug, so
+        # do NOT lower this pin. Raise it deliberately, when the SDK cuts a
+        # release worth taking.
         FetchContent_Declare(rcp
             GIT_REPOSITORY https://github.com/1ay1/rcp.git
-            GIT_TAG        main
+            GIT_TAG        ${RAGCPP_RCP_SDK_TAG}
             GIT_SHALLOW    TRUE
             SOURCE_SUBDIR  sdk/cpp)
         FetchContent_MakeAvailable(rcp)
