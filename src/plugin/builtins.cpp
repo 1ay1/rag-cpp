@@ -24,7 +24,6 @@
 #include "rag/dense/backends.hpp"
 #include "rag/dense/local_embedder.hpp"
 
-#include <atomic>
 #include <chrono>
 
 namespace rag::plugin {
@@ -191,18 +190,21 @@ void register_rerankers() {
 
 } // namespace
 
-// Register every built-in backend. Idempotent (registration is insert-or-assign)
-// and thread-safe; runs once behind a flag so repeated make_embedder() calls do
-// not re-register on every lookup.
+// Register every built-in backend. Thread-safe and runs exactly once: the
+// function-local static's initialization is guaranteed by the standard to block
+// concurrent callers until it completes, so no thread can observe a
+// half-populated registry (an atomic test-and-set flag would NOT give that — a
+// second caller could return while the first is still registering).
 void ensure_builtins_registered() noexcept {
-    static std::atomic<bool> done{false};
-    bool expected = false;
-    if (!done.compare_exchange_strong(expected, true)) return;
-    register_embedders();
-    register_rerankers();
-    // Polyglot bridge transports (process/http/rest) so {"type":"process", ...}
-    // resolves out of the box.
-    ::rag::bridge::ensure_bridge_registered();
+    static const bool once = [] {
+        register_embedders();
+        register_rerankers();
+        // Polyglot bridge transports (process/http/rest) so {"type":"process", ...}
+        // resolves out of the box.
+        ::rag::bridge::ensure_bridge_registered();
+        return true;
+    }();
+    (void)once;
 }
 
 } // namespace rag::plugin
