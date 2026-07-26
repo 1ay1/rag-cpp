@@ -1200,6 +1200,81 @@ TEST(explain_summary_is_human_readable) {
     CHECK(s.find("terms") != std::string::npos);
 }
 
+// ─── CSV / tabular ingestion ────────────────────────────────────
+
+TEST(csv_parses_rfc4180_quoting) {
+    // The three things that break naive CSV readers, all in one fixture: a
+    // delimiter inside quotes, a NEWLINE inside quotes (so getline() is wrong),
+    // and "" as an escaped quote.
+    const std::string csv =
+        "id,title,body,status\n"
+        "1,Widget,\"A small, useful widget\",open\n"
+        "2,Gadget,\"Line one\nLine two\",closed\n"
+        "3,Doohickey,\"He said \"\"hello\"\" loudly\",open\n";
+    rag::loaders::CsvOptions o;
+    o.title_column = "title"; o.id_column = "id";
+    auto docs = rag::loaders::load_csv_text(csv, "t.csv", o);
+    REQUIRE(docs.has_value());
+    REQUIRE(docs->size() == std::size_t{3});
+
+    CHECK_EQ((*docs)[0].meta["body"], std::string("A small, useful widget"));  // delim in quotes
+    CHECK((*docs)[1].meta["body"].find('\n') != std::string::npos);            // newline in quotes
+    CHECK_EQ((*docs)[2].meta["body"], std::string("He said \"hello\" loudly")); // "" -> "
+    CHECK_EQ((*docs)[0].title, std::string("Widget"));
+    CHECK_EQ((*docs)[0].uri, std::string("t.csv#1"));
+}
+
+TEST(csv_row_becomes_a_document_with_filterable_columns) {
+    // The point of tabular ingestion: structure survives into the query layer.
+    const std::string csv = "id,body,status\n1,alpha,open\n2,beta,closed\n3,gamma,open\n";
+    auto docs = rag::loaders::load_csv_text(csv, "t.csv", {});
+    REQUIRE(docs.has_value());
+    REQUIRE(docs->size() == std::size_t{3});
+
+    rag::index::Corpus c;
+    for (auto& d : *docs)
+        REQUIRE(c.add_document(d.uri, d.text, d.meta, d.title).has_value());
+    REQUIRE(c.build().has_value());
+    CHECK_EQ(c.document_count(), std::size_t{3});   // one doc per ROW
+
+    // Every column is queryable metadata.
+    std::size_t open_rows = 0;
+    for (auto& d : *docs) if (d.meta["status"] == "open") ++open_rows;
+    CHECK_EQ(open_rows, std::size_t{2});
+}
+
+TEST(csv_ragged_row_is_rejected_not_misaligned) {
+    // Silently accepting a short row shifts every subsequent column by one,
+    // which corrupts the data invisibly. A typed error is strictly better.
+    auto bad = rag::loaders::load_csv_text("a,b,c\n1,2\n", "x.csv", {});
+    CHECK(!bad.has_value());
+    CHECK_EQ(bad.error().code, rag::Errc::invalid_argument);
+}
+
+TEST(csv_text_columns_select_what_is_indexed) {
+    // A table with one prose column and several id columns should not index the
+    // ids: they add noise and dilute BM25's term statistics.
+    const std::string csv = "sku,body\nXQ-9911,the quick brown fox\n";
+    rag::loaders::CsvOptions o;
+    o.text_columns = {"body"};
+    auto docs = rag::loaders::load_csv_text(csv, "t.csv", o);
+    REQUIRE(docs.has_value());
+    REQUIRE(docs->size() == std::size_t{1});
+    CHECK((*docs)[0].text.find("quick brown fox") != std::string::npos);
+    CHECK((*docs)[0].text.find("XQ-9911") == std::string::npos);   // not indexed
+    CHECK_EQ((*docs)[0].meta["sku"], std::string("XQ-9911"));      // but still filterable
+}
+
+TEST(csv_without_header_synthesizes_column_names) {
+    rag::loaders::CsvOptions o;
+    o.has_header = false;
+    auto docs = rag::loaders::load_csv_text("alpha,beta\ngamma,delta\n", "t.csv", o);
+    REQUIRE(docs.has_value());
+    REQUIRE(docs->size() == std::size_t{2});
+    CHECK_EQ((*docs)[0].meta["col1"], std::string("alpha"));
+    CHECK_EQ((*docs)[0].meta["col2"], std::string("beta"));
+}
+
 TEST(hnsw_presets_are_ordered_points_on_the_curve) {
     using C = rag::index::HnswConfig;
     // fast < balanced < accurate on the recall knobs; compact drops floats.

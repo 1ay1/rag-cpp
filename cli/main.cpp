@@ -11,8 +11,10 @@
 // network); attach an embedder in code for hybrid. `serve` brings up a
 // conformant RCP/1 endpoint (github.com/1ay1/rcp) over stdio or HTTP.
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -78,7 +80,39 @@ int cmd_index(const std::vector<std::string>& args) {
         if (ext[0] != '.') ext = "." + ext;
         lo.include_ext = {ext};
     }
-    auto docs = rag::loaders::load_directory(dir, lo);
+    // A single CSV/TSV file is ingested ROW-WISE rather than walked as a
+    // directory: each row is an independent record, and chunking a table as
+    // prose would produce chunks spanning unrelated rows. Columns become
+    // filterable metadata. Detected from the path so `ragcpp index data.csv db`
+    // simply works.
+    rag::Result<std::vector<rag::loaders::LoadedDoc>> docs =
+        std::vector<rag::loaders::LoadedDoc>{};
+    {
+        std::filesystem::path p{dir};
+        auto ext_lower = p.extension().string();
+        for (auto& ch : ext_lower) ch = static_cast<char>(std::tolower(ch));
+        const bool is_table = std::filesystem::is_regular_file(p) &&
+                              (ext_lower == ".csv" || ext_lower == ".tsv" || ext_lower == ".tab");
+        if (is_table) {
+            rag::loaders::CsvOptions co;
+            co.title_column = opt(args, "--csv-title", "");
+            co.id_column    = opt(args, "--csv-id", "");
+            if (std::string cols = opt(args, "--csv-text", ""); !cols.empty()) {
+                std::size_t start = 0;
+                while (start <= cols.size()) {
+                    auto comma = cols.find(',', start);
+                    auto piece = cols.substr(start, comma == std::string::npos ? std::string::npos
+                                                                              : comma - start);
+                    if (!piece.empty()) co.text_columns.push_back(piece);
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+            }
+            docs = rag::loaders::load_csv(p, co);
+        } else {
+            docs = rag::loaders::load_directory(dir, lo);
+        }
+    }
     if (!docs) { std::printf("load error: %s\n", docs.error().message.c_str()); return 1; }
 
     std::size_t n = 0;

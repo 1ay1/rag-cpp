@@ -40,6 +40,42 @@ struct LoadedDoc {
 // for binary/unsupported types.
 [[nodiscard]] Result<LoadedDoc> load_file(const std::filesystem::path& path);
 
+// ─── Tabular (CSV/TSV) ───────────────────────────────────────────────
+// A CSV is not prose, and chunking it as prose destroys it: rows are
+// independent records, and a token window that spans a row boundary produces a
+// chunk describing two unrelated things. So each ROW becomes its own document,
+// with every column also attached as filterable metadata — which means the
+// structure survives into the query layer, where you can filter on
+// meta["status"] == "open" instead of hoping the word "open" was retrieved.
+struct CsvOptions {
+    char        delimiter    = ',';    // ';' or '\t' for European CSV / TSV
+    bool        has_header   = true;   // first row names the columns
+    // Columns to concatenate into the searchable text. Empty = every column.
+    // Naming them matters when the table has one prose column and ten id
+    // columns: indexing the ids adds noise and dilutes BM25's term statistics.
+    std::vector<std::string> text_columns;
+    // Column whose value becomes the document title (empty = none).
+    std::string title_column;
+    // Column whose value becomes the uri suffix. Empty = the 1-based row number,
+    // which is always available and always unique.
+    std::string id_column;
+    // Attach every column as metadata, not just the unindexed ones.
+    bool        meta_all_columns = true;
+};
+
+// Parse CSV text into one LoadedDoc per data row.
+//
+// Handles the parts of RFC 4180 that occur in practice: quoted fields, embedded
+// delimiters and newlines inside quotes, and "" as an escaped quote. Returns
+// invalid_argument on a row whose field count does not match the header, rather
+// than silently misaligning every column after the error.
+[[nodiscard]] Result<std::vector<LoadedDoc>>
+load_csv_text(std::string_view csv, const std::string& uri_prefix, const CsvOptions& opts = {});
+
+// Same, reading from a file. The extension picks a default delimiter (.tsv -> tab).
+[[nodiscard]] Result<std::vector<LoadedDoc>>
+load_csv(const std::filesystem::path& path, const CsvOptions& opts = {});
+
 // ─── Directory walk ───────────────────────────────────────────────────────────
 struct DirOptions {
     std::vector<std::string> include_ext = {   // lowercase, with dot

@@ -30,6 +30,32 @@ self-contained `<out.ragdb>`. Reopening it later never rebuilds.
 | `--proposition` | Index one **atomic statement** per chunk. Maximises precision-per-unit for claim-shaped queries — but it **loses on general IR**: −0.092 nDCG@10 on SciFact for a 12× larger index ([BENCHMARKS.md](../BENCHMARKS.md#chunking-strategy-measured)). Opt in only if you have measured a win on your data. |
 | `--contextual` | [Contextual Retrieval](configuration.md#contextual-retrieval): situate each chunk in its document before indexing. The CLI has no LLM binding, so this uses the deterministic extractive context. Costs ~3× ingest — measure before enabling. |
 
+### Indexing a CSV / TSV
+
+Point `index` at a `.csv`, `.tsv`, or `.tab` file and it is ingested **row-wise**
+instead of walked as a directory:
+
+```sh
+ragcpp index tickets.csv tickets.ragdb --csv-title=subject --csv-id=ticket_id
+```
+
+Each **row becomes one document**, and every column is attached as filterable
+metadata. That matters: a table chunked as prose produces chunks spanning
+unrelated rows, and the column structure — the most useful thing about a table —
+is lost. Here it survives into the query layer, so you can filter on
+`meta["status"] == "open"` rather than hoping the word "open" was retrieved.
+
+| Flag | Effect |
+|------|--------|
+| `--csv-title=COL` | Column whose value becomes the document title. |
+| `--csv-id=COL` | Column whose value becomes the uri suffix (default: the row number). |
+| `--csv-text=A,B` | Only these columns are indexed as searchable text. All columns remain filterable metadata. Use this when the table has one prose column and several id columns — indexing opaque ids dilutes BM25's term statistics. |
+
+The parser handles the parts of RFC 4180 that occur in practice: quoted fields,
+delimiters and newlines inside quotes, and `""` as an escaped quote. A row whose
+field count disagrees with the header is a **typed error**, not a silent column
+shift.
+
 ## `query` — search a corpus
 
 ```sh
