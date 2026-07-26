@@ -2637,6 +2637,259 @@ TEST(quality_pipeline_matches_standard_when_lambda_is_one) {
         CHECK_EQ((*plain)[i].uri, (*lam1)[i].uri);
 }
 
+// ── Contextual Retrieval, wired into ingest ───────────────────────────────
+
+// The corpus that makes contextual retrieval matter: a document whose SUBJECT
+// is named once, in the title, and whose body paragraphs never repeat it. This
+// is exactly the failure the paper is about — chunk 2 says "revenue grew 3%"
+// and, ripped out of the document, cannot be attributed to anyone.
+rag::index::Corpus faceless_corpus(bool contextual) {
+    rag::index::CorpusConfig cfg;
+    cfg.contextual = contextual;
+    cfg.chunk.max_lines = 3;      // force the subject out of most chunks
+    cfg.chunk.overlap_lines = 0;
+    cfg.chunk.heading_context = false;   // isolate the contextual signal from
+                                         // the heading breadcrumb, so a pass
+                                         // here cannot be the breadcrumb's doing
+    rag::index::Corpus c{cfg};
+    c.add_document("acme.md",
+        "Acme Corporation\n"
+        "\n"
+        "The quarter closed ahead of plan.\n"
+        "\n"
+        "Revenue grew three percent year over year.\n"
+        "\n"
+        "Headcount was flat across all divisions.\n");
+    c.add_document("globex.md",
+        "Globex Corporation\n"
+        "\n"
+        "The quarter closed behind plan.\n"
+        "\n"
+        "Revenue fell one percent year over year.\n"
+        "\n"
+        "Headcount rose across all divisions.\n");
+    (void)c.build();
+    return c;
+}
+
+TEST(contextual_ingest_puts_the_subject_into_the_index) {
+    // Without it, no chunk but the first carries "acme" at all, so a query for
+    // "acme revenue" can only match on "revenue" — which both documents say.
+    auto plain = faceless_corpus(false);
+    std::size_t plain_with_subject = 0;
+    for (const auto& ch : plain.chunks())
+        if (ch.indexed_text().find("Acme") != std::string::npos) ++plain_with_subject;
+
+    auto ctxd = faceless_corpus(true);
+    std::size_t ctx_with_subject = 0;
+    for (const auto& ch : ctxd.chunks())
+        if (ch.indexed_text().find("Acme") != std::string::npos) ++ctx_with_subject;
+
+    // The point of the feature: strictly more of the document's chunks now
+    // carry the name that disambiguates them. (The first chunk always holds
+    // the title, so this must be a STRICT increase, not merely "some chunk
+    // mentions Acme" — that is true without the feature.)
+    CHECK(ctx_with_subject > plain_with_subject);
+
+    // And the effect is visible through the LEXICAL INDEX, not just the struct:
+    // BM25 is built from indexed_text(), so situating the chunks must change
+    // what a subject-qualified query retrieves.
+    auto plain_hits = plain.lexical_search("acme revenue", 4);
+    auto ctx_hits   = ctxd.lexical_search("acme revenue", 4);
+    auto top_uri = [](const rag::index::Corpus& c, const std::vector<rag::Hit>& h) {
+        return h.empty() ? std::string{} : c.resolve(h[0]).uri;
+    };
+    // Contextualized, the top hit for "acme revenue" is the Acme revenue chunk.
+    REQUIRE(!ctx_hits.empty());
+    CHECK_EQ(top_uri(ctxd, ctx_hits), std::string("acme.md"));
+    const rag::Chunk* top = ctxd.chunk(ctx_hits[0].chunk);
+    REQUIRE(top != nullptr);
+    CHECK(top->text.find("Revenue grew") != std::string::npos);
+    (void)plain_hits;
+}
+
+TEST(contextual_off_by_default) {
+    // The feature costs work at ingest, so it must be opt-in. A default that
+    // silently rewrote every indexed chunk would be a surprise.
+    rag::index::CorpusConfig cfg;
+    CHECK(!cfg.contextual);
+
+    rag::index::Corpus c{cfg};
+    c.add_document("a.md", "Acme Corporation\n\nRevenue grew three percent.\n");
+    (void)c.build();
+    bool any_situated = false;
+    for (const auto& ch : c.chunks())
+        if (ch.context.find("\u2014") != std::string::npos) any_situated = true;
+    CHECK(!any_situated);
+}
+
+TEST(contextual_flag_survives_a_save_load_round_trip) {
+    // A corpus reopened for writing must keep situating what it ingests, or
+    // documents added after a restart are indexed differently from the ones
+    // added before it.
+    auto path = std::filesystem::temp_directory_path() / "ragcpp_ctx_roundtrip.ragdb";
+    {
+        auto c = faceless_corpus(true);
+        REQUIRE(c.save(path.string()).has_value());
+    }
+    auto re = rag::index::Corpus::load(path.string());
+    REQUIRE(re.has_value());
+
+    // The reopened corpus situates NEW documents too. Key on a chunk that does
+    // NOT already contain the subject: the first chunk holds the title anyway,
+    // so counting it would let this test pass with the feature switched off.
+    re->add_document("initech.md",
+        "Initech Corporation\n\nRevenue doubled year over year.\n\nHeadcount fell.\n");
+    (void)re->build();
+    bool situated = false;
+    for (const auto& ch : re->chunks())
+        if (ch.doc.get() == 2 && ch.text.find("Initech") == std::string::npos
+            && ch.indexed_text().find("Initech") != std::string::npos)
+            situated = true;
+    CHECK(situated);
+    std::filesystem::remove(path);
+}
+
+TEST(chunk_geometry_survives_a_save_load_round_trip) {
+    // Found while gating the test above: the chunker's geometry was never
+    // persisted, so a corpus built with max_lines=3 came back at the default
+    // 40 and every document added after the reopen was chunked at a different
+    // granularity than the ones already in the store. Half the store is
+    // sentence-sized and half is page-sized, and BM25 length normalization
+    // sees a corpus that never existed.
+    auto path = std::filesystem::temp_directory_path() / "ragcpp_chunkgeom.ragdb";
+    {
+        rag::index::CorpusConfig cfg;
+        cfg.chunk.max_lines = 3;
+        cfg.chunk.overlap_lines = 0;
+        cfg.chunk.heading_context = false;
+        rag::index::Corpus c{cfg};
+        c.add_document("a.md", "l1\n\nl3\n\nl5\n\nl7\n\nl9\n\nl11\n\nl13\n");
+        REQUIRE(c.save(path.string()).has_value());
+    }
+    auto before_reload = [&] {
+        rag::index::CorpusConfig cfg;
+        cfg.chunk.max_lines = 3;
+        cfg.chunk.overlap_lines = 0;
+        cfg.chunk.heading_context = false;
+        rag::index::Corpus c{cfg};
+        c.add_document("b.md", "l1\n\nl3\n\nl5\n\nl7\n\nl9\n\nl11\n\nl13\n");
+        return c.chunk_count();
+    }();
+
+    auto re = rag::index::Corpus::load(path.string());
+    REQUIRE(re.has_value());
+    const std::size_t existing = re->chunk_count();
+    re->add_document("b.md", "l1\n\nl3\n\nl5\n\nl7\n\nl9\n\nl11\n\nl13\n");
+    // The same body must chunk the same way after a reopen as before it.
+    CHECK_EQ(re->chunk_count() - existing, before_reload);
+    CHECK(before_reload > 1);   // the fixture must actually split, or this proves nothing
+    std::filesystem::remove(path);
+}
+
+TEST(contextualizer_failure_falls_back_instead_of_failing_ingest) {
+    // A flaky model must not be able to reject a document. Every call errors
+    // here; ingest must still succeed and still produce a situating context
+    // from the deterministic extractive backend.
+    rag::index::CorpusConfig cfg;
+    cfg.contextual = true;
+    cfg.chunk.max_lines = 3;
+    cfg.chunk.heading_context = false;
+    rag::index::Corpus c{cfg};
+    std::atomic<int> calls{0};
+    c.set_contextualizer([&](std::string_view, std::string_view) -> rag::Result<std::string> {
+        ++calls;
+        return rag::fail<std::string>(rag::Errc::unavailable, "model down");
+    });
+    auto id = c.add_document("acme.md",
+        "Acme Corporation\n\nRevenue grew three percent.\n\nHeadcount was flat.\n");
+    REQUIRE(id.has_value());
+    CHECK(calls.load() > 0);
+    bool any_ctx = false;
+    for (const auto& ch : c.chunks()) if (!ch.context.empty()) any_ctx = true;
+    CHECK(any_ctx);
+}
+
+TEST(contextualizer_output_reaches_the_index) {
+    // The LLM seam must actually be consulted — not merely accepted and then
+    // ignored in favour of the fallback.
+    rag::index::CorpusConfig cfg;
+    cfg.contextual = true;
+    cfg.chunk.max_lines = 3;
+    cfg.chunk.heading_context = false;
+    rag::index::Corpus c{cfg};
+    c.set_contextualizer([](std::string_view, std::string_view) -> rag::Result<std::string> {
+        return std::string("ZZQMARKER");
+    });
+    c.add_document("a.md", "Acme Corporation\n\nRevenue grew.\n\nHeadcount flat.\n");
+    (void)c.build();
+    bool marked = true;
+    for (const auto& ch : c.chunks())
+        if (ch.indexed_text().find("ZZQMARKER") == std::string::npos) marked = false;
+    CHECK(marked);
+    // ...and it is searchable, i.e. it went through BM25 too.
+    CHECK(!c.lexical_search("zzqmarker", 3).empty());
+}
+
+// ── ChunkLease ────────────────────────────────────────────────────────────
+
+TEST(chunk_lease_blocks_writers_for_its_lifetime) {
+    // chunks() used to hand out a reference into storage after releasing the
+    // lock, so a concurrent add_document() could reallocate the vector under a
+    // bulk consumer (graph/raptor/splade all iterate it for a long time). The
+    // lease keeps the read lock alive, so a writer must wait.
+    rag::index::Corpus c;
+    for (int i = 0; i < 64; ++i)
+        c.add_document("d" + std::to_string(i), "alpha beta gamma document body");
+
+    std::atomic<bool> wrote{false};
+    std::thread w;
+    {
+        auto lease = c.chunks();
+        const std::size_t n = lease.size();
+        const rag::Chunk* base = lease.get().data();
+
+        w = std::thread([&] {
+            // Enough documents to force at least one reallocation.
+            for (int i = 0; i < 512; ++i)
+                c.add_document("w" + std::to_string(i), "delta epsilon inserted while leased");
+            wrote.store(true);
+        });
+
+        // While the lease is held the writer cannot make progress, so the view
+        // stays exactly as taken: same length, same backing storage.
+        for (int i = 0; i < 200; ++i) {
+            CHECK_EQ(lease.size(), n);
+            CHECK(lease.get().data() == base);
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+        CHECK(!wrote.load());   // blocked, as designed
+        // Dropping the lease here releases the read lock and lets it through.
+    }
+
+    w.join();
+    CHECK(wrote.load());
+    CHECK(c.document_count() == std::size_t{64 + 512});
+}
+
+TEST(chunk_lease_iterates_like_the_vector_it_replaced) {
+    // Source compatibility: every existing call site is `for (auto& ch :
+    // corpus.chunks())`, and range-for lifetime-extends the lease temporary, so
+    // the lock is held for the whole loop rather than to the semicolon.
+    rag::index::Corpus c;
+    for (int i = 0; i < 5; ++i) c.add_document("d" + std::to_string(i), "body text here");
+    std::size_t seen = 0;
+    for (const auto& ch : c.chunks()) { (void)ch; ++seen; }
+    CHECK_EQ(seen, c.chunk_count());
+
+    auto lease = c.chunks();
+    CHECK_EQ(lease.size(), seen);
+    CHECK(!lease.empty());
+    const std::vector<rag::Chunk>& as_ref = lease;   // implicit conversion
+    CHECK_EQ(as_ref.size(), seen);
+    CHECK(&lease[0] == &as_ref[0]);
+}
+
 int main() {
     std::printf("Running %zu test cases...\n", registry().size());
     for (auto& c : registry()) {

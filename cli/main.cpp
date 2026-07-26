@@ -28,7 +28,7 @@ int usage() {
     std::printf(
         "ragcpp — a type-theoretic RAG engine\n\n"
         "usage:\n"
-        "  ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic]\n"
+        "  ragcpp index <dir> <out.ragdb> [--ext=.md] [--semantic] [--contextual]\n"
         "  ragcpp query <db.ragdb> \"<query>\" [-k N] [--mmr]\n"
         "  ragcpp serve <db.ragdb> [--http PORT] [--write] [--graph] [--memory] [--feedback] [--all]\n"
         "  ragcpp eval  <beir-dir> [--split=test]\n"
@@ -55,6 +55,10 @@ int cmd_index(const std::vector<std::string>& args) {
     rag::index::CorpusConfig ccfg;
     if (flag(args, "--semantic"))
         ccfg.chunking = rag::index::CorpusConfig::Chunking::semantic;
+    // Contextual Retrieval (Anthropic 2024): situate each chunk in its document
+    // before indexing. No model required — the CLI has no LLM binding, so this
+    // uses the deterministic extractive context.
+    if (flag(args, "--contextual")) ccfg.contextual = true;
     rag::index::Corpus corpus{ccfg};
     rag::loaders::DirOptions lo;
     // --ext restricts by FILE EXTENSION. This was previously spelled --glob,

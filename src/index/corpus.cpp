@@ -25,6 +25,7 @@ void Corpus::relink_meta() {
 void Corpus::move_from(Corpus&& o) {
     cfg_       = std::move(o.cfg_);
     embedder_  = std::move(o.embedder_);
+    contextualizer_ = std::move(o.contextualizer_);
     docs_      = std::move(o.docs_);
     chunks_    = std::move(o.chunks_);
     bm25_      = std::move(o.bm25_);
@@ -86,6 +87,22 @@ Result<DocId> Corpus::add_document_locked(std::string uri, std::string text, Met
         }
         return text::semantic_chunk_lexical(did, stored.text, cfg_.semantic);
     }();
+
+    // Contextual Retrieval, before anything is indexed.
+    //
+    // Order matters and is not arbitrary: indexed_text() is context ⊕ body, and
+    // it is what feeds BOTH bm25_.add() below and the embedder in
+    // embed_pending(). Situating the chunk after either of those would leave
+    // the indexes describing text no longer in the store. So this runs here,
+    // between chunking and id assignment, and nowhere else.
+    //
+    // contextualize() APPENDS to the existing `context` rather than replacing
+    // it, so the structural chunker's heading breadcrumb survives — the two
+    // signals are complementary (where in the document vs. what the document
+    // is about).
+    if (cfg_.contextual)
+        text::contextualize(new_chunks, stored.text, contextualizer_);
+
     for (auto& ch : new_chunks) {
         ChunkId cid{static_cast<std::uint32_t>(chunks_.size())};
         ch.id   = cid;
@@ -552,6 +569,22 @@ Result<store::Container> Corpus::snapshot_locked() const {
         json m;
         m["hnsw_threshold"] = cfg_.hnsw_threshold;
         m["embed_batch"]    = cfg_.embed_batch;
+        // Contextual Retrieval is an INGEST policy, not a query knob, but it
+        // still has to round-trip: a corpus reopened for writing (serve
+        // --write) must keep situating the documents it accepts, or the ones
+        // added after the restart are indexed differently from the ones added
+        // before it, and only half the store carries the disambiguating text.
+        //
+        // The same argument applies to the chunker's geometry, which was NOT
+        // persisted before: reopening a corpus built with max_lines=3 and
+        // adding a document chunked it at the default 40, so one store ended up
+        // holding two incompatible chunk granularities. Both are ingest policy
+        // and both round-trip.
+        m["contextual"]     = cfg_.contextual;
+        m["chunk"] = { {"max_lines", cfg_.chunk.max_lines},
+                       {"max_chars", cfg_.chunk.max_chars},
+                       {"overlap_lines", cfg_.chunk.overlap_lines},
+                       {"heading_context", cfg_.chunk.heading_context} };
         m["bm25"] = { {"k1", cfg_.bm25.k1}, {"b", cfg_.bm25.b} };
         c.put(store::Tag::meta, m.dump());
     }
@@ -630,6 +663,14 @@ Result<Corpus> Corpus::load(const std::string& path) {
         if (!m.is_discarded()) {
             c.cfg_.hnsw_threshold = m.value("hnsw_threshold", c.cfg_.hnsw_threshold);
             c.cfg_.embed_batch    = m.value("embed_batch", c.cfg_.embed_batch);
+            c.cfg_.contextual     = m.value("contextual", c.cfg_.contextual);
+            if (m.contains("chunk")) {
+                const auto& ck = m["chunk"];
+                c.cfg_.chunk.max_lines       = ck.value("max_lines", c.cfg_.chunk.max_lines);
+                c.cfg_.chunk.max_chars       = ck.value("max_chars", c.cfg_.chunk.max_chars);
+                c.cfg_.chunk.overlap_lines   = ck.value("overlap_lines", c.cfg_.chunk.overlap_lines);
+                c.cfg_.chunk.heading_context = ck.value("heading_context", c.cfg_.chunk.heading_context);
+            }
             if (m.contains("bm25")) {
                 c.cfg_.bm25.k1 = m["bm25"].value("k1", c.cfg_.bm25.k1);
                 c.cfg_.bm25.b  = m["bm25"].value("b", c.cfg_.bm25.b);

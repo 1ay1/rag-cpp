@@ -26,6 +26,7 @@
 #include "rag/store/container.hpp"
 #include "rag/store/wal.hpp"
 #include "rag/text/chunker.hpp"
+#include "rag/text/contextual.hpp"
 #include "rag/text/semantic_chunker.hpp"
 
 namespace rag::index {
@@ -52,6 +53,34 @@ struct CorpusConfig {
     enum class Chunking { fixed, semantic };
     Chunking               chunking = Chunking::fixed;
     text::SemanticChunkOptions semantic{};
+
+    // Contextual Retrieval (Anthropic 2024). Before indexing, prepend to each
+    // chunk a short blurb SITUATING it in its source document, so that a
+    // fragment which says "revenue grew 3%" still carries the name of the
+    // company it is about. Both the BM25 postings and the dense vector are
+    // built from indexed_text(), so turning this on changes what BOTH halves
+    // of the hybrid see — which is the whole point.
+    //
+    // Off by default because it is not free. Measured by
+    // bench/contextual_bench.cpp on its own synthetic corpus (2000 documents
+    // that name their subject ONCE, in the title, 18k chunks at max_lines=4,
+    // this machine): ingest+build 22.7 ms -> 67.7 ms (2.98x) and indexed text
+    // 1.95x, against chunk-level recall@5 0.0026 -> 0.9998.
+    //
+    // That recall figure is a CEILING, not a promise. It is that large only
+    // because on that corpus the subject is unreachable from any chunk but the
+    // title chunk, which is the paper's premise taken to its limit. On a corpus
+    // whose chunks already repeat their subject there is nothing to situate,
+    // and the 2.98x is pure cost. Measure before enabling this.
+    //
+    // (Document-level recall on the same corpus is 1.0 in BOTH arms — the
+    // subject token is unique, so the document is always found via its title
+    // chunk. A doc-level metric cannot see this feature at all.)
+    //
+    // This lives in the INGEST config rather than in a pipeline stage on
+    // purpose: the paper's method rewrites what is indexed, so it has to run
+    // before the indexes are built. A query-time stage cannot reproduce it.
+    bool                   contextual = false;
 };
 
 // Predicate over a chunk's document metadata for filtered retrieval.
@@ -90,6 +119,17 @@ public:
     // indexed chunks). Fails with Errc::unavailable if no embedder is set. Used
     // by RAPTOR / HyDE / late-interaction which embed synthetic text.
     [[nodiscard]] Result<Vector> embed_text(const std::string& text) const;
+
+    // Attach an LLM to write the situating context (Anthropic's method as
+    // published). Only consulted when cfg.contextual is true; with contextual
+    // on and no contextualizer set, ingest uses the deterministic extractive
+    // fallback, which needs no model and never fails. A contextualizer that
+    // returns an error for one chunk falls back for THAT chunk rather than
+    // failing the ingest — a flaky model must not be able to reject a document.
+    void set_contextualizer(text::Contextualizer c) { contextualizer_ = std::move(c); }
+    [[nodiscard]] bool has_contextualizer() const noexcept {
+        return static_cast<bool>(contextualizer_);
+    }
 
     // Ingest a document: chunk it, assign ids, index lexically, and (if an
     // embedder is set) embed its chunks. Returns the assigned DocId.
@@ -145,12 +185,47 @@ public:
     [[nodiscard]] std::size_t     document_count() const noexcept {
         std::shared_lock lk(mu_); return docs_.size();
     }
-    // NOTE: returns a reference to internal storage. Safe only while no writer
-    // runs — the lock is released on return, and a subsequent add_document()
-    // can reallocate the vector out from under the caller. Use the indexed
-    // accessors on a concurrently-written corpus.
-    [[nodiscard]] const std::vector<Chunk>& chunks() const {
-        std::shared_lock lk(mu_); ensure_linked(); return chunks_;
+    // A borrowed, READ-LOCKED view of the chunk vector.
+    //
+    // This exists because the obvious accessor — `const std::vector<Chunk>&
+    // chunks() const` — was a data race by construction: it took a shared lock,
+    // released it at the return statement, and handed the caller a reference
+    // into storage a concurrent add_document() may reallocate. Every bulk
+    // consumer (graph, raptor, splade) iterates that vector for as long as it
+    // takes to build an index over the whole corpus, which is exactly the
+    // window in which a served corpus accepts a write.
+    //
+    // The lease keeps the shared lock alive for as long as the view is, so the
+    // structure cannot change underneath the loop. It is move-only and must
+    // not outlive the Corpus. Holding one BLOCKS WRITERS — that is the trade:
+    // a consistent snapshot without copying the chunks. Take it, iterate, drop
+    // it; do not stash one in a long-lived object.
+    //
+    // Deadlock note: mu_ is not recursive, so do not call another Corpus
+    // method that locks (chunk(), document(), chunk_count(), ...) while a lease
+    // is held on the same thread. tokenizer() is safe — it takes no lock.
+    class ChunkLease {
+    public:
+        ChunkLease(std::shared_lock<std::shared_mutex> lk, const std::vector<Chunk>& v)
+            : lk_(std::move(lk)), v_(&v) {}
+
+        [[nodiscard]] const std::vector<Chunk>& get() const noexcept { return *v_; }
+        operator const std::vector<Chunk>&() const noexcept { return *v_; }
+        [[nodiscard]] auto begin() const noexcept { return v_->begin(); }
+        [[nodiscard]] auto end()   const noexcept { return v_->end(); }
+        [[nodiscard]] std::size_t size()  const noexcept { return v_->size(); }
+        [[nodiscard]] bool        empty() const noexcept { return v_->empty(); }
+        [[nodiscard]] const Chunk& operator[](std::size_t i) const noexcept { return (*v_)[i]; }
+
+    private:
+        std::shared_lock<std::shared_mutex> lk_;
+        const std::vector<Chunk>*           v_;
+    };
+
+    [[nodiscard]] ChunkLease chunks() const {
+        std::shared_lock lk(mu_);
+        ensure_linked();
+        return ChunkLease(std::move(lk), chunks_);
     }
     [[nodiscard]] const text::Tokenizer& tokenizer() const noexcept { return bm25_.tokenizer(); }
 
@@ -202,6 +277,10 @@ public:
 private:
     CorpusConfig                      cfg_{};
     std::optional<dense::AnyEmbedder> embedder_;
+    // Optional LLM seam for Contextual Retrieval; empty means "use the
+    // deterministic extractive context". Not serialized — it is a backend
+    // binding like embedder_, and the CONTEXT it produced is what persists.
+    text::Contextualizer              contextualizer_;
     std::vector<Document>             docs_;
     std::vector<Chunk>                chunks_;
     lexical::Bm25Index                bm25_{cfg_.bm25, cfg_.tokenize};

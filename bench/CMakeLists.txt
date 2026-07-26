@@ -11,3 +11,9 @@ target_link_libraries(ragcpp_ann_bench PRIVATE ragcpp)
 # row reports "declined" and the CPU timings still print.
 add_executable(ragcpp_gpu_bench gpu_bench.cpp)
 target_link_libraries(ragcpp_gpu_bench PRIVATE ragcpp)
+
+# What Contextual Retrieval costs at ingest vs what it buys at retrieval.
+# Self-contained (synthesizes its own corpus), so the numbers quoted in
+# CorpusConfig::contextual can be reproduced on any machine.
+add_executable(ragcpp_contextual_bench contextual_bench.cpp)
+target_link_libraries(ragcpp_contextual_bench PRIVATE ragcpp)
