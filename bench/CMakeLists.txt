@@ -29,3 +29,9 @@ target_link_libraries(ragcpp_batch_bench PRIVATE ragcpp)
 # in Pipeline::context()'s justification can be reproduced on any machine.
 add_executable(ragcpp_stitch_bench stitch_bench.cpp)
 target_link_libraries(ragcpp_stitch_bench PRIVATE ragcpp)
+
+# BEIR evaluation of the REAL production path (Engine/Pipeline), not the
+# lexical-only shortcut eval::evaluate_corpus takes. A/Bs ranking policies over
+# one corpus so a retrieval-quality change is a measured diff, not a claim.
+add_executable(ragcpp_beir_bench beir_bench.cpp)
+target_link_libraries(ragcpp_beir_bench PRIVATE ragcpp)

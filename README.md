@@ -271,6 +271,7 @@ Full guides live in [**`docs/`**](docs/README.md). Start there if you're new.
 
 **Reference**
 
+- [`BENCHMARKS.md`](BENCHMARKS.md) — measured BEIR / ANN / throughput numbers, reproducible.
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — layers, seams, invariants.
 - [`PLUGINS.md`](PLUGINS.md) — the three extension axes: concepts, `AnyX`, and the

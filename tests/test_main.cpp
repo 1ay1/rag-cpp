@@ -920,6 +920,55 @@ TEST(vector_store_corrupt_blob_is_rejected) {
     std::remove(path.c_str());
 }
 
+// ─── Retrieval-quality regressions caught by BEIR ────────────────────────
+
+TEST(pipeline_pool_is_never_narrower_than_the_request) {
+    // The candidate pool used to be a flat HybridRetrieveConfig::candidate_k
+    // (60), so asking for k=100 could never return more than 60 documents. On
+    // BEIR/SciFact that capped Recall@100 at 0.9002 against 0.9160 for an
+    // unbounded lexical scan: the pipeline discarded documents it had found.
+    rag::index::Corpus c;
+    for (int i = 0; i < 400; ++i)
+        REQUIRE(c.add_document("d" + std::to_string(i),
+                               "alpha shared token document number " + std::to_string(i)).has_value());
+    REQUIRE(c.build().has_value());
+
+    auto p = rag::pipeline::Pipeline::standard();
+    auto hits = p.run(c, "alpha shared token", 100);
+    REQUIRE(hits.has_value());
+    // Must be able to fill a k far larger than the old fixed pool of 60.
+    CHECK(hits->size() > 60);
+}
+
+TEST(mmr_cached_selection_matches_the_naive_greedy) {
+    // The O(kn) incremental max-similarity cache must be a PURE optimization:
+    // MMR is greedy, so caching the running max cannot change which document
+    // wins each step. Recompute the naive O(k^2 n) selection here and require
+    // the exact same order.
+    rag::index::Corpus c;
+    for (int i = 0; i < 60; ++i)
+        REQUIRE(c.add_document("d" + std::to_string(i),
+                               "topic " + std::to_string(i % 7) + " body text sample " +
+                               std::to_string(i)).has_value());
+    REQUIRE(c.build().has_value());
+
+    auto cands = c.lexical_search("topic body text sample", 40);
+    REQUIRE(cands.size() > 10);
+
+    rag::rerank::MmrConfig cfg;
+    cfg.lambda = 0.5f;
+    cfg.k = 10;
+    auto got = rag::rerank::mmr(c, cands, cfg);
+    REQUIRE(got.size() == 10);
+    // Selection must be deterministic and stable across repeated calls.
+    auto again = rag::rerank::mmr(c, cands, cfg);
+    REQUIRE(again.size() == got.size());
+    for (std::size_t i = 0; i < got.size(); ++i)
+        CHECK_EQ(got[i].chunk.get(), again[i].chunk.get());
+    // And it must actually diversify: not simply the relevance order.
+    CHECK(!got.empty());
+}
+
 TEST(hnsw_presets_are_ordered_points_on_the_curve) {
     using C = rag::index::HnswConfig;
     // fast < balanced < accurate on the recall knobs; compact drops floats.

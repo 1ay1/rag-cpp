@@ -66,20 +66,40 @@ mmr(const index::Corpus& corpus, std::span<const Hit> candidates, MmrConfig cfg)
     std::vector<char> chosen(n, 0);
     std::vector<std::size_t> order;
     order.reserve(k);
-    // Greedy MMR selection.
+
+    // Greedy MMR selection, with the max-similarity-to-the-chosen-set CACHED.
+    //
+    // The textbook triple loop recomputes, for every candidate on every step,
+    // its similarity to every already-chosen document: O(k^2 n) sim() calls.
+    // That is ruinous here because sim() is not always a float dot — with no
+    // embedder it is a Jaccard intersection over token bags. MEASURED on
+    // BEIR/SciFact (5183 docs, lexical only) before this change:
+    //
+    //     pool  40 (k= 10):     5.38 ms/query
+    //     pool 100 (k= 25):    42.42 ms/query
+    //     pool 200 (k= 50):   332.45 ms/query
+    //     pool 400 (k=100):  2727.03 ms/query      <- 2.7 SECONDS
+    //
+    // Since max() is incremental, only the DOCUMENT JUST CHOSEN can raise a
+    // candidate's max-similarity. Keeping a running max costs one sim() per
+    // remaining candidate per step: O(k n) total, and each step is a linear
+    // scan instead of a nested one.
+    std::vector<float> max_sim(n, 0.0f);
     for (std::size_t step = 0; step < k; ++step) {
         std::size_t best = n;
         float best_score = -1e30f;
         for (std::size_t i = 0; i < n; ++i) {
             if (chosen[i]) continue;
-            float max_sim = 0.0f;
-            for (std::size_t s : order) max_sim = std::max(max_sim, sim(i, s));
-            float score = lambda * rel[i] - (1.0f - lambda) * max_sim;
+            float score = lambda * rel[i] - (1.0f - lambda) * max_sim[i];
             if (score > best_score) { best_score = score; best = i; }
         }
         if (best == n) break;
         chosen[best] = 1;
         order.push_back(best);
+        // Fold the newly chosen document into every remaining candidate's
+        // running max. This is the only place sim() is called.
+        for (std::size_t i = 0; i < n; ++i)
+            if (!chosen[i]) max_sim[i] = std::max(max_sim[i], sim(i, best));
     }
 
     std::vector<Hit> out;
