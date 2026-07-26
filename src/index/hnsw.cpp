@@ -599,7 +599,8 @@ void HnswIndex::add(std::uint32_t id, std::span<const float> vec) {
     if (level > max_layer_) { max_layer_ = level; entry_ = ordinal; }
 }
 
-std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k) const {
+std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k,
+                                   std::size_t ef_override) const {
     if (nodes_.empty() || dim_ == 0) return {};
     seal();     // memoized: no-op on every query after the first
 
@@ -635,7 +636,7 @@ std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k) 
         search_layer_into(q, qb, q8, adc, cur, lc, 1, hop);
         if (!hop.empty()) cur = hop.front();
     }
-    std::size_t ef = std::max(cfg_.ef_search, k);
+    std::size_t ef = std::max(ef_override ? ef_override : cfg_.ef_search, k);
     search_layer_into(q, qb, q8, adc, cur, 0, ef, hop);
 
     // Rescore candidates on the FULL float vector (exact cosine) — corrects any

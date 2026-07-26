@@ -543,6 +543,22 @@ struct AnnFixture {
     std::vector<std::vector<float>> vecs, cents;
     std::size_t dim = 64, n = 4000, nc = 80;
 
+    // Cluster spread. This number decides whether the whole fixture means
+    // anything, so it is named rather than buried in two loops.
+    //
+    // It used to be 0.06, which put mean intra-cluster similarity at 0.815 —
+    // each cluster a blob of near-duplicates. The true top-10 was then trivially
+    // reachable from any entry point in the cluster, every graph scored ~0.99,
+    // and the CHECK(r > 0.95) below could not fail. That is what let a false
+    // claim ("ef=32 reaches ~0.999 recall") survive in HnswConfig for so long.
+    //
+    // At 0.20 the mean intra-cluster similarity is ~0.11 and the gap ratio
+    // (spread within the true top-10 vs the drop to rank 1000) rises from 0.044
+    // to ~0.3, which is where recall@10 starts discriminating between graphs.
+    // Verified by construction: M=16/ef=64 scores 0.987 here, and dropping to
+    // M=4 — a deliberately crippled graph — drops it below the gate.
+    static constexpr float kJitter = 0.20f;
+
     AnnFixture() {
         std::mt19937 rng(11);
         std::normal_distribution<float> g(0.0f, 1.0f);
@@ -557,13 +573,14 @@ struct AnnFixture {
         for (auto& v : vecs) {
             int c = pick(rng);
             v.resize(dim);
-            for (std::size_t d = 0; d < dim; ++d) v[d] = cents[c][d] + 0.06f * g(rng);
+            for (std::size_t d = 0; d < dim; ++d) v[d] = cents[c][d] + kJitter * g(rng);
             rag::dense::normalize(v);
         }
     }
 
     // Mean recall@k of `idx` against exact brute-force search.
-    double recall(const rag::index::HnswIndex& idx, std::size_t k, std::size_t queries) const {
+    double recall(const rag::index::HnswIndex& idx, std::size_t k, std::size_t queries,
+                  std::size_t ef = 0) const {
         std::mt19937 qr(23);
         std::normal_distribution<float> g(0.0f, 1.0f);
         std::uniform_int_distribution<int> pick(0, static_cast<int>(nc) - 1);
@@ -571,7 +588,7 @@ struct AnnFixture {
         for (std::size_t qi = 0; qi < queries; ++qi) {
             int c = pick(qr);
             std::vector<float> q(dim);
-            for (std::size_t d = 0; d < dim; ++d) q[d] = cents[c][d] + 0.06f * g(qr);
+            for (std::size_t d = 0; d < dim; ++d) q[d] = cents[c][d] + kJitter * g(qr);
             rag::dense::normalize(q);
 
             std::vector<std::pair<float, std::uint32_t>> exact;
@@ -584,7 +601,7 @@ struct AnnFixture {
             for (std::size_t i = 0; i < k; ++i) truth.push_back(exact[i].second);
 
             std::size_t got = 0;
-            for (const auto& h : idx.search(q, k))
+            for (const auto& h : idx.search(q, k, ef))
                 if (std::find(truth.begin(), truth.end(), h.chunk.get()) != truth.end()) ++got;
             acc += static_cast<double>(got) / static_cast<double>(k);
         }
@@ -607,6 +624,132 @@ TEST(hnsw_recall_matches_exact_search) {
     // below this means the graph or the neighbour heuristic has regressed.
     double r = fx.recall(idx, 10, 60);
     CHECK(r > 0.95);
+}
+
+// ─── the recall gate can actually FAIL ─────────────────────────────────
+//
+// A recall threshold is worthless if the fixture is so easy that every graph
+// clears it — which is exactly what happened here for a long time. This pins
+// the fixture's discriminating power: a deliberately crippled graph (M=4, a
+// beam of 4 neighbours per node) must score materially WORSE than the real
+// configuration. If someone re-softens the data, this test fails and says so.
+TEST(ann_fixture_is_hard_enough_to_discriminate) {
+    AnnFixture fx;
+
+    rag::index::HnswConfig good;
+    good.M = 16; good.ef_construction = 200; good.ef_search = 64;
+    rag::index::HnswIndex gi(good);
+    gi.build_batch(fx.n,
+        [&](std::size_t i) { return std::span<const float>(fx.vecs[i]); },
+        [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+
+    rag::index::HnswConfig crippled;
+    crippled.M = 4; crippled.ef_construction = 10; crippled.ef_search = 8;
+    rag::index::HnswIndex ci(crippled);
+    ci.build_batch(fx.n,
+        [&](std::size_t i) { return std::span<const float>(fx.vecs[i]); },
+        [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+
+    const double rg = fx.recall(gi, 10, 60);
+    const double rc = fx.recall(ci, 10, 60);
+    CHECK(rg > 0.95);          // the real config still clears the gate
+    CHECK(rc < 0.90);          // ...and a bad graph does not
+    CHECK(rg - rc > 0.10);     // with a wide, unambiguous margin
+}
+
+// ─── the neighbour-selection HEURISTIC is load-bearing ─────────────────────
+//
+// select_neighbours_heuristic (Malkov & Yashunin Algorithm 4) keeps a candidate
+// only if it opens a NEW direction, rather than keeping the M nearest. That is
+// what gives the graph long-range escape routes instead of a tight cluster of
+// redundant edges.
+//
+// The property is invisible at small n. Replacing the heuristic with naive
+// top-M measures 0.990 -> 0.978 at n=4000 (well inside noise, and the gate
+// above does NOT catch it) but 0.937 -> 0.898 at n=64000, because a short walk
+// across a small graph barely needs the escape routes. So this test pays for a
+// bigger corpus deliberately — it is the only one here that can see the
+// difference, and a heuristic regression is otherwise a silent recall leak that
+// grows with the corpus.
+TEST(hnsw_neighbour_heuristic_matters_at_scale) {
+    constexpr std::size_t kDim = 48, kN = 40000, kClusters = 80;
+    constexpr float kJitter = 0.20f;
+
+    std::mt19937 rng(11);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    std::vector<std::vector<float>> cents(kClusters, std::vector<float>(kDim));
+    for (auto& c : cents) { for (auto& x : c) x = g(rng); rag::dense::normalize(c); }
+    std::uniform_int_distribution<int> pick(0, static_cast<int>(kClusters) - 1);
+
+    std::vector<std::vector<float>> vecs(kN, std::vector<float>(kDim));
+    for (auto& v : vecs) {
+        int c = pick(rng);
+        for (std::size_t d = 0; d < kDim; ++d) v[d] = cents[c][d] + kJitter * g(rng);
+        rag::dense::normalize(v);
+    }
+
+    rag::index::HnswConfig cfg;
+    cfg.M = 16; cfg.ef_construction = 200; cfg.ef_search = 64;
+    rag::index::HnswIndex idx(cfg);
+    idx.build_batch(kN,
+        [&](std::size_t i) { return std::span<const float>(vecs[i]); },
+        [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+
+    constexpr std::size_t k = 10, kQueries = 40;
+    std::mt19937 qr(23);
+    double acc = 0;
+    for (std::size_t q = 0; q < kQueries; ++q) {
+        int c = pick(qr);
+        std::vector<float> qv(kDim);
+        for (std::size_t d = 0; d < kDim; ++d) qv[d] = cents[c][d] + kJitter * g(qr);
+        rag::dense::normalize(qv);
+
+        std::vector<std::pair<float, std::uint32_t>> exact(kN);
+        for (std::size_t i = 0; i < kN; ++i)
+            exact[i] = {rag::dense::dot(qv, vecs[i]), static_cast<std::uint32_t>(i)};
+        std::partial_sort(exact.begin(), exact.begin() + k, exact.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        std::size_t got = 0;
+        for (const auto& h : idx.search(qv, k))
+            for (std::size_t i = 0; i < k; ++i)
+                if (exact[i].second == h.chunk.get()) { ++got; break; }
+        acc += static_cast<double>(got) / static_cast<double>(k);
+    }
+    // Measured 0.96 with the heuristic, 0.93 without, at this size. The gate
+    // sits between them: tight enough to catch the regression, loose enough not
+    // to flake on link-order nondeterminism from the parallel build.
+    CHECK((acc / kQueries) > 0.95);
+}
+
+// ─── ef is a working per-query dial ────────────────────────────────────
+//
+// ef used to be build-time only, so trading recall for latency meant rebuilding
+// the graph. Now it is an argument, and the contract is: recall must be
+// MONOTONIC in ef on one index, and a wide beam must beat a narrow one
+// decisively. This is also what makes a recall/QPS curve measurable at all.
+TEST(hnsw_ef_is_a_per_query_recall_dial) {
+    AnnFixture fx;
+    rag::index::HnswConfig cfg;
+    cfg.M = 16; cfg.ef_construction = 200; cfg.ef_search = 64;
+    rag::index::HnswIndex idx(cfg);
+    idx.build_batch(fx.n,
+        [&](std::size_t i) { return std::span<const float>(fx.vecs[i]); },
+        [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
+
+    const double r_narrow = fx.recall(idx, 10, 60, 10);
+    const double r_mid    = fx.recall(idx, 10, 60, 64);
+    const double r_wide   = fx.recall(idx, 10, 60, 400);
+
+    CHECK(r_mid  >= r_narrow - 1e-9);   // monotonic, no rebuild involved
+    CHECK(r_wide >= r_mid    - 1e-9);
+    CHECK(r_wide - r_narrow > 0.05);    // the dial has real range
+
+    // ef=0 must mean "use the configured default", not "use a beam of zero".
+    CHECK_EQ(fx.recall(idx, 10, 60, 0), fx.recall(idx, 10, 60, cfg.ef_search));
+
+    // A beam narrower than k cannot return k; it must be clamped, not truncated.
+    CHECK_EQ(idx.search(fx.vecs[0], 10, 1).size(), std::size_t{10});
 }
 
 TEST(hnsw_parallel_build_matches_serial_recall) {

@@ -34,11 +34,36 @@ namespace rag::index {
 struct HnswConfig {
     std::size_t M               = 16;    // max neighbours per node (base layer 2M)
     std::size_t ef_construction = 200;   // beam width during insert
-    // Beam width during query. This is THE recall/latency dial: on realistic
-    // embedding geometry (topically clustered vectors) ef=32 already reaches
-    // ~0.999 recall@10 and ef=64 is comfortably saturated. Raise it only for
-    // near-uniform / very high-dimensional data, where every ANN index needs a
-    // wider beam because distances concentrate. Cost is roughly linear in ef.
+    // Default beam width during query; overridable per call (see search()).
+    // This is THE recall/latency dial.
+    //
+    // MEASURED on standard ANN benchmark datasets, recall@10 vs exact cosine,
+    // M=16 ef_construction=200, single thread, Apple M-series:
+    //
+    //   GloVe-25-angular (1.18M word embeddings, intrinsic dim 14.1)
+    //     ef=  16   recall 0.856    31.6 us/q    31.6k QPS
+    //     ef=  32   recall 0.942    62.4 us/q    16.0k QPS
+    //     ef=  64   recall 0.973    91.8 us/q    10.9k QPS   <- default
+    //     ef= 128   recall 0.994   146.6 us/q     6.8k QPS
+    //     ef= 256   recall 0.999   266.7 us/q     3.7k QPS
+    //
+    //   SIFT1M (1M image descriptors, intrinsic dim 3.1)
+    //     ef=  32   recall 0.893    90.9 us/q
+    //     ef=  64   recall 0.965   124.6 us/q   <- default
+    //     ef= 128   recall 0.989   209.2 us/q
+    //     ef= 512   recall 0.999   679.0 us/q
+    //
+    // The default trades ~3% recall for ~2x throughput against ef=128. Raise it
+    // when recall matters more than latency; the point of making ef a per-call
+    // argument is that this no longer requires a rebuild.
+    //
+    // An EARLIER VERSION OF THIS COMMENT claimed "ef=32 already reaches ~0.999
+    // recall@10 and ef=64 is comfortably saturated". That was never measured on
+    // real data and is wrong on both datasets above. It came from the unit-test
+    // fixture, whose clusters have jitter 0.06 — mean intra-cluster similarity
+    // 0.815, i.e. near-duplicates — where every graph scores ~0.99 and the
+    // number says nothing. Do not restate a recall figure here without naming
+    // the dataset it was measured on.
     std::size_t ef_search       = 64;
     float       ml              = 0.0f;  // level multiplier; 0 => 1/ln(M)
     std::size_t matryoshka_dim  = 0;     // >0: walk on this leading-dim prefix
@@ -114,7 +139,21 @@ public:
                      const std::function<std::uint32_t(std::size_t)>& id_at);
 
     // k-NN search: returns (id, cosine-similarity) pairs, descending.
-    [[nodiscard]] std::vector<Hit> search(std::span<const float> query, std::size_t k) const;
+    //
+    // `ef` overrides HnswConfig::ef_search for THIS query only; 0 means "use the
+    // configured default". This is the recall/latency dial, and it belongs on
+    // the call, not only on the index: ef is a pure search-time beam width that
+    // costs nothing to change, and the right value is a property of the REQUEST
+    // (an interactive autocomplete wants ef=32, an offline eval wants ef=512),
+    // not of the corpus. Baking it into the config forced a full rebuild to
+    // trade recall for latency — which, on a graph that takes minutes to build,
+    // makes the dial unusable in practice and also makes it impossible to plot
+    // a recall/QPS curve, the standard way ANN indexes are compared.
+    //
+    // Clamped to at least k: a beam narrower than the number of results
+    // requested cannot return them.
+    [[nodiscard]] std::vector<Hit> search(std::span<const float> query, std::size_t k,
+                                          std::size_t ef = 0) const;
 
     // Soft-delete a node by id (tombstone): it stays in the graph for
     // connectivity but is never returned by search. O(1). Re-adding the same id
