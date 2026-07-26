@@ -112,6 +112,44 @@ struct HnswConfig {
     // exactness first.
     bool        drop_floats     = false;
     std::uint64_t seed          = 0x9E3779B97F4A7C15ull;
+
+    // ── Presets ──────────────────────────────────────────────────────────────
+    // Starting points so nobody has to reason about nine knobs from scratch.
+    // Each is a named point on the recall/latency/memory surface the comments
+    // above measured; tweak a field after picking one if you must. The numbers
+    // quoted are recall@10 from the GloVe/SIFT tables above at these settings.
+
+    // Lowest latency, recall you can live with for interactive use (~0.94 on
+    // SIFT at ef=32). Autocomplete, typeahead, "good enough now".
+    [[nodiscard]] static HnswConfig fast() {
+        HnswConfig c; c.M = 16; c.ef_construction = 100; c.ef_search = 32; return c;
+    }
+
+    // The default trade: ~0.97 recall at ~2x the throughput of accurate().
+    [[nodiscard]] static HnswConfig balanced() { return HnswConfig{}; }
+
+    // Recall first (~0.99+): wider construction and search beams. Offline eval,
+    // legal/medical retrieval, anything where a miss costs more than a
+    // millisecond.
+    [[nodiscard]] static HnswConfig accurate() {
+        HnswConfig c; c.M = 32; c.ef_construction = 400; c.ef_search = 128; return c;
+    }
+
+    // Memory first: SQ8-only walk with the float arena dropped (~1 byte/dim,
+    // a ~3x saving) at ~0.94 recall. Scores become approximate — see
+    // drop_floats. Use when the corpus must fit and exact scores are not needed.
+    [[nodiscard]] static HnswConfig compact() {
+        HnswConfig c = balanced(); c.drop_floats = true; return c;
+    }
+
+    // Pick a sane point for `n` vectors. Small corpora can afford accuracy;
+    // huge ones lean on compression. This is a heuristic, not a promise —
+    // benchmark on your data with bench/ragcpp_ann_bench if it matters.
+    [[nodiscard]] static HnswConfig for_scale(std::size_t n) {
+        if (n < 100'000)   return accurate();   // cheap to be accurate when small
+        if (n < 5'000'000) return balanced();
+        return compact();                        // at 5M+ the SQ8 saving earns its keep
+    }
 };
 
 class HnswIndex {

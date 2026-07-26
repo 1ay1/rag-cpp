@@ -24,6 +24,7 @@
 #include "rag/fusion/fuse.hpp"
 #include "rag/graph/graph.hpp"
 #include "rag/index/corpus.hpp"
+#include "rag/index/vector_store.hpp"
 #include "rag/index/hnsw.hpp"
 #include "rag/index/pq.hpp"
 #include "rag/late/colbert.hpp"

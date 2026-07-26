@@ -12,6 +12,7 @@ the guide that matches what you're building.
 |-------|----------------|
 | [Getting Started](getting-started.md) | Install, build, first index, first query — both the CLI and the C++ library. |
 | [Retrieval](retrieval.md) | Hybrid BM25 + dense, HNSW ANN, score fusion, metadata filtering, quantization. The scoring core. |
+| [Vector store](vector-store.md) | Using rag-cpp as a plain vector database: you own the ids and vectors, no text pipeline. |
 | [The Pipeline](pipeline.md) | Composable retrieval stages, the `standard` / `quality` / `context` factories, and writing your own stage. |
 | [Embedders](embedders.md) | Every embedding backend, the retry/fallback decorators, the `HttpTransport` seam, and the in-process ONNX / GGUF paths. |
 | [Advanced Retrieval](advanced-retrieval.md) | SPLADE, ColBERT, RAPTOR, HyDE / multi-query, Corrective RAG, and GraphRAG. |

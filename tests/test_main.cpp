@@ -793,6 +793,146 @@ TEST(hnsw_filtered_search) {
     for (auto& h : hits) CHECK(h.chunk.get() % 2 == 0);
 }
 
+// ─── VectorStore: the plain vector-DB front door ──────────────────────────
+//
+// VectorStore wraps the same HnswIndex behind a five-method surface (add/build/
+// search/remove/save) with no chunks or embedder. These pin the contract that
+// makes it usable as a vector DB: your ids come back, an exact vector scores
+// ~1.0, filters and removes are honoured, and a save round-trips.
+
+namespace {
+std::vector<float> vs_rand(std::mt19937& rng, std::size_t dim) {
+    std::normal_distribution<float> nd;
+    std::vector<float> v(dim);
+    for (auto& x : v) x = nd(rng);
+    return v;
+}
+} // namespace
+
+TEST(vector_store_finds_the_exact_vector_brute) {
+    // Below the brute-force threshold: exact scan, must be perfect.
+    rag::index::VectorStore s{16};
+    std::mt19937 rng(1);
+    std::vector<std::vector<float>> vecs;
+    for (std::uint32_t i = 0; i < 100; ++i) { auto v = vs_rand(rng, 16); vecs.push_back(v); REQUIRE(s.add(i, v).has_value()); }
+    REQUIRE(s.build().has_value());
+    CHECK(!s.is_graph_built());                 // stayed brute below threshold
+    CHECK_EQ(s.size(), std::size_t{100});
+    auto hits = s.search(vecs[42], 3);
+    REQUIRE(!hits.empty());
+    CHECK_EQ(hits[0].id, 42u);
+    CHECK(std::fabs(hits[0].score - 1.0f) < 1e-4f);
+}
+
+TEST(vector_store_builds_graph_above_threshold_and_finds_self) {
+    rag::index::VectorStore s{32, rag::index::HnswConfig::accurate()};
+    std::mt19937 rng(2);
+    std::vector<std::vector<float>> vecs;
+    for (std::uint32_t i = 0; i < 3000; ++i) { auto v = vs_rand(rng, 32); vecs.push_back(v); REQUIRE(s.add(i, v).has_value()); }
+    REQUIRE(s.build().has_value());
+    CHECK(s.is_graph_built());
+    CHECK(s.memory_bytes() > 0);
+    // Self-query returns self as #1 at ~1.0 on the graph path.
+    std::size_t self_hits = 0;
+    for (std::uint32_t i : {7u, 100u, 999u, 2500u}) {
+        auto h = s.search(vecs[i], 1);
+        if (!h.empty() && h[0].id == i) ++self_hits;
+    }
+    CHECK_EQ(self_hits, std::size_t{4});
+}
+
+TEST(vector_store_rejects_dimension_mismatch) {
+    rag::index::VectorStore s{8};
+    std::vector<float> wrong(5, 1.0f);
+    auto r = s.add(0, wrong);
+    CHECK(!r.has_value());
+    CHECK_EQ(r.error().code, rag::Errc::invalid_argument);
+}
+
+TEST(vector_store_upsert_replaces_and_does_not_duplicate) {
+    rag::index::VectorStore s{4};
+    std::vector<float> a{1, 0, 0, 0}, b{0, 1, 0, 0};
+    REQUIRE(s.add(5, a).has_value());
+    REQUIRE(s.add(5, b).has_value());          // upsert same id
+    CHECK_EQ(s.size(), std::size_t{1});        // not 2
+    auto hits = s.search(b, 5);
+    std::size_t appearances = 0;
+    for (auto& h : hits) if (h.id == 5) ++appearances;
+    CHECK_EQ(appearances, std::size_t{1});     // id 5 appears at most once
+}
+
+TEST(vector_store_remove_hides_the_vector) {
+    rag::index::VectorStore s{4};
+    std::vector<float> a{1, 0, 0, 0};
+    REQUIRE(s.add(1, a).has_value());
+    REQUIRE(s.add(2, std::vector<float>{0, 1, 0, 0}).has_value());
+    s.remove(1);
+    CHECK_EQ(s.size(), std::size_t{1});
+    for (auto& h : s.search(a, 5)) CHECK(h.id != 1u);
+}
+
+TEST(vector_store_filtered_search_respects_predicate) {
+    rag::index::VectorStore s{8};
+    std::mt19937 rng(3);
+    std::vector<std::vector<float>> vecs;
+    for (std::uint32_t i = 0; i < 200; ++i) { auto v = vs_rand(rng, 8); vecs.push_back(v); REQUIRE(s.add(i, v).has_value()); }
+    REQUIRE(s.build().has_value());
+    auto hits = s.search(vecs[10], 5, [](std::uint32_t id) { return id % 2 == 0; });
+    REQUIRE(!hits.empty());
+    for (auto& h : hits) CHECK(h.id % 2 == 0);
+}
+
+TEST(vector_store_persists_and_reloads) {
+    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp")
+                     + "/ragcpp_vs_test.ragvec";
+    std::mt19937 rng(4);
+    std::vector<std::vector<float>> vecs;
+    {
+        rag::index::VectorStore s{24, rag::index::HnswConfig::accurate()};
+        for (std::uint32_t i = 0; i < 2500; ++i) { auto v = vs_rand(rng, 24); vecs.push_back(v); REQUIRE(s.add(i, v).has_value()); }
+        REQUIRE(s.build().has_value());
+        s.remove(9);                            // a removed id must not come back
+        REQUIRE(s.save(path).has_value());
+    }
+    auto loaded = rag::index::VectorStore::load(path);
+    REQUIRE(loaded.has_value());
+    CHECK_EQ(loaded->size(), std::size_t{2499});
+    CHECK(loaded->is_graph_built());
+    CHECK_EQ(loaded->dimension(), std::size_t{24});
+    auto h = loaded->search(vecs[123], 1);
+    REQUIRE(!h.empty());
+    CHECK_EQ(h[0].id, 123u);
+    for (auto& x : loaded->search(vecs[9], 5)) CHECK(x.id != 9u);   // stayed removed
+    std::remove(path.c_str());
+}
+
+TEST(vector_store_corrupt_blob_is_rejected) {
+    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp")
+                     + "/ragcpp_vs_corrupt.ragvec";
+    rag::index::VectorStore s{4};
+    REQUIRE(s.add(0, std::vector<float>{1, 0, 0, 0}).has_value());
+    REQUIRE(s.save(path).has_value());
+    // Flip a byte and confirm the CRC framing rejects it.
+    std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+    f.seekp(20); char b; f.seekg(20); f.read(&b, 1); b ^= 0xFF; f.seekp(20); f.write(&b, 1); f.close();
+    auto loaded = rag::index::VectorStore::load(path);
+    CHECK(!loaded.has_value());
+    std::remove(path.c_str());
+}
+
+TEST(hnsw_presets_are_ordered_points_on_the_curve) {
+    using C = rag::index::HnswConfig;
+    // fast < balanced < accurate on the recall knobs; compact drops floats.
+    CHECK(C::fast().ef_search < C::balanced().ef_search);
+    CHECK(C::balanced().ef_search < C::accurate().ef_search);
+    CHECK(C::accurate().M >= C::balanced().M);
+    CHECK(C::compact().drop_floats);
+    CHECK(!C::balanced().drop_floats);
+    // for_scale picks accuracy when small and compression when huge.
+    CHECK(!C::for_scale(1000).drop_floats);
+    CHECK(C::for_scale(20'000'000).drop_floats);
+}
+
 // ─── Parallel embedding: batches must be concurrency-transparent ──────
 //
 // Corpus::embed_pending fans batches out across workers when the embedder

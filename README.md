@@ -258,6 +258,7 @@ Full guides live in [**`docs/`**](docs/README.md). Start there if you're new.
 
 - [Getting Started](docs/getting-started.md) — install, first index, first query (CLI + library).
 - [Retrieval](docs/retrieval.md) — hybrid BM25 + dense, HNSW, fusion, filtering, quantization.
+- [Vector store](docs/vector-store.md) — using rag-cpp as a plain vector DB (your ids, your vectors).
 - [The Pipeline](docs/pipeline.md) — composable stages; `standard` / `quality` / `context` factories; custom stages.
 - [Embedders](docs/embedders.md) — every backend, the retry/fallback decorators, the `HttpTransport` seam.
 - [Advanced Retrieval](docs/advanced-retrieval.md) — SPLADE, ColBERT, RAPTOR, HyDE, CRAG, GraphRAG.
