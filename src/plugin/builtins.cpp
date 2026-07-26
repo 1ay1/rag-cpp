@@ -18,6 +18,7 @@
 #include "rag/bridge/bridge.hpp"
 #include "rag/dense/backends.hpp"
 #include "rag/dense/embedder.hpp"
+#include "rag/dense/local_embedder.hpp"
 #include "rag/rerank/reranker.hpp"
 
 namespace rag::plugin {
@@ -79,6 +80,88 @@ RAG_REGISTER(AnyEmbedder, "llamacpp", [](const json& c) -> Result<AnyEmbedder> {
     cfg.timeout = get_timeout(c);
     return AnyEmbedder{dense::LlamaCppEmbedder{std::move(cfg)}};
 });
+
+// ── Local (in-process) embedders ─────────────────────────────────────────────
+// ONNX Runtime and GGUF/llama.cpp run the model IN this process behind the same
+// Embedder concept. They exist as classes already; registering them here is what
+// makes them reachable BY NAME from a config file / the CLI / the C ABI, exactly
+// like the network backends. When the library was built without the relevant
+// feature flag, load() returns Errc::unavailable — so the factory surfaces a
+// clear, typed error instead of the name simply not existing. (The alternative,
+// not registering them, would make `{"type":"onnx"}` fail with "unknown type"
+// even on a build that COULD support it once the flag is flipped — a worse
+// diagnostic. Registering always, and letting load() report availability, keeps
+// the config surface stable across build configurations.)
+
+dense::LocalEmbedderConfig local_cfg(const json& c) {
+    dense::LocalEmbedderConfig lc;
+    lc.model_path     = get_or<std::string>(c, "model_path", lc.model_path);
+    lc.tokenizer_path = get_or<std::string>(c, "tokenizer_path", lc.tokenizer_path);
+    lc.normalize      = get_or<bool>(c, "normalize", lc.normalize);
+    lc.max_tokens     = get_or<std::size_t>(c, "max_tokens", lc.max_tokens);
+    lc.threads        = get_or<int>(c, "threads", lc.threads);
+    lc.identity_tag   = get_or<std::string>(c, "identity_tag", lc.identity_tag);
+    std::string pool  = get_or<std::string>(c, "pooling", "mean");
+    lc.pooling = (pool == "cls") ? dense::Pooling::cls : dense::Pooling::mean;
+    return lc;
+}
+
+RAG_REGISTER(AnyEmbedder, "onnx", [](const json& c) -> Result<AnyEmbedder> {
+    auto e = dense::OnnxEmbedder::load(local_cfg(c));
+    if (!e) return std::unexpected(e.error());   // unavailable if !RAGCPP_WITH_ONNX
+    return AnyEmbedder{std::move(*e)};
+});
+
+RAG_REGISTER(AnyEmbedder, "gguf", [](const json& c) -> Result<AnyEmbedder> {
+    auto e = dense::GgufEmbedder::load(local_cfg(c));
+    if (!e) return std::unexpected(e.error());   // unavailable if !RAGCPP_WITH_LLAMA
+    return AnyEmbedder{std::move(*e)};
+});
+
+// ── Composition decorators ───────────────────────────────────────────────────
+// These take NESTED embedder specs and resolve them through the SAME registry,
+// so config can express resilience declaratively:
+//
+//   {"type":"fallback",
+//    "primary":  {"type":"onnx", "model_path":"bge.onnx", ...},
+//    "secondary":{"type":"hash", "dim":256}}
+//
+// A model outage then silently degrades to the hash embedder with no code. The
+// nested resolution is why Registry invokes factories UNLOCKED (see registry.hpp):
+// building a `fallback` recursively builds two more embedders through the same
+// singleton, which would otherwise deadlock.
+
+RAG_REGISTER(AnyEmbedder, "retry", [](const json& c) -> Result<AnyEmbedder> {
+    auto it = c.find("inner");
+    if (it == c.end())
+        return fail<AnyEmbedder>(Errc::invalid_argument, "retry: missing \"inner\" embedder spec");
+    auto inner = Registry<AnyEmbedder>::instance().create_from(*it);
+    if (!inner) return std::unexpected(inner.error());
+    int  attempts = get_or<int>(c, "max_attempts", 3);
+    auto delay    = std::chrono::milliseconds(get_or<long>(c, "base_delay_ms", 200));
+    dense::RetryingEmbedder wrapped(std::move(*inner), attempts, delay);
+    return AnyEmbedder{std::move(wrapped)};
+});
+
+RAG_REGISTER(AnyEmbedder, "fallback", [](const json& c) -> Result<AnyEmbedder> {
+    auto pit = c.find("primary");
+    auto sit = c.find("secondary");
+    if (pit == c.end() || sit == c.end())
+        return fail<AnyEmbedder>(Errc::invalid_argument,
+            "fallback: needs both \"primary\" and \"secondary\" embedder specs");
+    // The secondary must always be constructible — it is the safety net.
+    auto secondary = Registry<AnyEmbedder>::instance().create_from(*sit);
+    if (!secondary) return std::unexpected(secondary.error());
+    // If the PRIMARY cannot even be constructed (e.g. this build lacks ONNX, or
+    // an API key is missing), degrade to the secondary AT CONSTRUCTION rather
+    // than failing — that is the whole point of a fallback. A primary that
+    // constructs but fails per-request is handled at runtime by FallbackEmbedder.
+    auto primary = Registry<AnyEmbedder>::instance().create_from(*pit);
+    if (!primary) return AnyEmbedder{std::move(*secondary)};
+    dense::FallbackEmbedder wrapped(std::move(*primary), std::move(*secondary));
+    return AnyEmbedder{std::move(wrapped)};
+});
+
 
 // ── Rerankers ────────────────────────────────────────────────────────────────
 

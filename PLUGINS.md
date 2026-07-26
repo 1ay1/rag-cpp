@@ -66,8 +66,57 @@ engine.with_embedder(std::move(*emb));
 engine.with_embedder_spec(config["embedder"]);       // {"type": "ollama", ...}
 ```
 
-Built-in embedder names: `hash`, `ollama`, `openai`, `llamacpp`.
+Built-in embedder names: `hash`, `ollama`, `openai`, `llamacpp`, and the
+in-process **local** models `onnx` and `gguf` (see below). Composition
+decorators: `retry`, `fallback`. Polyglot transports: `process`, `http`, `rest`.
 Built-in reranker names: `cross_encoder` (with `wire` = `tei` | `cohere` | `jina`).
+
+### Local (in-process) embedders are just names too
+
+The ONNX Runtime and GGUF/llama.cpp embedders run the model **inside your
+process** — no server, no HTTP hop. They are reachable by name exactly like the
+network backends:
+
+```cpp
+engine.with_embedder_spec({
+    {"type", "onnx"},                       // or "gguf"
+    {"model_path", "bge-small-en.onnx"},
+    {"tokenizer_path", "tokenizer.json"},   // ONNX only
+    {"pooling", "mean"}, {"normalize", true}, {"max_tokens", 512}});
+```
+
+These require the corresponding build flag (`-DRAGCPP_WITH_ONNX=ON` /
+`-DRAGCPP_WITH_LLAMA=ON`). On a build **without** the flag the name still
+resolves, but the factory returns a clear `Errc::unavailable` ("built without
+ONNX support") instead of "unknown type" — the config surface is stable across
+build configurations, so the same config file works everywhere and tells you
+precisely what to flip.
+
+### Compose resilience from config
+
+Two decorators take **nested** embedder specs and resolve them through the same
+registry, so a config file can express retry-then-degrade declaratively — no
+code:
+
+```jsonc
+{ "type": "fallback",
+  "primary":   { "type": "onnx", "model_path": "bge-small-en.onnx" },
+  "secondary": { "type": "retry", "max_attempts": 3,
+                 "inner": { "type": "ollama", "model": "nomic-embed-text" } } }
+```
+
+- **`retry`** — wraps `inner` with bounded exponential backoff on transient
+  failures (`max_attempts`, `base_delay_ms`).
+- **`fallback`** — tries `primary`, then `secondary`. If the primary cannot even
+  be *constructed* (missing feature flag, missing key), it degrades to the
+  secondary at construction time — so a config naming a local model this build
+  can't load still yields a working embedder. A primary that constructs but
+  fails per-request degrades at runtime.
+
+Composition **nests arbitrarily** (`retry(fallback(a, b))`), because the registry
+invokes factories *unlocked* — building a composite re-enters the same singleton
+several times on one thread, which a naive lock-around-factory design would
+deadlock.
 
 ### Ship a plugin as a shared library (no recompile of the app)
 
@@ -81,8 +130,11 @@ auto ps = rag::plugin::load_plugin_dir("./rag_plugins");             // whole di
 ```
 
 Build your plugin with the **same compiler and rag headers** as the host so both
-see the same registry singletons. See `examples/plugin_backend/` for a complete,
-buildable example.
+see the same registry singletons. `examples/plugin_backend/` has two complete,
+buildable examples: `my_embedder_plugin.cpp` (a minimal toy) and
+`local_embedder_plugin.cpp` (a real in-process character-n-gram LOCAL embedder,
+no external deps), each with a host demo that loads the `.so` and builds the
+backend by name.
 
 ## Polyglot backends — engines/retrievers/graphs in ANY language
 

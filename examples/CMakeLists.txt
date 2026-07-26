@@ -23,6 +23,17 @@ set_target_properties(reverse_hash_plugin PROPERTIES PREFIX "lib")
 add_executable(ragcpp_plugin_host plugin_backend/host_demo.cpp)
 target_link_libraries(ragcpp_plugin_host PRIVATE ragcpp)
 
+# A real LOCAL (in-process) embedder shipped as a plugin: character n-gram
+# feature-hashing, no external deps or network. Demonstrates that local
+# embedders are just another registry entry, and that config can compose them
+# (fallback/retry) declaratively. Host also shows the built-in onnx/gguf names.
+add_library(local_ngram_plugin SHARED plugin_backend/local_embedder_plugin.cpp)
+target_link_libraries(local_ngram_plugin PRIVATE ragcpp)
+set_target_properties(local_ngram_plugin PROPERTIES PREFIX "lib")
+
+add_executable(ragcpp_local_plugin_host plugin_backend/local_host_demo.cpp)
+target_link_libraries(ragcpp_local_plugin_host PRIVATE ragcpp)
+
 # ── Polyglot (Python / any-language) backend demo ─────────────────────────
 add_executable(ragcpp_python_backend polyglot/python_backend.cpp)
 target_link_libraries(ragcpp_python_backend PRIVATE ragcpp)

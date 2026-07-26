@@ -26,8 +26,8 @@ To carry one around type-erased (as the Engine does), wrap it in `AnyEmbedder`.
 | `OllamaEmbedder` | `"ollama"` | Local [Ollama](https://ollama.com) server (`nomic-embed-text`, etc.). |
 | `OpenAIEmbedder` | `"openai"` | OpenAI (and any OpenAI-compatible) embeddings endpoint. |
 | `LlamaCppEmbedder` | `"llamacpp"` | A running `llama.cpp` server's `/embedding` endpoint. |
-| `OnnxEmbedder` | (in-process) | ONNX Runtime, **in-process**. Needs `-DRAGCPP_WITH_ONNX=ON`. |
-| `GgufEmbedder` | (in-process) | GGUF via llama.cpp, **in-process**. Needs `-DRAGCPP_WITH_LLAMA=ON`. |
+| `OnnxEmbedder` | `"onnx"` | ONNX Runtime, **in-process**. Needs `-DRAGCPP_WITH_ONNX=ON`. |
+| `GgufEmbedder` | `"gguf"` | GGUF via llama.cpp, **in-process**. Needs `-DRAGCPP_WITH_LLAMA=ON`. |
 
 Network backends (Ollama / OpenAI / llama.cpp) all take an **injected
 `HttpTransport`** and degrade gracefully when the endpoint is unavailable.
@@ -74,6 +74,22 @@ they compose):
 
 Compose them: `Fallback{ Retrying{hosted}, local }` gives you retry-then-degrade.
 
+### Composing from config (no code)
+
+The decorators are also **registered by name**, taking nested embedder specs, so
+resilience is expressible in a config file:
+
+```jsonc
+{ "type": "fallback",
+  "primary":   { "type": "onnx",  "model_path": "bge-small-en.onnx" },
+  "secondary": { "type": "retry", "max_attempts": 3,
+                 "inner": { "type": "ollama", "model": "nomic-embed-text" } } }
+```
+
+`fallback` even degrades when the **primary can't be constructed** (e.g. this
+build lacks ONNX) — the same config then works on every build. Composition nests
+arbitrarily. See [`PLUGINS.md`](../PLUGINS.md#compose-resilience-from-config).
+
 ## The `HttpTransport` seam
 
 Every network backend takes a `std::shared_ptr<HttpTransport>`. The library ships
@@ -96,7 +112,8 @@ rag::dense::OllamaEmbedder e{{.model = "x"}, my_transport};
 ## In-process backends
 
 `OnnxEmbedder` and `GgufEmbedder` run the model **in your process** — no server,
-no HTTP hop — behind the same `Embedder` concept. They are opt-in at build time
+no HTTP hop — behind the same `Embedder` concept, and are selectable by name
+(`"onnx"` / `"gguf"`) like any other backend. They are opt-in at build time
 because they pull in a heavy dependency:
 
 ```sh
@@ -106,6 +123,9 @@ cmake -B build -DRAGCPP_WITH_ONNX=ON     # or -DRAGCPP_WITH_LLAMA=ON
 Without the flag the code isn't compiled in, and everything degrades to the
 network / hash backends. See `LocalEmbedderConfig` in
 `include/rag/dense/local_embedder.hpp` for the model-path / threads / tag knobs.
+A build without the flag still **resolves** `"onnx"`/`"gguf"` by name but returns
+a clear `unavailable` error — so a `fallback` naming a local primary degrades to
+its secondary instead of breaking.
 
 ## Remote embedders over a bridge
 

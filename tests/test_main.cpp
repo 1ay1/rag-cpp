@@ -2174,6 +2174,107 @@ TEST(plugin_reranker_registered) {
     CHECK(rag::plugin::Registry<rag::plugin::AnyReranker>::instance().contains("cross_encoder"));
 }
 
+TEST(plugin_local_embedders_registered_by_name) {
+    // onnx/gguf are in-process local backends. They must be reachable BY NAME
+    // like every network backend, so config/CLI/C-ABI can select them without
+    // the caller naming the C++ type. (They existed as classes but were not
+    // registered, so `{"type":"onnx"}` used to fail with "unknown type" even
+    // on a build that supports ONNX.)
+    rag::plugin::ensure_builtins_registered();
+    auto& reg = rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance();
+    CHECK(reg.contains("onnx"));
+    CHECK(reg.contains("gguf"));
+}
+
+TEST(plugin_local_embedder_reports_availability_not_unknown) {
+    // On a build WITHOUT the feature flag, the factory must surface a clear
+    // typed error (Errc::unavailable, from load()) — NOT not_found. The name
+    // existing but the feature not being compiled in is a categorically
+    // different, and more actionable, diagnostic than an unknown type.
+    auto e = rag::plugin::make_embedder(
+        nlohmann::json{{"type", "onnx"}, {"model_path", "x.onnx"}});
+    if (rag::dense::OnnxEmbedder::available()) {
+        // Built with ONNX: a bogus path fails, but not as "unknown type".
+        if (!e) CHECK(e.error().code != rag::Errc::not_found);
+    } else {
+        REQUIRE(!e.has_value());
+        CHECK_EQ(e.error().code, rag::Errc::unavailable);   // not not_found
+    }
+}
+
+TEST(plugin_retry_decorator_wraps_by_name) {
+    // retry composes: it resolves its "inner" spec through the SAME registry and
+    // wraps it. The wrapped embedder must still embed correctly.
+    auto e = rag::plugin::make_embedder(nlohmann::json{
+        {"type", "retry"},
+        {"max_attempts", 2},
+        {"inner", {{"type", "hash"}, {"dim", 96}}}});
+    REQUIRE(e.has_value());
+    CHECK_EQ(e->dimension(), 96u);
+    std::vector<std::string> texts{"hello world"};
+    auto v = e->embed(texts);
+    REQUIRE(v.has_value());
+    CHECK_EQ((*v)[0].size(), 96u);
+}
+
+TEST(plugin_retry_missing_inner_is_error) {
+    auto e = rag::plugin::make_embedder(nlohmann::json{{"type", "retry"}});
+    CHECK(!e.has_value());
+    CHECK_EQ(e.error().code, rag::Errc::invalid_argument);
+}
+
+TEST(plugin_fallback_composes_two_specs) {
+    // fallback resolves BOTH nested specs and wraps them. Both constructible
+    // here, so the primary is used; the decorator just has to build and embed.
+    auto e = rag::plugin::make_embedder(nlohmann::json{
+        {"type", "fallback"},
+        {"primary",   {{"type", "hash"}, {"dim", 128}}},
+        {"secondary", {{"type", "hash"}, {"dim", 128}}}});
+    REQUIRE(e.has_value());
+    CHECK_EQ(e->dimension(), 128u);
+}
+
+TEST(plugin_fallback_degrades_when_primary_unconstructable) {
+    // THE point of fallback: if the primary cannot even be BUILT (here: onnx on
+    // a build without ONNX support), construction degrades to the secondary
+    // instead of failing. A config that names a local model it cannot load must
+    // still yield a working embedder.
+    auto e = rag::plugin::make_embedder(nlohmann::json{
+        {"type", "fallback"},
+        {"primary",   {{"type", "onnx"}, {"model_path", "missing.onnx"}}},
+        {"secondary", {{"type", "hash"}, {"dim", 64}}}});
+    if (rag::dense::OnnxEmbedder::available()) return;   // primary builds; N/A here
+    REQUIRE(e.has_value());                             // degraded, not failed
+    CHECK_EQ(e->dimension(), 64u);                      // the secondary's dim
+    std::vector<std::string> texts{"still works"};
+    auto v = e->embed(texts);
+    REQUIRE(v.has_value());
+    CHECK_EQ((*v)[0].size(), 64u);
+}
+
+TEST(plugin_fallback_needs_both_specs) {
+    auto e = rag::plugin::make_embedder(nlohmann::json{
+        {"type", "fallback"},
+        {"primary", {{"type", "hash"}}}});   // no secondary
+    CHECK(!e.has_value());
+    CHECK_EQ(e.error().code, rag::Errc::invalid_argument);
+}
+
+TEST(plugin_composition_nests_arbitrarily) {
+    // The recursive resolution must nest to any depth: retry(fallback(a, b)).
+    // This also exercises that Registry invokes factories UNLOCKED — building
+    // this spec re-enters the same singleton three times on one thread, which
+    // would deadlock a naive lock-around-factory design.
+    auto e = rag::plugin::make_embedder(nlohmann::json{
+        {"type", "retry"},
+        {"inner", {{"type", "fallback"},
+                   {"primary",   {{"type", "onnx"}, {"model_path", "x.onnx"}}},
+                   {"secondary", {{"type", "hash"}, {"dim", 200}}}}}});
+    if (rag::dense::OnnxEmbedder::available()) return;
+    REQUIRE(e.has_value());
+    CHECK_EQ(e->dimension(), 200u);   // onnx unavailable -> fallback -> hash(200)
+}
+
 TEST(plugin_load_missing_lib_is_error) {
     auto r = rag::plugin::load_plugin("/no/such/plugin.so");
     CHECK(!r.has_value());
