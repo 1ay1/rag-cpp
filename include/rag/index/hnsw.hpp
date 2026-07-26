@@ -266,6 +266,25 @@ public:
     [[nodiscard]] std::size_t memory_bytes() const noexcept { return memory_use().total(); }
     [[nodiscard]] const HnswConfig& config() const noexcept { return cfg_; }
 
+    // Serialize the graph to a versioned blob / parse one back.
+    //
+    // TOMBSTONES ARE NOT PERSISTED. The deleted_ set built by remove() lives
+    // only in memory, so a serialize()/deserialize() round-trip returns a graph
+    // in which every soft-deleted id is live again. This is a deliberate format
+    // choice — tombstones are a walk optimisation, and the OWNER of the index
+    // is the authority on what is deleted — but it is a sharp edge, and it has
+    // already caused two real bugs:
+    //
+    //   * Corpus::dense_search's HNSW branch trusted the graph tombstones and
+    //     returned deleted documents after save()/load(), while is_deleted()
+    //     still reported them deleted. It now filters on the PERSISTED
+    //     deleted_docs_ (the TOMB section) instead.
+    //   * VectorStore::save() persisted a graph whose removed ids came back on
+    //     load(). It now calls compact() first, which physically drops them.
+    //
+    // So: if you persist an HnswIndex that may hold tombstones, you must either
+    // (a) compact() before serializing, or (b) keep your own durable delete set
+    // and consult it on every read path. Do not assume the graph remembers.
     [[nodiscard]] std::string serialize() const;
     [[nodiscard]] static Result<HnswIndex> deserialize(std::string_view blob);
 

@@ -266,6 +266,15 @@ void Corpus::ensure_packed() const {
             // A mixed-dimension corpus is already broken, but it must not turn
             // into an out-of-bounds GPU read.
             if (ch.embedding.size() != packed_dim_) continue;
+            // Skip SOFT-DELETED documents. The batch path scores this matrix
+            // directly and builds hits straight from packed_ids_, so anything
+            // packed here is returnable — unlike the per-query path, there is no
+            // later deleted_docs_ check to catch it. Excluding at pack time is
+            // also strictly cheaper than filtering afterwards: the GPU never
+            // scores a row that could not have been returned. The mirror is
+            // keyed on epoch_, which remove_document bumps, so a delete
+            // invalidates and rebuilds it.
+            if (!deleted_docs_.empty() && deleted_docs_.count(ch.doc.get())) continue;
             packed_.insert(packed_.end(), ch.embedding.begin(), ch.embedding.end());
             packed_ids_.push_back(ch.id.get());
         }
@@ -434,12 +443,31 @@ Result<std::vector<Hit>> Corpus::dense_search_locked(std::string_view query, std
     if (!qv) return std::unexpected(qv.error());
     dense::normalize(*qv);
 
-    // Build an allow-predicate over chunk id from the metadata filter.
+    // Build an allow-predicate over chunk id from the metadata filter AND the
+    // soft-delete tombstones.
+    //
+    // deleted_docs_ must be consulted HERE, not left to the graph's own
+    // tombstones, because HnswIndex::serialize() does NOT persist its deleted_
+    // set. In memory the graph tombstone (set by remove_document) hides the
+    // chunk; after save()/load() the graph comes back with no tombstones at all,
+    // and this path would happily return a deleted document — a
+    // delete-then-restart silently resurrected it, fully searchable, while
+    // is_deleted() still reported true. The lexical and brute-force dense paths
+    // already filtered on deleted_docs_; the HNSW branch was the one hole.
+    //
+    // deleted_docs_ IS persisted (the TOMB section), so it is the authoritative
+    // source of truth on both sides of a reload. Keeping the graph tombstones
+    // too is still worthwhile: they prune the walk instead of merely filtering
+    // its output, so a live process does less work.
+    const bool have_tombs = !deleted_docs_.empty();
     HnswIndex::AllowFn allow;
-    if (filter) {
-        allow = [this, &filter](std::uint32_t id) -> bool {
+    if (filter || have_tombs) {
+        allow = [this, &filter, have_tombs](std::uint32_t id) -> bool {
             const Chunk* ch = (id < chunks_.size()) ? &chunks_[id] : nullptr;
-            if (!ch || !ch->meta) return false;
+            if (!ch) return false;
+            if (have_tombs && deleted_docs_.count(ch->doc.get())) return false;
+            if (!filter) return true;
+            if (!ch->meta) return false;
             return filter(*ch->meta);
         };
     }

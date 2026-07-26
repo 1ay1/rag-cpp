@@ -969,6 +969,136 @@ TEST(mmr_cached_selection_matches_the_naive_greedy) {
     CHECK(!got.empty());
 }
 
+// ─── Soft-delete durability across every dense path ─────────────────────
+//
+// HnswIndex::serialize() does NOT persist its deleted_ tombstone set. That is
+// fine for the graph itself (tombstones are a walk optimisation), but it means
+// deleted_docs_ — which IS persisted, in the TOMB section — has to be the
+// authoritative filter on every path that can return a chunk. The lexical and
+// brute-force dense paths always did; the HNSW branch and the batch/GPU branch
+// did not, so a delete survived in memory and RESURRECTED after save()/load().
+
+namespace {
+// Build a corpus that is forced onto the HNSW path (threshold lowered) with an
+// embedder attached, and return the DocId of the document at index `victim`.
+rag::index::Corpus tomb_corpus(std::size_t docs, std::size_t victim, rag::DocId& out) {
+    rag::index::CorpusConfig cfg;
+    cfg.hnsw_threshold = 50;                       // force graph construction
+    rag::index::Corpus c{cfg};
+    c.set_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{64}});
+    for (std::size_t i = 0; i < docs; ++i) {
+        auto id = c.add_document("d" + std::to_string(i),
+                                 "alpha beta gamma document " + std::to_string(i));
+        if (i == victim && id) out = *id;
+    }
+    (void)c.build();
+    return c;
+}
+bool contains_doc(const std::vector<rag::Hit>& hits, const rag::index::Corpus& c, rag::DocId d) {
+    for (const auto& h : hits) {
+        const rag::Chunk* ch = c.chunk(h.chunk);
+        if (ch && ch->doc.get() == d.get()) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST(deleted_document_stays_deleted_through_the_hnsw_path) {
+    rag::DocId victim{};
+    auto c = tomb_corpus(200, 7, victim);
+    REQUIRE(c.remove_document(victim).has_value());
+    auto hits = c.dense_search("alpha beta gamma document 7", 10);
+    REQUIRE(hits.has_value());
+    CHECK(!contains_doc(*hits, c, victim));
+}
+
+TEST(deleted_document_does_not_resurrect_after_save_and_load) {
+    // THE regression: the graph reloads WITHOUT tombstones, so before the fix a
+    // deleted document came back fully searchable while is_deleted() still said
+    // it was gone.
+    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp")
+                     + "/ragcpp_tomb_reload.ragdb";
+    rag::DocId victim{};
+    {
+        auto c = tomb_corpus(200, 7, victim);
+        REQUIRE(c.remove_document(victim).has_value());
+        REQUIRE(c.save(path).has_value());
+    }
+    auto re = rag::index::Corpus::load(path);
+    REQUIRE(re.has_value());
+    re->set_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{64}});
+    CHECK(re->is_deleted(victim));                       // tombstone persisted
+    auto hits = re->dense_search("alpha beta gamma document 7", 10);
+    REQUIRE(hits.has_value());
+    CHECK(!contains_doc(*hits, *re, victim));            // and it is HONOURED
+    std::remove(path.c_str());
+}
+
+TEST(deleted_document_is_excluded_from_the_batch_mirror) {
+    // dense_search_batch's scan branch scores the packed mirror and builds hits
+    // straight from packed_ids_, with NO later deleted_docs_ check — so the
+    // exclusion has to happen when the mirror is packed. Asserting on the
+    // mirror's row count rather than on search output is deliberate: the batch
+    // path only reaches the mirror when a GPU is present, so a search-level
+    // assertion silently tests the CPU fallback (which was already correct) on
+    // every GPU-less machine and CI runner, and would gate nothing.
+    rag::index::Corpus c;
+    c.set_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{64}});
+    rag::DocId victim{};
+    for (int i = 0; i < 100; ++i) {
+        auto id = c.add_document("b" + std::to_string(i),
+                                 "delta epsilon zeta record " + std::to_string(i));
+        if (i == 5 && id) victim = *id;
+    }
+    REQUIRE(c.build().has_value());
+    const std::size_t before = c.batch_row_count();
+    CHECK(before > 0);
+
+    REQUIRE(c.remove_document(victim).has_value());
+    const std::size_t after = c.batch_row_count();
+    // The victim's chunk(s) must be gone from what the GPU would score.
+    CHECK(after < before);
+
+    // And the batch API itself must agree (CPU fallback path here).
+    std::vector<std::string> qs{"delta epsilon zeta record 5", "delta epsilon zeta record 6"};
+    auto batches = c.dense_search_batch(qs, 10, rag::index::MetaFilter{});
+    REQUIRE(batches.has_value());
+    REQUIRE(batches->size() == std::size_t{2});
+    for (const auto& b : *batches) CHECK(!contains_doc(b, c, victim));
+}
+
+TEST(batch_mirror_rebuilds_after_a_delete) {
+    // The mirror is epoch-keyed and remove_document bumps the epoch, so a stale
+    // mirror (which would still contain the deleted rows) must not be reused.
+    rag::index::Corpus c;
+    c.set_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{32}});
+    std::vector<rag::DocId> ids;
+    for (int i = 0; i < 20; ++i) {
+        auto id = c.add_document("m" + std::to_string(i), "row content " + std::to_string(i));
+        if (id) ids.push_back(*id);
+    }
+    REQUIRE(c.build().has_value());
+    std::size_t rows = c.batch_row_count();          // forces a pack
+    for (std::size_t i = 0; i < 5; ++i) {
+        REQUIRE(c.remove_document(ids[i]).has_value());
+        std::size_t now = c.batch_row_count();
+        CHECK(now < rows);                            // rebuilt, not cached
+        rows = now;
+    }
+}
+
+TEST(tombstone_and_metadata_filter_compose) {
+    // The allow-predicate now carries BOTH concerns; neither may cancel the
+    // other out. A filter that admits everything must still hide a deleted doc.
+    rag::DocId victim{};
+    auto c = tomb_corpus(200, 11, victim);
+    REQUIRE(c.remove_document(victim).has_value());
+    rag::index::MetaFilter allow_all = [](const rag::Metadata&) { return true; };
+    auto hits = c.dense_search("alpha beta gamma document 11", 10, allow_all);
+    REQUIRE(hits.has_value());
+    CHECK(!contains_doc(*hits, c, victim));
+}
+
 TEST(hnsw_presets_are_ordered_points_on_the_curve) {
     using C = rag::index::HnswConfig;
     // fast < balanced < accurate on the recall knobs; compact drops floats.

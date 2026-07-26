@@ -207,6 +207,21 @@ public:
     [[nodiscard]] std::size_t     document_count() const noexcept {
         std::shared_lock lk(mu_); return docs_.size();
     }
+
+    // How many chunk rows dense_search_batch() would actually score.
+    //
+    // This is the packed GPU mirror's row count, which is NOT chunk_count():
+    // rows are omitted for chunks with no embedding, for ragged
+    // (wrong-dimension) rows, and for chunks belonging to soft-deleted
+    // documents. That last exclusion is load-bearing — the batch path builds
+    // hits straight from the mirror with no later tombstone check — and it is
+    // otherwise unobservable, since the batch path only reaches the mirror when
+    // a GPU is present. Exposed so the invariant is testable on any machine.
+    [[nodiscard]] std::size_t batch_row_count() const noexcept {
+        std::shared_lock lk(mu_);
+        ensure_packed();
+        return packed_ids_.size();
+    }
     // A borrowed, READ-LOCKED view of the chunk vector.
     //
     // This exists because the obvious accessor — `const std::vector<Chunk>&
