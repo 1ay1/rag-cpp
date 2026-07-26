@@ -30,6 +30,8 @@
 // that differs is the ranking policy under test.
 
 #include <cstdio>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -40,6 +42,7 @@
 #include "rag/eval/beir.hpp"
 #include "rag/index/corpus.hpp"
 #include "rag/pipeline/pipeline.hpp"
+#include "rag/rerank/reranker.hpp"
 
 namespace {
 
@@ -140,6 +143,26 @@ int main(int argc, char** argv) {
     auto doc_uri = index_dataset(*ds, corpus);
     std::printf("indexed %zu chunks\n\n", corpus.chunk_count());
 
+    // Optionally attach an in-process cross-encoder. Reranking is the accuracy
+    // ceiling of the funnel: retrieval decides WHICH ~100 chunks are candidates,
+    // the cross-encoder re-scores each (query,passage) jointly and reorders the
+    // top-k. It only ever sees what retrieval already narrowed to, so the
+    // measured lift is purely "better ordering of the same candidates".
+    const std::string rr_model = opt(argc, argv, "--reranker", "");
+    const std::string rr_tok   = opt(argc, argv, "--reranker-tokenizer", "");
+    const std::size_t rr_topn  = std::strtoul(opt(argc, argv, "--rerank-topn", "100").c_str(), nullptr, 10);
+    std::optional<rag::rerank::AnyReranker> reranker;
+    if (!rr_model.empty()) {
+        rag::dense::LocalEmbedderConfig rc;
+        rc.model_path = rr_model;
+        rc.tokenizer_path = rr_tok;
+        rc.max_tokens = 512;   // cross-encoders read query+passage; give room
+        auto rr = rag::rerank::OnnxReranker::load(rc);
+        if (!rr) { std::printf("reranker error: %s\n", rr.error().message.c_str()); return 1; }
+        std::printf("reranker: %s (in-process cross-encoder, top-%zu)\n", rr_model.c_str(), rr_topn);
+        reranker.emplace(rag::rerank::AnyReranker{std::move(*rr)});
+    }
+
     // With a model attached, the pure-dense arm is worth reporting on its own:
     // hybrid should beat BOTH halves, and showing only the winner hides whether
     // fusion is actually contributing.
@@ -171,6 +194,17 @@ int main(int argc, char** argv) {
     if (all || variant == "standard") pipeline_variant("standard", rag::pipeline::Pipeline::standard());
     if (all || variant == "quality")  pipeline_variant("quality",  rag::pipeline::Pipeline::quality());
     if (all || variant == "context")  pipeline_variant("context",  rag::pipeline::Pipeline::context());
+
+    // The rerank arm: same retrieval, then an in-process cross-encoder reorders
+    // the top-N. This is where hybrid retrieval crosses into SOTA — if the
+    // cross-encoder cannot lift nDCG@10 above the retrieval-only number, it is
+    // not earning its latency, and this measures exactly that. AnyReranker holds
+    // a shared_ptr to the loaded model, so the copy into the stage is cheap.
+    if (reranker) {
+        auto std_rr = rag::pipeline::Pipeline::standard().add(
+            rag::rerank::make_rerank_stage(*reranker, rr_topn, /*blend=*/1.0f, "cross_encoder"));
+        pipeline_variant("standard+rerank", std::move(std_rr));
+    }
 
     std::printf("\nRead nDCG@10 as the headline. R@100 is the ceiling any reranking\n"
                 "policy could reach: when R@100 >> nDCG@10, the right documents are\n"

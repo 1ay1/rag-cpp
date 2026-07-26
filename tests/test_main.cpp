@@ -20,6 +20,7 @@
 #include <rag/rag.hpp>
 #include <rag/gpu/device.hpp>
 #include <rag/util/parallel.hpp>
+#include <rag/dense/wordpiece.hpp>   // header-only; pair encoding is testable w/o ONNX
 
 namespace {
 struct Case { std::string name; std::function<void()> fn; };
@@ -2330,6 +2331,118 @@ TEST(scorefn_reranker_reorders) {
     REQUIRE(scores.has_value());
     REQUIRE(scores->size() == 3);
     CHECK((*scores)[1] > (*scores)[0]);
+}
+
+// ── WordPiece pair encoding (cross-encoder input) ────────────────────────────
+// A cross-encoder is trained on `[CLS] query [SEP] passage [SEP]` with
+// token_type_ids 0 over the first span and 1 over the second. If encode_pair
+// gets that structure wrong, every reranker score is meaningless — so this pins
+// the exact shape the ONNX reranker feeds the model.
+namespace {
+rag::dense::WordPieceTokenizer tiny_wordpiece() {
+    // A minimal BERT-style vocab.txt: specials first, then whole words.
+    const std::string path = "/tmp/ragcpp_tiny_vocab.txt";
+    std::ofstream f(path);
+    // Standard BERT special ordering so ids match the tokenizer defaults
+    // ([PAD]=0, [UNK]=100, [CLS]=101, [SEP]=102). Pad the gap with fillers.
+    f << "[PAD]\n";
+    for (int i = 1; i < 100; ++i) f << "[unused" << i << "]\n";
+    f << "[UNK]\n[CLS]\n[SEP]\n";        // 100,101,102
+    for (auto* w : {"cat", "dog", "sky", "blue", "runs"}) f << w << "\n";
+    f.close();
+    auto t = rag::dense::WordPieceTokenizer::load(path);
+    return t ? std::move(*t) : rag::dense::WordPieceTokenizer{};
+}
+} // namespace
+
+TEST(wordpiece_pair_encoding_has_correct_structure) {
+    auto tok = tiny_wordpiece();
+    auto e = tok.encode_pair("cat", "dog blue", 32);
+    // [CLS] cat [SEP] dog blue [SEP]
+    REQUIRE(e.ids.size() == e.mask.size());
+    REQUIRE(e.ids.size() == e.type_ids.size());
+    CHECK_EQ(e.ids.front(), std::int64_t{101});   // [CLS]
+    CHECK_EQ(e.ids.back(),  std::int64_t{102});   // trailing [SEP]
+    // Exactly two [SEP] separators.
+    int seps = 0; for (auto id : e.ids) if (id == 102) ++seps;
+    CHECK_EQ(seps, 2);
+    // mask is all 1 (no padding at this length).
+    for (auto m : e.mask) CHECK_EQ(m, std::int64_t{1});
+    // token_type_ids: 0 over `[CLS] cat [SEP]`, then 1 over `dog blue [SEP]`.
+    // The first 0 is [CLS]; the first 1 must appear AFTER the first [SEP].
+    std::size_t first_sep = 0;
+    while (first_sep < e.ids.size() && e.ids[first_sep] != 102) ++first_sep;
+    for (std::size_t i = 0; i <= first_sep; ++i) CHECK_EQ(e.type_ids[i], std::int64_t{0});
+    for (std::size_t i = first_sep + 1; i < e.type_ids.size(); ++i) CHECK_EQ(e.type_ids[i], std::int64_t{1});
+    // No unknowns for in-vocab words.
+    for (auto id : e.ids) CHECK(id != 100);
+}
+
+TEST(wordpiece_single_encode_is_all_segment_zero) {
+    // encode() must still behave: single sequence, all type_ids 0, one [SEP].
+    auto tok = tiny_wordpiece();
+    auto e = tok.encode("cat dog", 32);
+    CHECK_EQ(e.ids.front(), std::int64_t{101});
+    CHECK_EQ(e.ids.back(),  std::int64_t{102});
+    REQUIRE(e.type_ids.size() == e.ids.size());
+    for (auto t : e.type_ids) CHECK_EQ(t, std::int64_t{0});
+    int seps = 0; for (auto id : e.ids) if (id == 102) ++seps;
+    CHECK_EQ(seps, 1);
+}
+
+TEST(wordpiece_pair_budget_truncates_without_dropping_query) {
+    // Even with a long passage and a tight budget, the query span must survive
+    // (truncating the query loses the information need). Query is capped at ~1/3.
+    auto tok = tiny_wordpiece();
+    std::string longpass;
+    for (int i = 0; i < 50; ++i) longpass += "dog ";
+    auto e = tok.encode_pair("cat sky runs", longpass, 16);
+    CHECK(e.ids.size() <= 16u);
+    // The query tokens (cat/sky/runs map to ids 103/105/107) must appear before
+    // the first [SEP] — at least one survived truncation.
+    std::size_t first_sep = 0;
+    while (first_sep < e.ids.size() && e.ids[first_sep] != 102) ++first_sep;
+    CHECK(first_sep >= 2);   // [CLS] + at least one query token before [SEP]
+}
+
+// ── In-process ONNX cross-encoder (graceful without the flag) ─────────────────
+TEST(onnx_reranker_reports_availability) {
+    // Mirrors local_embedder_reports_availability: without RAGCPP_WITH_ONNX,
+    // load() must fail with `unavailable`, never crash.
+    if (!rag::rerank::OnnxReranker::available()) {
+        rag::dense::LocalEmbedderConfig cfg; cfg.model_path = "nope.onnx";
+        auto r = rag::rerank::OnnxReranker::load(cfg);
+        CHECK(!r.has_value());
+        if (!r) CHECK(r.error().code == rag::Errc::unavailable);
+    }
+}
+
+TEST(plugin_onnx_reranker_registered_by_name) {
+    // The in-process cross-encoder must be reachable BY NAME like cross_encoder,
+    // so config/CLI can select {"type":"onnx"} for reranking too.
+    rag::plugin::ensure_builtins_registered();
+    CHECK(rag::plugin::Registry<rag::plugin::AnyReranker>::instance().contains("onnx"));
+}
+
+TEST(onnx_reranker_real_model_if_available) {
+    // Set RAGCPP_TEST_RERANK_MODEL / _TOKENIZER to a real cross-encoder ONNX to
+    // exercise the true path: the relevant passage must outscore the irrelevant.
+    if (!rag::rerank::OnnxReranker::available()) { CHECK(true); return; }
+    const char* model = std::getenv("RAGCPP_TEST_RERANK_MODEL");
+    const char* toks  = std::getenv("RAGCPP_TEST_RERANK_TOKENIZER");
+    if (!model || !toks) { CHECK(true); return; }
+    rag::dense::LocalEmbedderConfig cfg;
+    cfg.model_path = model; cfg.tokenizer_path = toks; cfg.max_tokens = 512;
+    auto rr = rag::rerank::OnnxReranker::load(cfg);
+    REQUIRE(rr.has_value());
+    std::vector<std::string> ps = {
+        "The weather is pleasant in spring.",
+        "Berlin has a population of 3.75 million inhabitants.",
+    };
+    auto s = rr->rerank("How many people live in Berlin?", ps);
+    REQUIRE(s.has_value());
+    REQUIRE(s->size() == 2);
+    CHECK((*s)[1] > (*s)[0]);   // the population passage wins
 }
 
 TEST(prf_expand_stage_grows_query) {

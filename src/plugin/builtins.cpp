@@ -186,6 +186,16 @@ void register_rerankers() {
                 c.get("host", "127.0.0.1"), static_cast<std::uint16_t>(c.get<int>("port", 8080)));
             return AnyReranker{rerank::CrossEncoderReranker{std::move(cfg)}};
         });
+
+    // In-process cross-encoder (no network), gated exactly like the onnx
+    // embedder: the name always resolves, and without RAGCPP_WITH_ONNX load()
+    // returns Errc::unavailable rather than "unknown type".
+    register_reranker("onnx", "in-process ONNX cross-encoder (keys: model_path, tokenizer_path, max_tokens, threads)",
+        [](Config c) -> Result<AnyReranker> {
+            auto r = rerank::OnnxReranker::load(local_cfg(c));
+            if (!r) return std::unexpected(r.error());
+            return AnyReranker{std::move(*r)};
+        });
 }
 
 } // namespace

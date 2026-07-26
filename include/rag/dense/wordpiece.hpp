@@ -8,6 +8,7 @@
 // nlohmann/json, already a dependency).
 
 #include <cstdint>
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -24,6 +25,11 @@ namespace rag::dense {
 struct Encoded {
     std::vector<std::int64_t> ids;
     std::vector<std::int64_t> mask;
+    // Segment ids: 0 for the first sequence, 1 for the second. For a single
+    // sequence every entry is 0; a cross-encoder pair uses 0 over
+    // `[CLS] query [SEP]` and 1 over `passage [SEP]`. BERT-family models read
+    // these as `token_type_ids`; models without that input simply ignore them.
+    std::vector<std::int64_t> type_ids;
 };
 
 class WordPieceTokenizer {
@@ -68,6 +74,47 @@ public:
         if (e.ids.size() + 1 > max_tokens) e.ids.resize(max_tokens - 1);
         e.ids.push_back(sep_);
         e.mask.assign(e.ids.size(), 1);
+        e.type_ids.assign(e.ids.size(), 0);
+        return e;
+    }
+
+    // Cross-encoder pair encoding: `[CLS] a [SEP] b [SEP]`, with token_type_ids
+    // 0 over the `[CLS] a [SEP]` span and 1 over the `b [SEP]` span. This is the
+    // exact sequence a HuggingFace `AutoModelForSequenceClassification` reranker
+    // (mono-BERT, bge-reranker, ms-marco cross-encoders) was trained on, so the
+    // relevance logit it emits is only meaningful for input shaped this way.
+    //
+    // The budget is split so the passage never crowds out the query: the query
+    // is capped at a third of the window (queries are short; truncating them
+    // loses the actual information need), the passage takes the rest. Both share
+    // the greedy WordPiece path used by `encode`, so behaviour matches.
+    Encoded encode_pair(std::string_view a, std::string_view b, std::size_t max_tokens) const {
+        // Reserve room for [CLS] + two [SEP].
+        const std::size_t budget = max_tokens > 3 ? max_tokens - 3 : 1;
+        const std::size_t a_budget = std::max<std::size_t>(1, budget / 3);
+
+        std::vector<std::int64_t> a_ids, b_ids;
+        for (auto& word : basic_split(a)) {
+            wordpiece(word, a_ids);
+            if (a_ids.size() >= a_budget) { a_ids.resize(a_budget); break; }
+        }
+        const std::size_t b_budget = budget > a_ids.size() ? budget - a_ids.size() : 1;
+        for (auto& word : basic_split(b)) {
+            wordpiece(word, b_ids);
+            if (b_ids.size() >= b_budget) { b_ids.resize(b_budget); break; }
+        }
+
+        Encoded e;
+        e.ids.push_back(cls_);
+        e.ids.insert(e.ids.end(), a_ids.begin(), a_ids.end());
+        e.ids.push_back(sep_);
+        const std::size_t seg0 = e.ids.size();          // [CLS] a [SEP]
+        e.ids.insert(e.ids.end(), b_ids.begin(), b_ids.end());
+        e.ids.push_back(sep_);
+
+        e.mask.assign(e.ids.size(), 1);
+        e.type_ids.assign(e.ids.size(), 0);
+        for (std::size_t i = seg0; i < e.type_ids.size(); ++i) e.type_ids[i] = 1;
         return e;
     }
 

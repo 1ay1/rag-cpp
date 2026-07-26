@@ -3,9 +3,16 @@
 #include "rag/rerank/reranker.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <thread>
 
 #include <nlohmann/json.hpp>
+
+#ifdef RAGCPP_WITH_ONNX
+#include <onnxruntime_cxx_api.h>
+#include "rag/dense/wordpiece.hpp"
+#endif
 
 namespace rag::rerank {
 
@@ -74,6 +81,121 @@ CrossEncoderReranker::rerank(std::string_view query, std::span<const std::string
         if (idx < scores.size()) scores[idx] = s;
     }
     return scores;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// OnnxReranker — in-process cross-encoder
+// ══════════════════════════════════════════════════════════════════════════
+struct OnnxReranker::Impl {
+    dense::LocalEmbedderConfig cfg;
+    std::string id = "onnx-rerank";
+#ifdef RAGCPP_WITH_ONNX
+    Ort::Env            env{ORT_LOGGING_LEVEL_WARNING, "ragcpp-rerank"};
+    Ort::SessionOptions opts;
+    std::unique_ptr<Ort::Session> session;
+    dense::WordPieceTokenizer     tok;
+    bool                has_token_type = false;
+#endif
+};
+
+OnnxReranker::OnnxReranker() : impl_(std::make_unique<Impl>()) {}
+OnnxReranker::OnnxReranker(OnnxReranker&&) noexcept = default;
+OnnxReranker& OnnxReranker::operator=(OnnxReranker&&) noexcept = default;
+OnnxReranker::~OnnxReranker() = default;
+
+std::string_view OnnxReranker::identity() const { return impl_->id; }
+
+Result<OnnxReranker> OnnxReranker::load(dense::LocalEmbedderConfig cfg) {
+#ifndef RAGCPP_WITH_ONNX
+    (void)cfg;
+    return std::unexpected(Error{Errc::unavailable,
+        "ragcpp built without ONNX support (configure -DRAGCPP_WITH_ONNX=ON)"});
+#else
+    OnnxReranker r;
+    auto& im = *r.impl_;
+    im.cfg = std::move(cfg);
+    if (!im.cfg.identity_tag.empty()) im.id = im.cfg.identity_tag;
+    int threads = im.cfg.threads > 0 ? im.cfg.threads
+                : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    im.opts.SetIntraOpNumThreads(threads);
+    im.opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    try {
+        auto tk = dense::WordPieceTokenizer::load(im.cfg.tokenizer_path);
+        if (!tk) return std::unexpected(tk.error());
+        im.tok = std::move(*tk);
+#ifdef _WIN32
+        std::wstring wpath(im.cfg.model_path.begin(), im.cfg.model_path.end());
+        im.session = std::make_unique<Ort::Session>(im.env, wpath.c_str(), im.opts);
+#else
+        im.session = std::make_unique<Ort::Session>(im.env, im.cfg.model_path.c_str(), im.opts);
+#endif
+        // A cross-encoder is a sequence-classification head: input_ids +
+        // attention_mask, and (for BERT-family) token_type_ids as a third input.
+        im.has_token_type = im.session->GetInputCount() >= 3;
+    } catch (const std::exception& ex) {
+        return std::unexpected(Error{Errc::corrupt_index,
+            std::string("onnx reranker load failed: ") + ex.what()});
+    }
+    return r;
+#endif
+}
+
+Result<std::vector<float>>
+OnnxReranker::rerank(std::string_view query, std::span<const std::string> passages) const {
+#ifndef RAGCPP_WITH_ONNX
+    (void)query; (void)passages;
+    return std::unexpected(Error{Errc::unavailable, "onnx reranker unavailable"});
+#else
+    if (passages.empty()) return std::vector<float>{};
+    auto& im = *impl_;
+    Ort::AllocatorWithDefaultOptions alloc;
+    Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+    std::vector<std::string> in_names, out_names;
+    for (std::size_t i = 0; i < im.session->GetInputCount(); ++i)
+        in_names.push_back(im.session->GetInputNameAllocated(i, alloc).get());
+    for (std::size_t i = 0; i < im.session->GetOutputCount(); ++i)
+        out_names.push_back(im.session->GetOutputNameAllocated(i, alloc).get());
+    std::vector<const char*> in_c, out_c;
+    for (auto& s : in_names)  in_c.push_back(s.c_str());
+    for (auto& s : out_names) out_c.push_back(s.c_str());
+
+    std::vector<float> scores;
+    scores.reserve(passages.size());
+    try {
+        for (const auto& p : passages) {
+            // The query is the FIRST sequence, the passage the SECOND — the order
+            // cross-encoders are trained on. encode_pair sets token_type_ids.
+            auto enc = im.tok.encode_pair(query, p, im.cfg.max_tokens);
+            const std::int64_t L = static_cast<std::int64_t>(enc.ids.size());
+            std::array<std::int64_t, 2> shape{1, L};
+            std::vector<Ort::Value> inputs;
+            inputs.push_back(Ort::Value::CreateTensor<std::int64_t>(
+                mem, enc.ids.data(), enc.ids.size(), shape.data(), 2));
+            inputs.push_back(Ort::Value::CreateTensor<std::int64_t>(
+                mem, enc.mask.data(), enc.mask.size(), shape.data(), 2));
+            if (im.has_token_type) {
+                inputs.push_back(Ort::Value::CreateTensor<std::int64_t>(
+                    mem, enc.type_ids.data(), enc.type_ids.size(), shape.data(), 2));
+            }
+            auto res = im.session->Run(Ort::RunOptions{nullptr},
+                in_c.data(), inputs.data(), inputs.size(), out_c.data(), 1);
+            // Classifier logits: shape [1, num_labels]. A reranker head has 1
+            // label (mono relevance) — take logit[0]. If a model emits 2 labels
+            // (irrelevant/relevant, e.g. some ms-marco exports), the positive
+            // class is the last logit, which is what ranking should key on.
+            auto info = res[0].GetTensorTypeAndShapeInfo();
+            auto dims = info.GetShape();
+            const std::int64_t n_labels = dims.empty() ? 1 : dims.back();
+            const float* logits = res[0].GetTensorData<float>();
+            scores.push_back(n_labels >= 2 ? logits[n_labels - 1] : logits[0]);
+        }
+    } catch (const std::exception& ex) {
+        return std::unexpected(Error{Errc::transport_error,
+            std::string("onnx reranker run failed: ") + ex.what()});
+    }
+    return scores;
+#endif
 }
 
 // ─── Pipeline stage ───────────────────────────────────────────────────────────

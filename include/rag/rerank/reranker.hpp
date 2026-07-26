@@ -29,6 +29,7 @@
 
 #include "rag/core/types.hpp"
 #include "rag/dense/embedder.hpp"     // HttpTransport seam
+#include "rag/dense/local_embedder.hpp" // LocalEmbedderConfig (reused for paths)
 #include "rag/index/corpus.hpp"
 #include "rag/pipeline/pipeline.hpp"
 
@@ -91,6 +92,50 @@ private:
     Fn fn_;
 };
 
+// ─── In-process ONNX cross-encoder (no network) ───────────────────────────
+// The reranking counterpart to OnnxEmbedder: loads a HuggingFace sequence-
+// classification cross-encoder exported to ONNX (bge-reranker, ms-marco
+// MiniLM cross-encoders, mono-BERT) and scores (query, passage) pairs IN
+// PROCESS — no server, no network — which is what most deployments want. It
+// jointly encodes the pair as `[CLS] query [SEP] passage [SEP]` and reads the
+// model's single relevance logit, the accuracy ceiling of the retrieval funnel.
+//
+// Gated behind RAGCPP_WITH_ONNX exactly like OnnxEmbedder: without the flag the
+// class is still DECLARED (callers compile) but load() returns Errc::unavailable
+// — the same graceful-degradation contract. Reuses LocalEmbedderConfig for the
+// model_path / tokenizer_path / max_tokens / threads fields.
+class OnnxReranker {
+public:
+    // Load a cross-encoder. Fails with Errc::unavailable if built without ONNX,
+    // or a typed error if the model/tokenizer file is missing or malformed.
+    [[nodiscard]] static Result<OnnxReranker> load(dense::LocalEmbedderConfig cfg);
+
+    // Score `query` against each passage; returns one relevance per passage in
+    // input order. Higher is more relevant (raw logit; monotonic, un-normalized).
+    [[nodiscard]] Result<std::vector<float>>
+    rerank(std::string_view query, std::span<const std::string> passages) const;
+
+    [[nodiscard]] std::string_view identity() const;
+
+    // Compile-time capability flag (mirrors OnnxEmbedder::available()).
+    [[nodiscard]] static constexpr bool available() noexcept {
+#ifdef RAGCPP_WITH_ONNX
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    OnnxReranker(OnnxReranker&&) noexcept;
+    OnnxReranker& operator=(OnnxReranker&&) noexcept;
+    ~OnnxReranker();
+
+private:
+    OnnxReranker();
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // ─── Type-erased reranker ─────────────────────────────────────────────────────
 class AnyReranker {
 public:
@@ -123,5 +168,6 @@ make_rerank_stage(AnyReranker reranker, std::size_t top_n = 50, float blend = 1.
 
 static_assert(Reranker<CrossEncoderReranker>);
 static_assert(Reranker<ScoreFnReranker>);
+static_assert(Reranker<OnnxReranker>);
 
 } // namespace rag::rerank
