@@ -14,6 +14,16 @@ option(RAGCPP_WERROR         "Treat warnings as errors"     OFF)
 option(RAGCPP_WITH_ONNX      "Build in-process ONNX Runtime embedder" OFF)
 option(RAGCPP_WITH_LLAMA     "Build in-process GGUF (llama.cpp) embedder" OFF)
 option(RAGCPP_WITH_RCP       "Build the Retrieval Context Protocol (RCP) server front-end" ON)
+# GPU acceleration for BATCH scoring (Apple/Metal). Defaults to ON on Apple
+# platforms because it needs no SDK, no toolchain component and no download:
+# shaders are compiled from source at runtime by the driver. It is also safe to
+# leave on — availability is decided at RUNTIME, so a binary built with it still
+# runs correctly on a machine with no usable GPU.
+if(APPLE)
+    option(RAGCPP_WITH_METAL "Build the Metal GPU backend for batch scoring" ON)
+else()
+    option(RAGCPP_WITH_METAL "Build the Metal GPU backend for batch scoring" OFF)
+endif()
 set(RAGCPP_RCP_SDK_DIR "" CACHE PATH "Path to a local RCP C++ SDK checkout (sdk/cpp). Empty = FetchContent from GitHub.")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -88,6 +98,34 @@ if(RAGCPP_WITH_LLAMA)
     target_compile_definitions(ragcpp PUBLIC RAGCPP_WITH_LLAMA)
 endif()
 target_compile_features(ragcpp PUBLIC cxx_std_23)
+
+# ── Metal GPU backend ─────────────────────────────────────────────────
+if(RAGCPP_WITH_METAL)
+    if(NOT APPLE)
+        message(FATAL_ERROR "RAGCPP_WITH_METAL=ON but Metal exists only on Apple platforms.")
+    endif()
+    # Objective-C++ is a CLANG dialect. This project is routinely built with
+    # GCC (Homebrew g++-15, because Apple Clang's libc++ still lacks pieces of
+    # C++23 that the rest of the library uses), and GCC cannot compile .mm at
+    # all. So pin the OBJCXX compiler to the system clang++ regardless of what
+    # CXX is — the two object files link together fine, since the .mm exposes
+    # only a plain C++ function boundary and no Objective-C types cross it.
+    if(NOT CMAKE_OBJCXX_COMPILER)
+        find_program(RAGCPP_CLANGXX clang++)
+        if(NOT RAGCPP_CLANGXX)
+            message(FATAL_ERROR "RAGCPP_WITH_METAL=ON but no clang++ found to compile Objective-C++.")
+        endif()
+        set(CMAKE_OBJCXX_COMPILER "${RAGCPP_CLANGXX}" CACHE FILEPATH "" FORCE)
+    endif()
+    enable_language(OBJCXX)
+    target_sources(ragcpp PRIVATE src/gpu/metal_backend.mm)
+    set_source_files_properties(src/gpu/metal_backend.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc -std=c++20")
+    find_library(METAL_LIB Metal REQUIRED)
+    find_library(FOUNDATION_LIB Foundation REQUIRED)
+    target_link_libraries(ragcpp PUBLIC ${METAL_LIB} ${FOUNDATION_LIB})
+    target_compile_definitions(ragcpp PRIVATE RAGCPP_WITH_METAL=1)
+endif()
 
 if(RAGCPP_USE_SIMD)
     target_compile_definitions(ragcpp PUBLIC RAGCPP_USE_SIMD=1)

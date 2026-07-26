@@ -6,3 +6,8 @@ target_link_libraries(ragcpp_bench PRIVATE ragcpp)
 # it exists so the recall numbers quoted in HnswConfig can be reproduced.
 add_executable(ragcpp_ann_bench ann_bench.cpp)
 target_link_libraries(ragcpp_ann_bench PRIVATE ragcpp)
+
+# GPU vs CPU batch-scoring throughput. Runs on any machine: without a GPU every
+# row reports "declined" and the CPU timings still print.
+add_executable(ragcpp_gpu_bench gpu_bench.cpp)
+target_link_libraries(ragcpp_gpu_bench PRIVATE ragcpp)

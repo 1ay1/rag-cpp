@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <rag/rag.hpp>
+#include <rag/gpu/device.hpp>
 #include <rag/util/parallel.hpp>
 
 namespace {
@@ -2274,6 +2275,127 @@ TEST(bridge_process_roundtrip_with_cat) {
     REQUIRE(s.has_value());
     CHECK_EQ(s->size(), 1u);
     CHECK(std::abs((*s)[0] - 1.0f) < 1e-6f);
+}
+
+// ── GPU batch scoring ────────────────────────────────────────────────────────
+//
+// These must pass on a machine with NO GPU, on a build with no GPU backend, and
+// on one with both — so every assertion is either about the CPU-equivalence of
+// whatever ran, or is guarded by what score_batch actually reports it did.
+// score_batch returning false is a ROUTING answer ("not on the GPU"), never an
+// error, and the caller's job is then to run its own CPU path.
+
+namespace {
+
+// The CPU reference, written the way the library's own hot loops are: outer
+// over candidates so each row stays hot across the whole query batch.
+std::vector<float> cpu_score_batch(const std::vector<float>& corpus,
+                                   const std::vector<float>& queries, std::size_t dim) {
+    const std::size_t n = corpus.size() / dim, nq = queries.size() / dim;
+    std::vector<float> out(n * nq);
+    for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t q = 0; q < nq; ++q)
+            out[q * n + i] = rag::dense::dot(
+                std::span<const float>(queries.data() + q * dim, dim),
+                std::span<const float>(corpus.data() + i * dim, dim));
+    return out;
+}
+
+struct GpuFixture {
+    std::size_t dim = 64, n = 0, nq = 0;
+    std::vector<float> corpus, queries;
+
+    GpuFixture(std::size_t n_, std::size_t nq_, std::size_t dim_ = 64)
+        : dim(dim_), n(n_), nq(nq_), corpus(n_ * dim_), queries(nq_ * dim_) {
+        std::mt19937 rng(1234);
+        std::normal_distribution<float> g(0.0f, 1.0f);
+        for (auto& x : corpus)  x = g(rng);
+        for (auto& x : queries) x = g(rng);
+        for (std::size_t i = 0; i < n; ++i)
+            rag::dense::normalize(std::span<float>(corpus.data() + i * dim, dim));
+        for (std::size_t i = 0; i < nq; ++i)
+            rag::dense::normalize(std::span<float>(queries.data() + i * dim, dim));
+    }
+};
+
+} // namespace
+
+TEST(gpu_reports_a_coherent_device) {
+    const auto& info = rag::gpu::device_info();
+    if (rag::gpu::available()) {
+        // A device that says it is present must describe itself consistently.
+        // This also guards the ABI boundary: the Metal backend is Objective-C++
+        // compiled by Clang against libc++ while the library may be built by
+        // GCC against libstdc++, so device info is marshalled through plain C.
+        // When that was wrong the symptoms showed up EXACTLY here — an empty
+        // name and a device claiming no unified memory on hardware that has
+        // nothing else.
+        CHECK(info.backend != rag::gpu::Backend::none);
+        CHECK(!info.name.empty());
+        CHECK(info.max_buffer_bytes > 0);
+    } else {
+        CHECK(info.backend == rag::gpu::Backend::none);
+    }
+    // The name mapping is total — no enum value renders as garbage.
+    CHECK_EQ(std::string(rag::gpu::backend_name(rag::gpu::Backend::none)), std::string("none"));
+    CHECK_EQ(std::string(rag::gpu::backend_name(rag::gpu::Backend::metal)), std::string("metal"));
+}
+
+TEST(gpu_score_batch_matches_cpu_or_declines) {
+    // Large enough to clear min_batch_work() on a machine that has a GPU.
+    const std::size_t dim = 64;
+    const std::size_t n = 40000, nq = 16;
+    GpuFixture fx(n, nq, dim);
+
+    std::vector<float> out(n * nq, -999.0f);
+    const bool ran = rag::gpu::score_batch(fx.corpus, fx.queries, dim, out);
+    if (!ran) { CHECK(true); return; }           // no device: nothing to verify
+
+    const std::vector<float> ref = cpu_score_batch(fx.corpus, fx.queries, dim);
+    double worst = 0.0;
+    for (std::size_t i = 0; i < out.size(); ++i)
+        worst = std::max(worst, (double)std::fabs(out[i] - ref[i]));
+
+    // ABSOLUTE, not relative, error. These are unit vectors, so scores live in
+    // [-1,1] and many sit near zero, where a relative test explodes for free —
+    // an early version of this comparison reported "MISMATCH" everywhere for
+    // exactly that reason while the GPU was in fact more accurate than the CPU.
+    CHECK(worst < 1e-5);
+}
+
+TEST(gpu_score_batch_validates_and_routes) {
+    const std::size_t dim = 64;
+    GpuFixture fx(1000, 4, dim);
+    std::vector<float> out(1000 * 4);
+
+    // Malformed shapes are refused rather than read out of bounds.
+    CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, 0, out));
+    CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, dim + 1, out));   // not a divisor
+    std::vector<float> tiny_out(3);
+    CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, dim, tiny_out));  // output too small
+
+    // Below the measured crossover the GPU must DECLINE even when present:
+    // shipping work to a device that loses to the CPU is the failure mode this
+    // whole threshold exists to prevent.
+    CHECK(1000u * 4u * dim < rag::gpu::min_batch_work());
+    CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, dim, out));
+
+    CHECK(rag::gpu::min_batch_work() > 0);
+}
+
+TEST(gpu_disable_is_honoured) {
+    // Runs last by construction: disable() is deliberately a ONE-WAY switch, so
+    // this test permanently turns the GPU off for the process. A reversible
+    // toggle would race with in-flight dispatches for no real benefit.
+    rag::gpu::disable();
+    CHECK(!rag::gpu::available());
+    CHECK(rag::gpu::device_info().backend == rag::gpu::Backend::none);
+
+    const std::size_t dim = 64;
+    GpuFixture fx(40000, 16, dim);
+    std::vector<float> out(40000 * 16, 7.0f);
+    CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, dim, out));
+    CHECK_EQ(out[0], 7.0f);          // declined means UNTOUCHED, not partial
 }
 
 int main() {
