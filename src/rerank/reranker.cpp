@@ -95,6 +95,8 @@ struct OnnxReranker::Impl {
     std::unique_ptr<Ort::Session> session;
     dense::WordPieceTokenizer     tok;
     bool                has_token_type = false;
+    std::vector<std::string>      in_names, out_names;   // owned; cached once
+    std::vector<const char*>      in_c, out_c;           // point into *_names
 #endif
 };
 
@@ -132,6 +134,14 @@ Result<OnnxReranker> OnnxReranker::load(dense::LocalEmbedderConfig cfg) {
         // A cross-encoder is a sequence-classification head: input_ids +
         // attention_mask, and (for BERT-family) token_type_ids as a third input.
         im.has_token_type = im.session->GetInputCount() >= 3;
+        // Cache the IO names once; re-querying them per call allocates needlessly.
+        Ort::AllocatorWithDefaultOptions alloc;
+        for (std::size_t i = 0; i < im.session->GetInputCount(); ++i)
+            im.in_names.push_back(im.session->GetInputNameAllocated(i, alloc).get());
+        for (std::size_t i = 0; i < im.session->GetOutputCount(); ++i)
+            im.out_names.push_back(im.session->GetOutputNameAllocated(i, alloc).get());
+        for (auto& s : im.in_names)  im.in_c.push_back(s.c_str());
+        for (auto& s : im.out_names) im.out_c.push_back(s.c_str());
     } catch (const std::exception& ex) {
         return std::unexpected(Error{Errc::corrupt_index,
             std::string("onnx reranker load failed: ") + ex.what()});
@@ -148,47 +158,51 @@ OnnxReranker::rerank(std::string_view query, std::span<const std::string> passag
 #else
     if (passages.empty()) return std::vector<float>{};
     auto& im = *impl_;
-    Ort::AllocatorWithDefaultOptions alloc;
     Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
-    std::vector<std::string> in_names, out_names;
-    for (std::size_t i = 0; i < im.session->GetInputCount(); ++i)
-        in_names.push_back(im.session->GetInputNameAllocated(i, alloc).get());
-    for (std::size_t i = 0; i < im.session->GetOutputCount(); ++i)
-        out_names.push_back(im.session->GetOutputNameAllocated(i, alloc).get());
-    std::vector<const char*> in_c, out_c;
-    for (auto& s : in_names)  in_c.push_back(s.c_str());
-    for (auto& s : out_names) out_c.push_back(s.c_str());
-
-    std::vector<float> scores;
-    scores.reserve(passages.size());
+    std::vector<float> scores(passages.size(), 0.0f);
     try {
-        for (const auto& p : passages) {
-            // The query is the FIRST sequence, the passage the SECOND — the order
-            // cross-encoders are trained on. encode_pair sets token_type_ids.
-            auto enc = im.tok.encode_pair(query, p, im.cfg.max_tokens);
-            const std::int64_t L = static_cast<std::int64_t>(enc.ids.size());
-            std::array<std::int64_t, 2> shape{1, L};
-            std::vector<Ort::Value> inputs;
-            inputs.push_back(Ort::Value::CreateTensor<std::int64_t>(
-                mem, enc.ids.data(), enc.ids.size(), shape.data(), 2));
-            inputs.push_back(Ort::Value::CreateTensor<std::int64_t>(
-                mem, enc.mask.data(), enc.mask.size(), shape.data(), 2));
-            if (im.has_token_type) {
-                inputs.push_back(Ort::Value::CreateTensor<std::int64_t>(
-                    mem, enc.type_ids.data(), enc.type_ids.size(), shape.data(), 2));
+        // Encode every pair, then run them in fixed-size batches padded to the
+        // batch's longest sequence. One session->Run over [B, maxL] is far
+        // cheaper than B separate runs (fixed per-call overhead amortized, and
+        // ORT parallelizes the matmuls across the batch) — the difference between
+        // a reranker you can ship and one you can only demo.
+        const std::size_t B = 32;
+        for (std::size_t base = 0; base < passages.size(); base += B) {
+            const std::size_t bn = std::min(B, passages.size() - base);
+            std::vector<dense::Encoded> encs(bn);
+            std::size_t maxL = 1;
+            for (std::size_t i = 0; i < bn; ++i) {
+                encs[i] = im.tok.encode_pair(query, passages[base + i], im.cfg.max_tokens);
+                maxL = std::max(maxL, encs[i].ids.size());
             }
+            // Pad each sequence to maxL: ids with [PAD]=0, mask with 0, type 0.
+            std::vector<std::int64_t> ids(bn * maxL, 0), mask(bn * maxL, 0), types(bn * maxL, 0);
+            for (std::size_t i = 0; i < bn; ++i) {
+                for (std::size_t j = 0; j < encs[i].ids.size(); ++j) {
+                    ids  [i * maxL + j] = encs[i].ids[j];
+                    mask [i * maxL + j] = encs[i].mask[j];
+                    types[i * maxL + j] = encs[i].type_ids[j];
+                }
+            }
+            std::array<std::int64_t, 2> shape{static_cast<std::int64_t>(bn),
+                                              static_cast<std::int64_t>(maxL)};
+            std::vector<Ort::Value> inputs;
+            inputs.push_back(Ort::Value::CreateTensor<std::int64_t>(mem, ids.data(),  ids.size(),  shape.data(), 2));
+            inputs.push_back(Ort::Value::CreateTensor<std::int64_t>(mem, mask.data(), mask.size(), shape.data(), 2));
+            if (im.has_token_type)
+                inputs.push_back(Ort::Value::CreateTensor<std::int64_t>(mem, types.data(), types.size(), shape.data(), 2));
+
             auto res = im.session->Run(Ort::RunOptions{nullptr},
-                in_c.data(), inputs.data(), inputs.size(), out_c.data(), 1);
-            // Classifier logits: shape [1, num_labels]. A reranker head has 1
-            // label (mono relevance) — take logit[0]. If a model emits 2 labels
-            // (irrelevant/relevant, e.g. some ms-marco exports), the positive
-            // class is the last logit, which is what ranking should key on.
-            auto info = res[0].GetTensorTypeAndShapeInfo();
-            auto dims = info.GetShape();
-            const std::int64_t n_labels = dims.empty() ? 1 : dims.back();
+                im.in_c.data(), inputs.data(), inputs.size(), im.out_c.data(), 1);
+            // Output [B, num_labels]. 1-label head → mono relevance; 2-label
+            // (irrelevant/relevant) → the positive class is the last logit.
+            auto dims = res[0].GetTensorTypeAndShapeInfo().GetShape();
+            const std::int64_t n_labels = dims.size() >= 2 ? dims.back() : 1;
             const float* logits = res[0].GetTensorData<float>();
-            scores.push_back(n_labels >= 2 ? logits[n_labels - 1] : logits[0]);
+            for (std::size_t i = 0; i < bn; ++i)
+                scores[base + i] = n_labels >= 2 ? logits[i * n_labels + (n_labels - 1)]
+                                                 : logits[i];
         }
     } catch (const std::exception& ex) {
         return std::unexpected(Error{Errc::transport_error,

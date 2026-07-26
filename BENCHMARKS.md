@@ -191,6 +191,64 @@ Reproduce (bge-base ONNX + tokenizer are one `curl` each from
     --model=bge-base/model.onnx --tokenizer=bge-base/tokenizer.json
 ```
 
+## Reranking, measured (and when it hurts)
+
+A cross-encoder is the accuracy ceiling of a retrieval funnel in principle: it
+jointly encodes each `(query, passage)` pair instead of comparing two
+independently-embedded vectors. rag-cpp runs one **in process** (`OnnxReranker`,
+the reranking twin of `OnnxEmbedder` — no server), and `beir_bench` gains a
+`standard+rerank` arm so its contribution is a measured diff, not an assumption.
+
+The result is a caution, not a victory lap. Reranking `standard`'s top-100 on
+SciFact with `cross-encoder/ms-marco-MiniLM-L-6-v2`, `blend` = how much to trust
+the cross-encoder vs the tuned hybrid score it replaces (both min-max normalized
+over the reranked block):
+
+| Policy | nDCG@10 | nDCG@1 | R@10 | R@100 |
+|--------|---------|--------|------|-------|
+| `standard` (hybrid, no rerank) | **0.7355** | 0.6233 | 0.8500 | 0.9583 |
+| `standard+rerank` blend=1.0 (trust CE) | 0.6859 | 0.5700 | 0.8089 | 0.9550 |
+| `standard+rerank` blend=0.5 (mix) | 0.7280 | 0.6067 | **0.8523** | 0.9583 |
+
+**Blindly trusting the cross-encoder (`blend=1.0`) LOSES 0.049 nDCG@10** — and
+loses most at rank 1 (0.6233→0.5700), exactly where a reranker is supposed to
+help. R@100 is unchanged (same candidate set), so this is purely the reordering
+doing damage. The reason is domain mismatch, and it is instructive: ms-marco
+cross-encoders are trained on web-passage relevance, while SciFact is scientific
+*claim verification* — "is this abstract evidence for this claim?" is not the
+relation the model learned, so its confident reordering fights a hybrid retriever
+that was already well-calibrated for the task.
+
+**Blending recovers almost all of it** (`blend=0.5`, mixing the cross-encoder
+and the hybrid score 50/50): nDCG@10 0.6859→0.7280, back within 0.008 of the
+no-rerank baseline, and R@10 actually *improves* to 0.8523 (> 0.8500). So the
+reorder is not worthless — it sharpens the top-10 — it just must not be trusted to
+override a tuned hybrid outright. The honest verdict on THIS pair: an
+out-of-domain reranker is at best a wash on SciFact nDCG@10 and needs
+conservative blending to avoid being a loss; the win from reranking is real only
+when the cross-encoder is trained for the task. That is exactly the kind of thing
+a measured harness is supposed to tell you before you ship the latency.
+
+The cross-encoder itself is not broken — on an in-domain probe it ranks the
+exact answer to "How many people live in Berlin?" at +8.74, a topical-but-
+weaker passage at -1.01, and off-topic passages at -11.3. It is a domain and a
+trust-level problem, which is why `blend` exists and defaults below `1.0`.
+
+Two honest constraints on this measurement. (1) The bundled tokenizer is BERT
+WordPiece, correct for ms-marco / mono-BERT cross-encoders but **not** for
+XLM-RoBERTa rerankers (`bge-reranker`, Unigram/SentencePiece) — those need a
+tokenizer not yet implemented, so the strongest open rerankers are out of reach
+here for now. (2) In-process CPU reranking of 100 candidates × 1109 queries is
+~25 min on an M-series laptop; reranking is a latency/accuracy trade, not free.
+
+```sh
+./build/bench/ragcpp_beir_bench ./scifact --split=test \
+    --model=minilm/model.onnx --tokenizer=minilm/tokenizer.json \
+    --reranker=ms-marco-MiniLM/model.onnx \
+    --reranker-tokenizer=ms-marco-MiniLM/tokenizer.json \
+    --variant=standard --rerank-topn=100 --rerank-blend=0.5
+```
+
 ## Retrieval-quality fixes, measured
 
 Three defects found by building the harness above, each with the measurement that

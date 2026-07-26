@@ -44,8 +44,11 @@ The library treats the type system as a proof assistant:
 - **HNSW** ANN (Malkov & Yashunin) with **Matryoshka truncation** + **binary
   quantization**, and **filtered-HNSW**: a metadata predicate pushed *into* the
   graph walk (pre-filter) so selective filters still return k results.
-- **Cross-encoder reranking** as a first-class stage — TEI `/rerank`,
-  Cohere/Jina `/v1/rerank`, or any in-process scorer.
+- **Cross-encoder reranking** as a first-class stage — an **in-process ONNX**
+  cross-encoder (no server), TEI `/rerank`, Cohere/Jina `/v1/rerank`, or any
+  in-process scorer, with a `blend` knob to mix cross-encoder and retrieval
+  scores (measured: trusting an out-of-domain CE outright can *hurt* — see
+  [BENCHMARKS](BENCHMARKS.md#reranking-measured-and-when-it-hurts)).
 - **Query expansion** (RM3-lite PRF) and **parent-document stitching**
   (small-to-big) pipeline stages.
 

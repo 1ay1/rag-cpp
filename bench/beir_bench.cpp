@@ -151,6 +151,7 @@ int main(int argc, char** argv) {
     const std::string rr_model = opt(argc, argv, "--reranker", "");
     const std::string rr_tok   = opt(argc, argv, "--reranker-tokenizer", "");
     const std::size_t rr_topn  = std::strtoul(opt(argc, argv, "--rerank-topn", "100").c_str(), nullptr, 10);
+    const float rr_blend = std::strtof(opt(argc, argv, "--rerank-blend", "1.0").c_str(), nullptr);
     std::optional<rag::rerank::AnyReranker> reranker;
     if (!rr_model.empty()) {
         rag::dense::LocalEmbedderConfig rc;
@@ -159,7 +160,7 @@ int main(int argc, char** argv) {
         rc.max_tokens = 512;   // cross-encoders read query+passage; give room
         auto rr = rag::rerank::OnnxReranker::load(rc);
         if (!rr) { std::printf("reranker error: %s\n", rr.error().message.c_str()); return 1; }
-        std::printf("reranker: %s (in-process cross-encoder, top-%zu)\n", rr_model.c_str(), rr_topn);
+        std::printf("reranker: %s (in-process cross-encoder, top-%zu, blend=%.2f)\n", rr_model.c_str(), rr_topn, rr_blend);
         reranker.emplace(rag::rerank::AnyReranker{std::move(*rr)});
     }
 
@@ -202,7 +203,7 @@ int main(int argc, char** argv) {
     // a shared_ptr to the loaded model, so the copy into the stage is cheap.
     if (reranker) {
         auto std_rr = rag::pipeline::Pipeline::standard().add(
-            rag::rerank::make_rerank_stage(*reranker, rr_topn, /*blend=*/1.0f, "cross_encoder"));
+            rag::rerank::make_rerank_stage(*reranker, rr_topn, /*blend=*/rr_blend, "cross_encoder"));
         pipeline_variant("standard+rerank", std::move(std_rr));
     }
 

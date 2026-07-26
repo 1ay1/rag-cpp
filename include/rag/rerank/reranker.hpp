@@ -160,10 +160,18 @@ private:
 // ─── Adapt a reranker into a pipeline stage ───────────────────────────────────
 // Reranks the top `top_n` candidates (the rest keep their fused order below the
 // reranked block). `blend` in [0,1] mixes cross-encoder score with the incoming
-// fused score: 1.0 = pure cross-encoder, 0.0 = ignore it. Graceful: if the
-// reranker is unavailable, candidates pass through untouched.
+// fused score (both min-max normalized over the reranked block): 1.0 = pure
+// cross-encoder, 0.0 = ignore it. Graceful: if the reranker is unavailable,
+// candidates pass through untouched.
+//
+// The default is 0.5, NOT 1.0, and that is a measured choice: trusting an
+// out-of-domain cross-encoder outright (blend=1.0) cost 0.049 nDCG@10 on SciFact
+// (0.7355 -> 0.6859), while a 50/50 blend recovered it to 0.7280 and improved
+// R@10. A reranker should sharpen a good retriever, not overrule it. Pass 1.0
+// explicitly only when the cross-encoder is known to be in-domain and stronger
+// than the retriever it is reordering. See BENCHMARKS.md "Reranking, measured".
 [[nodiscard]] pipeline::StagePtr
-make_rerank_stage(AnyReranker reranker, std::size_t top_n = 50, float blend = 1.0f,
+make_rerank_stage(AnyReranker reranker, std::size_t top_n = 50, float blend = 0.5f,
                   std::string label = "cross_encoder");
 
 static_assert(Reranker<CrossEncoderReranker>);

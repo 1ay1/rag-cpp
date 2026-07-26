@@ -206,3 +206,43 @@ Embedding is batched — `CorpusConfig::embed_batch` (default `32`) controls how
 many texts go to the backend per call at ingest. At query time, HyDE and
 multi-query batch their hypotheticals into a single `embed()` call, and on Apple
 hardware that batch can be scored on the [GPU](gpu.md).
+
+## In-process cross-encoder reranking
+
+A retriever answers "which chunks are plausibly relevant?" cheaply; a
+cross-encoder answers "how relevant is THIS chunk to THIS query?" precisely, by
+jointly encoding the `(query, passage)` pair. It is the accuracy ceiling of the
+funnel and only ever sees the top-N the retriever already narrowed to.
+
+`OnnxReranker` is the reranking counterpart to `OnnxEmbedder` — same in-process,
+no-server contract, same `RAGCPP_WITH_ONNX` gate, same `LocalEmbedderConfig`
+fields. It loads a HuggingFace sequence-classification cross-encoder exported to
+ONNX and reads the model's relevance logit. It is registered as the `"onnx"`
+reranker, and drops into a pipeline via `make_rerank_stage`:
+
+```cpp
+rag::dense::LocalEmbedderConfig rc;
+rc.model_path     = "ms-marco-MiniLM-L-6-v2/model.onnx";
+rc.tokenizer_path = "ms-marco-MiniLM-L-6-v2/tokenizer.json";
+rc.max_tokens     = 512;                    // room for query + passage
+auto rr = rag::rerank::OnnxReranker::load(rc);
+
+rag::pipeline::Pipeline p = rag::pipeline::Pipeline::standard();
+p.add(rag::rerank::make_rerank_stage(
+    rag::rerank::AnyReranker{std::move(*rr)}, /*top_n=*/100, /*blend=*/0.5f));
+```
+
+**Tokenizer family matters — this is load-bearing.** The bundled tokenizer is
+BERT **WordPiece**. It is correct for ms-marco MiniLM cross-encoders and
+mono-BERT (`[CLS]`/`[SEP]`, 30522 vocab). It is **not** correct for
+XLM-RoBERTa rerankers like `bge-reranker-base`, which use Unigram /
+SentencePiece with `<s>`/`</s>` and a Metaspace pre-tokenizer — running those
+through WordPiece silently produces garbage tokens and meaningless scores. Until
+a Unigram tokenizer lands, use a WordPiece-family cross-encoder.
+
+**`blend` is not optional tuning — it is the safety valve.** `blend=1.0` throws
+away the tuned hybrid score and trusts the cross-encoder outright; that is a net
+*loss* when the cross-encoder is out of domain (an ms-marco web-passage model on
+scientific claim verification). The measured lift, and why the default should be
+a mix rather than `1.0`, is in
+[BENCHMARKS.md](../BENCHMARKS.md#reranking-measured-and-when-it-hurts).

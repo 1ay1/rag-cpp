@@ -326,6 +326,15 @@ TEST(corpus_survives_concurrent_readers_and_writer) {
         (void)corpus.add_document("new" + std::to_string(i),
                                   "newly indexed retrieval vector document " + std::to_string(i),
                                   {{"kind", "new"}});
+    // The readers race the writer, but under heavy CPU contention (e.g. another
+    // benchmark saturating every core) the OS can schedule them out for the
+    // whole — fast — ingest, leaving reads==0. That is scheduler starvation, not
+    // a correctness failure: the property under test is "concurrent reads never
+    // observe a torn document", which is `corrupt == 0`. So give the readers a
+    // bounded chance to actually run at least once before declaring they did,
+    // rather than asserting on a count the scheduler controls.
+    for (int spin = 0; spin < 1000 && reads.load() == 0; ++spin)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     stop = true;
     for (auto& t : readers) t.join();
 
