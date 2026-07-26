@@ -180,7 +180,11 @@ Composable `RetrievalStage`s: `PrfExpand` (RM3-lite query expansion) →
 `HybridRetrieve` (BM25 + dense + fusion) → `Filter` → cross-encoder rerank →
 `ParentStitch` (small-to-big) → `TopK`. Every stage has the same interface, so
 they compose in any order. Stages are runtime-polymorphic; the hot scoring loops
-they call stay non-virtual inside `Corpus`.
+they call stay non-virtual inside `Corpus`. Three pre-assembled factories ship:
+`Pipeline::standard()` (hybrid → filter → feature-rerank → top-k, the default),
+`Pipeline::quality()` (+MMR diversity), and `Pipeline::context()` (+ParentStitch
+small-to-big). The two extras are opt-in because their good is coverage, not
+accuracy, and each carries a measured justification at its declaration.
 
 ### store — persistence
 The stable, versioned, CRC-checked `.ragdb` container (see `FORMAT.md`).

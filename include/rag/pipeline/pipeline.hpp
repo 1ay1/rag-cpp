@@ -188,6 +188,40 @@ public:
     // standard_with exists.
     [[nodiscard]] static Pipeline quality_with(HybridRetrieveConfig cfg, float mmr_lambda = 0.5f);
 
+    // OPT-IN: standard() plus ParentStitch (small-to-big / parent-document).
+    //
+    // WHY THIS IS NOT THE DEFAULT. Stitch does not make ranking more accurate.
+    // It folds a matched chunk into a higher-ranked ADJACENT sibling of the same
+    // document (their line ranges are within max_gap), on the theory that the
+    // sibling already represents the content, and hands the freed top-k slot to
+    // the next distinct location. Two things follow. First, the good is COVERAGE,
+    // not accuracy — like MMR, and measured the same way. Second, it only does
+    // anything when a query pulls a RUN of adjacent fragments of one document;
+    // on a corpus whose documents each produce a single chunk it folds nothing.
+    //
+    // On a benchmark built for the effect (bench/stitch_bench.cpp: few long
+    // documents, each with a 12-paragraph topic run chunked at max_lines=3, so
+    // one document alone supplies >k matching fragments):
+    //
+    //   pipeline            distinct documents in top-10 (of 10)
+    //   standard()                 2
+    //   context()                  4
+    //
+    // i.e. standard()'s top-10 was five slivers of one document's topic run plus
+    // five of another's; stitch folded each run to its best sibling and the
+    // freed slots reached two more documents. On a corpus with many short docs
+    // (e.g. the bench at n=400) the delta is 0 — nothing is adjacent to fold —
+    // which is the correct, honest result there and the reason this is opt-in.
+    //
+    // Stitch runs AFTER rerank, BEFORE top-k — folding must see the relevance
+    // order (it keeps the higher-ranked sibling) and there must still be a pool
+    // to promote from, both of which top-k would have destroyed.
+    [[nodiscard]] static Pipeline context(std::size_t max_gap = 1);
+
+    // context() with the retrieval stage configured, for the same reason
+    // standard_with exists.
+    [[nodiscard]] static Pipeline context_with(HybridRetrieveConfig cfg, std::size_t max_gap = 1);
+
 private:
     std::vector<StagePtr> stages_;
 };

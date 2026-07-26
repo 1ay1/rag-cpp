@@ -265,4 +265,22 @@ Pipeline Pipeline::quality_with(HybridRetrieveConfig cfg, float mmr_lambda) {
     return p;
 }
 
+Pipeline Pipeline::context(std::size_t max_gap) {
+    return context_with(HybridRetrieveConfig{}, max_gap);
+}
+
+Pipeline Pipeline::context_with(HybridRetrieveConfig cfg, std::size_t max_gap) {
+    Pipeline p;
+    p.add(std::make_shared<HybridRetrieveStage>(std::move(cfg)))
+     .add(std::make_shared<FilterStage>())
+     .add(std::make_shared<RerankStage>("feature_rerank", feature_rerank))
+     // ParentStitch folds adjacent same-document fragments into their
+     // higher-ranked sibling — so it must run AFTER the rerank that establishes
+     // that order, and BEFORE the top-k that would trim away the pool it
+     // promotes distinct locations from. Same slot-ordering argument as MMR.
+     .add(std::make_shared<ParentStitchStage>(max_gap))
+     .add(std::make_shared<TopKStage>());
+    return p;
+}
+
 } // namespace rag::pipeline

@@ -2835,6 +2835,115 @@ TEST(quality_pipeline_matches_standard_when_lambda_is_one) {
         CHECK_EQ((*plain)[i].uri, (*lam1)[i].uri);
 }
 
+// ── Opt-in context pipeline (ParentStitch small-to-big) ──────────────────
+
+namespace {
+
+// A few LONG documents, each with a run of consecutive paragraphs on one topic,
+// chunked small (max_lines=3) so one document's topic run becomes several
+// ADJACENT matching chunks. Ranking by pure relevance then fills the top-k with
+// adjacent slivers of one or two documents; ParentStitch folds each run into its
+// best sibling and frees the slots for other documents. This is the small-to-big
+// failure mode, made real rather than assumed.
+rag::Engine fragmented_engine(int docs) {
+    rag::index::CorpusConfig cfg;
+    cfg.chunk.max_lines = 3;
+    cfg.chunk.overlap_lines = 0;
+    cfg.chunk.heading_context = false;
+    rag::Engine e{cfg};
+    for (int d = 0; d < docs; ++d) {
+        std::string body = "Engineering note " + std::to_string(d) + "\n\n";
+        body += "The design review covered failure domains.\n\n";
+        body += "An on-call rotation was established.\n\n";
+        // A long adjacent run on the query topic — this document alone yields
+        // more than k matching fragments.
+        for (int p = 0; p < 12; ++p)
+            body += "The migration to the new storage engine reduced replication lag "
+                    "and compaction backlog under peak write load step "
+                    + std::to_string(p) + ".\n\n";
+        body += "Capacity headroom was confirmed before cutover.\n\n";
+        e.add("doc" + std::to_string(d) + ".md", body);
+    }
+    e.build();
+    return e;
+}
+
+std::size_t distinct_docs(const std::vector<rag::SearchResult>& hits) {
+    std::set<std::string> u;
+    for (const auto& h : hits) u.insert(h.uri);
+    return u.size();
+}
+
+} // namespace
+
+TEST(context_pipeline_covers_more_documents_than_standard) {
+    // With five fragmented documents the standard top-10 is dominated by the
+    // adjacent fragments of one or two documents' topic runs; ParentStitch folds
+    // those runs and the freed slots reach more distinct documents. Measured
+    // (bench/stitch_bench.cpp n=5): standard covers 2 documents, context covers 4.
+    auto engine = fragmented_engine(5);
+    const char* q = "migration storage engine replication lag compaction";
+
+    engine.with_pipeline(rag::pipeline::Pipeline::standard());
+    auto plain = engine.search(q, 10);
+    REQUIRE(plain.has_value());
+
+    engine.with_pipeline(rag::pipeline::Pipeline::context());
+    auto stitched = engine.search(q, 10);
+    REQUIRE(stitched.has_value());
+
+    // Strictly more of the corpus covered. If this ever fails to be strict, the
+    // stitch stage is not being reached by the pipeline — the exact gap this
+    // factory exists to close.
+    CHECK(distinct_docs(*stitched) > distinct_docs(*plain));
+}
+
+TEST(context_pipeline_folds_adjacent_fragments) {
+    // The mechanism, not just the outcome: for a single document whose topic run
+    // spans many adjacent chunks, standard() returns several of those adjacent
+    // fragments and context() must return strictly fewer of them (they were
+    // folded into their best sibling).
+    auto engine = fragmented_engine(1);
+    const char* q = "migration storage engine replication lag compaction";
+
+    engine.with_pipeline(rag::pipeline::Pipeline::standard());
+    auto plain = engine.search(q, 10);
+    REQUIRE(plain.has_value());
+
+    engine.with_pipeline(rag::pipeline::Pipeline::context());
+    auto stitched = engine.search(q, 10);
+    REQUIRE(stitched.has_value());
+
+    // One document, so "distinct docs" cannot grow; the visible effect is that
+    // stitch collapsed the run to fewer hits.
+    CHECK(stitched->size() < plain->size());
+    CHECK(!stitched->empty());
+}
+
+TEST(context_pipeline_is_a_noop_when_nothing_is_adjacent) {
+    // Honesty check: on a corpus of single-chunk documents there is nothing
+    // adjacent to fold, so context() must degenerate EXACTLY to standard(). A
+    // stage that reordered or dropped hits here would be doing damage for no
+    // benefit — the reason the feature is opt-in is precisely that its gain is
+    // corpus-dependent, and its COST must be zero when the gain is.
+    rag::Engine e;
+    for (int i = 0; i < 12; ++i)
+        e.add("d" + std::to_string(i), "alpha beta gamma unique term" + std::to_string(i));
+    e.build();
+
+    e.with_pipeline(rag::pipeline::Pipeline::standard());
+    auto plain = e.search("alpha beta gamma", 8);
+    REQUIRE(plain.has_value());
+
+    e.with_pipeline(rag::pipeline::Pipeline::context());
+    auto stitched = e.search("alpha beta gamma", 8);
+    REQUIRE(stitched.has_value());
+
+    REQUIRE(plain->size() == stitched->size());
+    for (std::size_t i = 0; i < plain->size(); ++i)
+        CHECK_EQ((*plain)[i].uri, (*stitched)[i].uri);
+}
+
 // ── Contextual Retrieval, wired into ingest ───────────────────────────────
 
 // The corpus that makes contextual retrieval matter: a document whose SUBJECT

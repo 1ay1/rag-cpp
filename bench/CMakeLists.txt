@@ -23,3 +23,9 @@ target_link_libraries(ragcpp_contextual_bench PRIVATE ragcpp)
 # ordering bug was found. Runs anywhere; without a GPU it reports ~1.0x.
 add_executable(ragcpp_batch_bench batch_bench.cpp)
 target_link_libraries(ragcpp_batch_bench PRIVATE ragcpp)
+
+# What ParentStitch (small-to-big) folds away and what coverage it buys.
+# Self-contained (synthesizes its own fragmented corpus), so the numbers quoted
+# in Pipeline::context()'s justification can be reproduced on any machine.
+add_executable(ragcpp_stitch_bench stitch_bench.cpp)
+target_link_libraries(ragcpp_stitch_bench PRIVATE ragcpp)
