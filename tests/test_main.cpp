@@ -43,6 +43,10 @@ struct Reg { Reg(std::string n, std::function<void()> f) { registry().push_back(
 
 #define REQUIRE(cond) do { ++g_checks; if (!(cond)) { \
     ++g_failures; std::printf("  REQUIRE FAIL [%s]: %s (line %d)\n", g_current.c_str(), #cond, __LINE__); return; } } while(0)
+
+std::string test_temp_path(std::string_view name) {
+    return (std::filesystem::temp_directory_path() / name).string();
+}
 }
 
 TEST(strong_ids_are_distinct) {
@@ -374,7 +378,7 @@ TEST(corpus_concurrent_readers_see_consistent_results) {
 // temp file and rename()-ing it over the destination makes the swap atomic, so
 // an overwrite that fails leaves the previous index intact.
 TEST(save_overwrite_leaves_a_loadable_index) {
-    const std::string path = "/tmp/ragcpp_durability_test.ragdb";
+    const std::string path = test_temp_path("ragcpp_durability_test.ragdb");
     std::remove(path.c_str());
 
     {
@@ -416,7 +420,7 @@ TEST(save_overwrite_leaves_a_loadable_index) {
 // document through index/delete, the server saves and restarts, and the
 // document is being served again.
 TEST(tombstones_survive_save_load) {
-    const std::string path = "/tmp/ragcpp_tombstone_test.ragdb";
+    const std::string path = test_temp_path("ragcpp_tombstone_test.ragdb");
     std::remove(path.c_str());
 
     rag::index::Corpus a;
@@ -453,7 +457,7 @@ TEST(tombstones_survive_save_load) {
 // Savers are deliberately oversubscribed relative to cores: with only a few
 // they stay in lockstep and the reordering never shows up.
 TEST(concurrent_saves_never_move_the_file_backwards) {
-    const std::string path = "/tmp/ragcpp_saveorder_test.ragdb";
+    const std::string path = test_temp_path("ragcpp_saveorder_test.ragdb");
     std::remove(path.c_str());
 
     rag::index::Corpus corpus;
@@ -2474,7 +2478,7 @@ TEST(source_chunking_round_trips_through_persistence) {
     // The chunking MODE is ingest policy: a corpus built with `source` and
     // reopened as `fixed` would chunk new documents on a different granularity
     // than the ones already stored.
-    const std::string path = "/tmp/ragcpp_test_source_mode.ragdb";
+    const std::string path = test_temp_path("ragcpp_test_source_mode.ragdb");
     {
         rag::index::CorpusConfig cfg;
         cfg.chunking = rag::index::CorpusConfig::Chunking::source;
@@ -2521,7 +2525,7 @@ TEST(scorefn_reranker_reorders) {
 namespace {
 rag::dense::WordPieceTokenizer tiny_wordpiece() {
     // A minimal BERT-style vocab.txt: specials first, then whole words.
-    const std::string path = "/tmp/ragcpp_tiny_vocab.txt";
+    const std::string path = test_temp_path("ragcpp_tiny_vocab.txt");
     std::ofstream f(path);
     // Standard BERT special ordering so ids match the tokenizer defaults
     // ([PAD]=0, [UNK]=100, [CLS]=101, [SEP]=102). Pad the gap with fillers.
@@ -4017,8 +4021,8 @@ TEST(gpu_disable_is_honoured) {
 // ── Write-ahead log ───────────────────────────────────────────────────────
 
 TEST(wal_replays_mutations_into_a_fresh_corpus) {
-    const std::string db  = "/tmp/ragcpp_wal_replay.ragdb";
-    const std::string log = "/tmp/ragcpp_wal_replay.wal";
+    const std::string db  = test_temp_path("ragcpp_wal_replay.ragdb");
+    const std::string log = test_temp_path("ragcpp_wal_replay.wal");
     std::remove(db.c_str()); std::remove(log.c_str());
 
     {
@@ -4059,8 +4063,8 @@ TEST(wal_replay_is_not_re_logged) {
     // Recovery must not append what it just read. Without a guard, every
     // restart would double the log and replay time would grow without bound
     // even on an idle server.
-    const std::string db  = "/tmp/ragcpp_wal_double.ragdb";
-    const std::string log = "/tmp/ragcpp_wal_double.wal";
+    const std::string db  = test_temp_path("ragcpp_wal_double.ragdb");
+    const std::string log = test_temp_path("ragcpp_wal_double.wal");
     std::remove(db.c_str()); std::remove(log.c_str());
 
     std::uint64_t first = 0;
@@ -4087,7 +4091,7 @@ TEST(wal_replay_is_not_re_logged) {
 }
 
 TEST(wal_tolerates_a_torn_tail_but_not_inner_corruption) {
-    const std::string log = "/tmp/ragcpp_wal_torn.wal";
+    const std::string log = test_temp_path("ragcpp_wal_torn.wal");
     std::remove(log.c_str());
     {
         rag::store::Wal w;
@@ -4145,8 +4149,8 @@ TEST(wal_tolerates_a_torn_tail_but_not_inner_corruption) {
 }
 
 TEST(wal_checkpoint_snapshots_then_truncates) {
-    const std::string db  = "/tmp/ragcpp_wal_ckpt.ragdb";
-    const std::string log = "/tmp/ragcpp_wal_ckpt.wal";
+    const std::string db  = test_temp_path("ragcpp_wal_ckpt.ragdb");
+    const std::string log = test_temp_path("ragcpp_wal_ckpt.wal");
     std::remove(db.c_str()); std::remove(log.c_str());
 
     rag::index::Corpus c;

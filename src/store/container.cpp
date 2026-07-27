@@ -148,7 +148,10 @@ Result<void> Container::write_file(const std::string& path) const {
 
     // Flush the file's contents out of the OS page cache onto the device.
     // ofstream::flush only pushes to the kernel; it is not durability.
-    if (int fd = ::open(tmp.c_str(), O_RDONLY); fd >= 0) {
+    // _commit(), our Windows fsync equivalent, requires a writable descriptor.
+    // POSIX permits fsync on O_RDONLY, so opening read-only here made every
+    // snapshot save fail under MSYS2/UCRT64 despite the temp file being valid.
+    if (int fd = ::open(tmp.c_str(), O_RDWR | O_BINARY); fd >= 0) {
         const int rc = ::fsync(fd);
         ::close(fd);
         if (rc != 0) { std::remove(tmp.c_str()); return fail<void>(Errc::io_error, "fsync " + tmp); }

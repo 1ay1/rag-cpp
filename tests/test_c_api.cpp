@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <string>
 
 #include "rag/c/rag.h"
 
@@ -50,10 +52,11 @@ int main() {
     rag_results_free(fres);
 
     // Save + load round-trip.
-    const char* path = "/tmp/ragcpp_c_api.ragdb";
-    C_CHECK(rag_engine_save(eng, path) == RAG_OK);
+    const std::string path = (std::filesystem::temp_directory_path()
+                            / "ragcpp_c_api.ragdb").string();
+    C_CHECK(rag_engine_save(eng, path.c_str()) == RAG_OK);
     rag_status st = RAG_ERR_UNKNOWN;
-    rag_engine* loaded = rag_engine_load(path, &st);
+    rag_engine* loaded = rag_engine_load(path.c_str(), &st);
     C_CHECK(st == RAG_OK);
     C_CHECK(loaded != nullptr);
     if (loaded) {
@@ -64,7 +67,7 @@ int main() {
         rag_results_free(lr);
         rag_engine_free(loaded);
     }
-    std::remove(path);
+    std::remove(path.c_str());
 
     rag_engine_free(eng);
     std::printf("\n%d checks, %d failures\n", checks, failures);
