@@ -904,8 +904,7 @@ TEST(vector_store_filtered_search_respects_predicate) {
 }
 
 TEST(vector_store_persists_and_reloads) {
-    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp")
-                     + "/ragcpp_vs_test.ragvec";
+    const std::string path = test_temp_path("ragcpp_vs_test.ragvec");
     std::mt19937 rng(4);
     std::vector<std::vector<float>> vecs;
     {
@@ -928,8 +927,7 @@ TEST(vector_store_persists_and_reloads) {
 }
 
 TEST(vector_store_corrupt_blob_is_rejected) {
-    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp")
-                     + "/ragcpp_vs_corrupt.ragvec";
+    const std::string path = test_temp_path("ragcpp_vs_corrupt.ragvec");
     rag::index::VectorStore s{4};
     REQUIRE(s.add(0, std::vector<float>{1, 0, 0, 0}).has_value());
     REQUIRE(s.save(path).has_value());
@@ -1037,8 +1035,7 @@ TEST(deleted_document_does_not_resurrect_after_save_and_load) {
     // THE regression: the graph reloads WITHOUT tombstones, so before the fix a
     // deleted document came back fully searchable while is_deleted() still said
     // it was gone.
-    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp")
-                     + "/ragcpp_tomb_reload.ragdb";
+    const std::string path = test_temp_path("ragcpp_tomb_reload.ragdb");
     rag::DocId victim{};
     {
         auto c = tomb_corpus(200, 7, victim);
@@ -1150,8 +1147,7 @@ TEST(chunking_mode_round_trips_through_meta) {
     // The MODE is ingest policy, like the geometry that was fixed earlier: a
     // corpus built with `proposition` that reopened as `fixed` would chunk newly
     // added documents on a different granularity from the ones already stored.
-    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp")
-                     + "/ragcpp_chunkmode.ragdb";
+    const std::string path = test_temp_path("ragcpp_chunkmode.ragdb");
     {
         rag::index::CorpusConfig cfg;
         cfg.chunking = rag::index::CorpusConfig::Chunking::proposition;
@@ -2116,7 +2112,7 @@ TEST(container_roundtrip_and_crc) {
 }
 
 TEST(corpus_save_load_ragdb) {
-    std::string path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") + "/ragcpp_test.ragdb";
+    const std::string path = test_temp_path("ragcpp_test.ragdb");
     {
         rag::Engine engine;
         engine.with_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{64}});

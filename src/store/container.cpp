@@ -13,6 +13,16 @@
 
 #include "rag/store/posix_compat.hpp"
 
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#endif
+
 namespace rag::store {
 
 // ─── CRC32 (IEEE 802.3, reflected) ────────────────────────────────────────────
@@ -160,11 +170,22 @@ Result<void> Container::write_file(const std::string& path) const {
         return fail<void>(Errc::io_error, "reopen " + tmp);
     }
 
-    // The atomic swap. After this returns, `path` is the new index.
+    // The atomic swap. POSIX rename replaces an existing destination, but the
+    // Windows CRT rename does not. MoveFileExW supplies the equivalent atomic
+    // replacement there (and WRITE_THROUGH persists the directory update).
+#if defined(_WIN32)
+    if (!::MoveFileExW(std::filesystem::path(tmp).c_str(),
+                       std::filesystem::path(path).c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::remove(tmp.c_str());
+        return fail<void>(Errc::io_error, "rename " + tmp + " -> " + path);
+    }
+#else
     if (std::rename(tmp.c_str(), path.c_str()) != 0) {
         std::remove(tmp.c_str());
         return fail<void>(Errc::io_error, "rename " + tmp + " -> " + path);
     }
+#endif
 
     // Make the rename itself durable. Best-effort: some filesystems refuse to
     // open a directory for fsync, and failing the whole save over that would be
