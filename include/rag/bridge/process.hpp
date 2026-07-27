@@ -63,8 +63,10 @@ private:
     long        pid_    = -1;     // pid_t stored wide to keep the header POSIX-agnostic
     // Windows needs the process HANDLE to wait/terminate; the pid alone can't do
     // it, and a pid can be recycled once the process exits. Held as void* so this
-    // header never has to include <windows.h>. Always nullptr on POSIX.
+    // header never has to include <windows.h>.
+#if defined(_WIN32)
     void*       handle_ = nullptr;
+#endif
     int         to_child_ = -1;   // write end (child's stdin)
     int         from_child_ = -1; // read end  (child's stdout)
     std::string inbuf_;           // carry-over bytes past a newline

@@ -28,7 +28,14 @@ option(RAGCPP_USE_SIMD       "Enable SIMD distance kernels" ON)
 option(RAGCPP_WERROR         "Treat warnings as errors"     OFF)
 option(RAGCPP_WITH_ONNX      "Build in-process ONNX Runtime embedder" OFF)
 option(RAGCPP_WITH_LLAMA     "Build in-process GGUF (llama.cpp) embedder" OFF)
-option(RAGCPP_WITH_RCP       "Build the Retrieval Context Protocol (RCP) server front-end" ${RAGCPP_IS_TOPLEVEL})
+# The pinned RCP SDK uses POSIX socket headers, so it cannot be built by the
+# MSYS2/MinGW Windows toolchain yet. Keep the core engine and its Windows CI
+# build usable; an explicit request for the front-end fails clearly below.
+set(_ragcpp_rcp_default ${RAGCPP_IS_TOPLEVEL})
+if(WIN32)
+    set(_ragcpp_rcp_default OFF)
+endif()
+option(RAGCPP_WITH_RCP       "Build the Retrieval Context Protocol (RCP) server front-end" ${_ragcpp_rcp_default})
 # GPU acceleration for BATCH scoring (Apple/Metal). Defaults to ON on Apple
 # platforms because it needs no SDK, no toolchain component and no download:
 # shaders are compiled from source at runtime by the driver. It is also safe to
@@ -205,6 +212,11 @@ endif()
 set(RAGCPP_RCP_SDK_TAG "v1.0.1" CACHE STRING
     "Git tag of the RCP SDK to fetch when no local checkout is present")
 if(RAGCPP_WITH_RCP)
+    if(WIN32)
+        message(FATAL_ERROR
+            "RAGCPP_WITH_RCP=ON is not supported on Windows: the pinned RCP SDK "
+            "requires POSIX socket headers (<netinet/in.h>).")
+    endif()
     if(RAGCPP_RCP_SDK_DIR AND EXISTS "${RAGCPP_RCP_SDK_DIR}/include/rcp.hpp")
         add_subdirectory(${RAGCPP_RCP_SDK_DIR} ${CMAKE_BINARY_DIR}/rcp-sdk)
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../rcp/sdk/cpp/include/rcp.hpp")
