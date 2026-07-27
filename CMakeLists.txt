@@ -72,6 +72,14 @@ file(GLOB_RECURSE RAGCPP_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/
 # the glob must not pull them in when the corresponding option is off, or the
 # build fails on a machine with no OpenCL headers.
 list(REMOVE_ITEM RAGCPP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/opencl_backend.cpp")
+# src/bridge/process.cpp is a POSIX subprocess Channel (fork/exec, sys/wait.h,
+# unistd.h) used ONLY by the RCP front-end's local-process transport. It does
+# not compile on Windows (no <sys/wait.h>), and nothing in the core library
+# references it, so drop it from the core glob on WIN32. When RAGCPP_WITH_RCP is
+# on it's a POSIX-only path anyway.
+if(WIN32)
+    list(REMOVE_ITEM RAGCPP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/bridge/process.cpp")
+endif()
 
 add_library(ragcpp ${RAGCPP_SOURCES})
 add_library(ragcpp::ragcpp ALIAS ragcpp)
