@@ -50,6 +50,14 @@ inline int ftruncate(int fd, long long len) noexcept {
     return ::_chsize_s(fd, len) == 0 ? 0 : -1;
 }
 
+// getpid → GetCurrentProcessId. mingw's CRT does expose _getpid(), but not the
+// unprefixed POSIX name in the global namespace, so `::getpid()` does not
+// compile. Going straight to the Win32 call keeps the value identical to the id
+// that kill() below probes with, which matters: Container stamps its temp file
+// names with this pid and sweep_orphan_temps() later asks kill(pid, 0) whether
+// that writer is still alive. If the two disagreed, live temps would be swept.
+inline int getpid() noexcept { return static_cast<int>(::GetCurrentProcessId()); }
+
 // kill(pid, 0): existence probe only — never signals. Returns 0 if the process
 // is alive; -1 with errno=ESRCH when gone, errno=EPERM when present but
 // inaccessible. Matches the single use in Container::sweep_orphan_temps.

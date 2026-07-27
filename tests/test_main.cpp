@@ -3541,10 +3541,19 @@ TEST(bridge_open_channel_unknown_transport) {
 }
 
 TEST(bridge_process_roundtrip_with_cat) {
-    // Spawn a trivial line-echo peer that speaks the protocol using only /bin sh.
+    // Spawn a trivial line-echo peer that speaks the protocol using only a shell.
     // It reads a request line and emits a valid reply, exercising the real pipe.
+    //
+    // The program name differs by platform: POSIX can name /bin/sh directly,
+    // while on Windows CreateProcess resolves via PATH and an MSYS path like
+    // "/bin/sh" is meaningless to it — "sh" finds MSYS2's sh.exe on PATH.
+#if defined(_WIN32)
+    const char* shell = "sh";
+#else
+    const char* shell = "/bin/sh";
+#endif
     rag::bridge::ProcessConfig cfg;
-    cfg.argv = {"/bin/sh", "-c",
+    cfg.argv = {shell, "-c",
                 "while IFS= read -r line; do printf '{\"ok\":true,\"result\":{\"scores\":[1.0]}}\\n'; done"};
     auto ch = rag::bridge::ProcessChannel::spawn(cfg);
     REQUIRE(ch.has_value());
@@ -3554,6 +3563,45 @@ TEST(bridge_process_roundtrip_with_cat) {
     REQUIRE(s.has_value());
     CHECK_EQ(s->size(), 1u);
     CHECK(std::abs((*s)[0] - 1.0f) < 1e-6f);
+}
+
+TEST(bridge_process_empty_argv_is_an_error) {
+    // Platform-independent: must be rejected before any spawn syscall.
+    auto ch = rag::bridge::ProcessChannel::spawn(rag::bridge::ProcessConfig{});
+    REQUIRE(!ch.has_value());
+    CHECK_EQ(ch.error().code, rag::Errc::invalid_argument);
+}
+
+TEST(bridge_process_spawn_of_missing_program_fails_cleanly) {
+    // A bad argv[0] must surface as a transport_error, never a throw, a hang,
+    // or a half-built channel. On POSIX the child exec fails after fork, so the
+    // failure shows up as EOF on the first call; on Windows CreateProcess fails
+    // outright and spawn() itself reports it. Accept either shape — what this
+    // pins down is that the caller gets an error and the process stays healthy.
+    rag::bridge::ProcessConfig cfg;
+    cfg.argv = {"ragcpp-no-such-program-cba9871"};
+    auto ch = rag::bridge::ProcessChannel::spawn(cfg);
+    if (!ch.has_value()) {
+        CHECK_EQ(ch.error().code, rag::Errc::transport_error);
+    } else {
+        auto r = (*ch)->call("ping", nlohmann::json::object());
+        CHECK(!r.has_value());
+    }
+}
+
+TEST(bridge_open_channel_process_transport_is_linked) {
+    // Regression guard for a LINK-time bug, not a runtime one: process.cpp was
+    // once excluded from the build on Windows while register.cpp still called
+    // ProcessChannel::spawn(), so every downstream binary failed to link with
+    // 'undefined reference to rag::bridge::ProcessChannel::spawn'. Naming the
+    // "process" transport through the public open_channel() entry point keeps
+    // that edge exercised on every platform the tests run on. An empty argv is
+    // deliberate: it fails in the config check, so no child is ever spawned,
+    // yet the symbol must still resolve for this file to link at all.
+    auto ch = rag::bridge::open_channel(nlohmann::json{{"transport", "process"},
+                                                      {"argv", nlohmann::json::array()}});
+    REQUIRE(!ch.has_value());
+    CHECK_EQ(ch.error().code, rag::Errc::invalid_argument);
 }
 
 // ── GPU batch scoring ────────────────────────────────────────────────────────
