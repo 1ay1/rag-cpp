@@ -22,9 +22,7 @@
 #include <sstream>
 #include <utility>
 
-#include <fcntl.h>
-#include <unistd.h>
-
+#include "rag/store/posix_compat.hpp"
 #include "rag/store/format.hpp"
 
 namespace rag::store {
@@ -93,7 +91,7 @@ Result<void> Wal::open(std::string path, SyncMode mode) {
     close();
     // O_APPEND makes every write atomic with respect to the file offset, so a
     // concurrent appender can never interleave into the middle of our record.
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_BINARY, 0644);
     if (fd < 0) return fail<void>(Errc::io_error, "wal open " + path + ": " + std::strerror(errno));
     fd_    = fd;
     path_  = std::move(path);

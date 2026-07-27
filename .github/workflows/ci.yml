@@ -184,6 +184,39 @@ jobs:
         env:
           RAGCPP_GPU_BACKEND: none
 
+  # Windows is a first-class target: users build under MSYS2's ucrt64 toolchain
+  # (the environment where the store's POSIX file-durability calls — fsync,
+  # ftruncate, kill — have no CRT equivalent and are supplied by
+  # include/rag/store/posix_compat.hpp). Nothing on a Linux or macOS runner
+  # compiles that shim, so without this job a Windows regression is invisible
+  # until a user hits it. GPU backends are off here — mingw has neither Metal
+  # nor a default OpenCL ICD — so this exercises the CPU path plus Winsock.
+  windows:
+    name: windows / msys2 ucrt64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            git
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          RAGCPP_GPU_BACKEND: none
+
   # Warnings get their own job so that a new compiler release inventing a
   # diagnostic cannot take down the pin check or the test matrix. Pinned to the
   # platform where -Werror was actually verified clean; widen it only after

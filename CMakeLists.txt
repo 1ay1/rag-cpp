@@ -94,6 +94,12 @@ target_link_libraries(ragcpp PUBLIC nlohmann_json::nlohmann_json)
 # The plugin loader uses dlopen/dlsym (POSIX) — link the platform's dl library.
 target_link_libraries(ragcpp PUBLIC ${CMAKE_DL_LIBS})
 
+# The HTTP transport uses Winsock on Windows. mingw does not honour MSVC's
+# `#pragma comment(lib, ...)`, so link ws2_32 explicitly here.
+if(WIN32)
+    target_link_libraries(ragcpp PUBLIC ws2_32)
+endif()
+
 # ── Optional in-process embedder backends ────────────────────────────────────
 if(RAGCPP_WITH_ONNX)
     # Point CMake at your ONNX Runtime install via -Donnxruntime_ROOT=... .

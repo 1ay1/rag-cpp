@@ -5,15 +5,13 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
-#include <csignal>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <random>
 #include <sstream>
 
-#include <fcntl.h>
-#include <unistd.h>
+#include "rag/store/posix_compat.hpp"
 
 namespace rag::store {
 

@@ -107,6 +107,9 @@ bool initialized() noexcept {
         char name[256] = {0};
         int unified = 0;
         unsigned long long max_buf = 0;
+        // These feed metal_info()/opencl_info() below; unused when neither GPU
+        // backend is compiled in (e.g. the Windows build).
+        (void)name; (void)unified; (void)max_buf;
 
 #if defined(RAGCPP_WITH_METAL)
         if (!force_opencl && metal_init()) {
