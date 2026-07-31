@@ -53,14 +53,30 @@ correct(const index::Corpus& corpus, std::string_view query, std::span<const Hit
     Correction c;
     text::Tokenizer tok = corpus.tokenizer();
 
-    // Score each passage's relevance (learned evaluator or lexical default).
+    // Normalize retrieval scores so the default evaluator keeps semantic
+    // evidence instead of reducing relevance to literal token overlap.
+    float lo = 1e30f, hi = -1e30f;
+    for (const auto& h : hits) {
+        lo = std::min(lo, h.score.get());
+        hi = std::max(hi, h.score.get());
+    }
+    const float range = hi - lo;
+
     struct Graded { Hit hit; float rel; std::string text; };
     std::vector<Graded> graded;
     graded.reserve(hits.size());
     for (const auto& h : hits) {
         const Chunk* ch = corpus.chunk(h.chunk);
         std::string text = ch ? ch->indexed_text() : std::string{};
-        float rel = eval ? eval(query, text) : lexical_relevance(tok, query, text);
+        float rel;
+        if (eval) {
+            rel = eval(query, text);
+        } else {
+            const float lexical = lexical_relevance(tok, query, text);
+            const float retrieval = range > 1e-9f
+                ? (h.score.get() - lo) / range : 1.0f;
+            rel = 0.75f * retrieval + 0.25f * lexical;
+        }
         graded.push_back({h, std::clamp(rel, 0.0f, 1.0f), std::move(text)});
     }
     std::sort(graded.begin(), graded.end(), [](const Graded& a, const Graded& b) { return a.rel > b.rel; });

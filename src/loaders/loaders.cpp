@@ -297,6 +297,7 @@ load_directory(const fs::path& root, const DirOptions& opts, const ProgressFn& o
         std::string ext = lower_ext(entry.path());
         if (!want.contains(ext)) continue;
         if (entry.file_size(ec) > opts.max_file_bytes) { if (on_file) on_file(entry.path(), false); continue; }
+        if (opts.max_files > 0 && docs.size() >= opts.max_files) break;
 
         auto d = load_file(entry.path());
         bool ok = d.has_value();

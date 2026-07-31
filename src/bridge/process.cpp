@@ -24,7 +24,9 @@
 
 #include "rag/bridge/process.hpp"
 
+#include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -58,10 +60,34 @@ extern char** environ;
 namespace rag::bridge {
 namespace {
 
+#if defined(_WIN32)
+using io_result_t = int;
+
+io_result_t fd_write(int fd, const char* p, std::size_t n) {
+    return ::_write(fd, p, static_cast<unsigned>(
+        std::min(n, static_cast<std::size_t>(INT_MAX))));
+}
+
+io_result_t fd_read(int fd, char* p, std::size_t n) {
+    return ::_read(fd, p, static_cast<unsigned>(
+        std::min(n, static_cast<std::size_t>(INT_MAX))));
+}
+#else
+using io_result_t = ssize_t;
+
+io_result_t fd_write(int fd, const char* p, std::size_t n) {
+    return ::write(fd, p, n);
+}
+
+io_result_t fd_read(int fd, char* p, std::size_t n) {
+    return ::read(fd, p, n);
+}
+#endif
+
 // Write all bytes, retrying on EINTR/partial writes. Returns false on error.
 bool write_all(int fd, const char* p, std::size_t n) {
     while (n > 0) {
-        ssize_t w = ::write(fd, p, n);
+        io_result_t w = fd_write(fd, p, n);
         if (w < 0) {
             if (errno == EINTR) continue;
             return false;
@@ -351,7 +377,7 @@ Result<std::string> ProcessChannel::read_line() {
             return line;
         }
         char tmp[4096];
-        ssize_t r = ::read(from_child_, tmp, sizeof(tmp));
+        io_result_t r = fd_read(from_child_, tmp, sizeof(tmp));
         if (r < 0) {
             if (errno == EINTR) continue;
             alive_ = false;

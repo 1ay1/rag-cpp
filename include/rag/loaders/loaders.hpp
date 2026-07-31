@@ -104,6 +104,7 @@ struct DirOptions {
         ".git","node_modules","build","dist","target","__pycache__",".venv","venv",
     };
     std::size_t max_file_bytes = 4 * 1024 * 1024;   // skip huge files
+    std::size_t max_files = 0;                       // 0 = unlimited
     bool        follow_symlinks = false;
 };
 

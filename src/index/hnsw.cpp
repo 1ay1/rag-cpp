@@ -11,6 +11,17 @@
 #include <queue>
 #include <unordered_set>
 
+#if defined(_MSC_VER)
+#  include <intrin.h>
+#  define RAGCPP_PREFETCH(addr, locality) _mm_prefetch(
+       reinterpret_cast<const char*>(addr),
+       (locality) > 0 ? _MM_HINT_T0 : _MM_HINT_NTA)
+#elif defined(__GNUC__) || defined(__clang__)
+#  define RAGCPP_PREFETCH(addr, locality) __builtin_prefetch((addr), 0, (locality))
+#else
+#  define RAGCPP_PREFETCH(addr, locality) ((void)0)
+#endif
+
 namespace rag::index {
 
 HnswIndex::HnswIndex(HnswConfig cfg) : cfg_(cfg), rng_(cfg.seed) {
@@ -263,13 +274,13 @@ void HnswIndex::search_layer_into(std::span<const float> q, std::span<const std:
         // outer one. -Wdangling-else flags exactly this.
         if (!pq_codes_.empty() && !adc.empty()) {
             for (std::uint32_t nb : links)
-                if (nb < nodes_.size()) __builtin_prefetch(pq_codes_.data() + nb * pq_m_, 0, 1);
+                if (nb < nodes_.size()) RAGCPP_PREFETCH(pq_codes_.data() + nb * pq_m_, 1);
         } else if (!q8_.empty()) {
             for (std::uint32_t nb : links)
-                if (nb < nodes_.size()) __builtin_prefetch(q8_.data() + nb * dim_, 0, 1);
+                if (nb < nodes_.size()) RAGCPP_PREFETCH(q8_.data() + nb * dim_, 1);
         } else {
             for (std::uint32_t nb : links)
-                if (nb < nodes_.size()) __builtin_prefetch(store_.data() + nb * dim_, 0, 1);
+                if (nb < nodes_.size()) RAGCPP_PREFETCH(store_.data() + nb * dim_, 1);
         }
 
         for (std::uint32_t nb : links) {

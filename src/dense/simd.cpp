@@ -6,6 +6,16 @@
 #include <cmath>
 #include <cstddef>
 
+#if defined(_MSC_VER)
+#  include <intrin.h>
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#  define RAGCPP_TARGET(x) __attribute__((target(x)))
+#else
+#  define RAGCPP_TARGET(x)
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64)
 #  define RAGCPP_X86 1
 #  include <immintrin.h>
@@ -30,10 +40,14 @@ float dot_scalar(const float* a, const float* b, std::size_t n) noexcept {
 #if defined(RAGCPP_X86)
 bool has_avx2() {
     static const bool v = [] {
-#  if defined(__GNUC__)
+#  if defined(__GNUC__) || defined(__clang__)
         unsigned eax, ebx, ecx, edx;
         if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
         return (ebx & (1u << 5)) != 0; // AVX2 bit
+#  elif defined(_MSC_VER) && defined(__AVX2__)
+        int regs[4]{};
+        __cpuidex(regs, 7, 0);
+        return (regs[1] & (1 << 5)) != 0;
 #  else
         return false;
 #  endif
@@ -46,7 +60,7 @@ bool has_avx2() {
 // saturated, which is what actually makes this throughput- rather than
 // latency-bound. Embedding dims (256/384/768/1024) are all multiples of 32,
 // so the 32-wide main loop covers the vast majority of the work.
-__attribute__((target("avx2,fma")))
+RAGCPP_TARGET("avx2,fma")
 float dot_avx2(const float* a, const float* b, std::size_t n) noexcept {
     __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
     __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
@@ -143,7 +157,7 @@ void quantize_sq8(std::span<const float> v, std::span<std::int8_t> out) noexcept
 //
 // The runtime check stays where it is; the attribute only tells the compiler
 // it may EMIT AVX2 here, it does not decide whether we CALL it.
-__attribute__((target("avx2")))
+RAGCPP_TARGET("avx2")
 std::int32_t dot_sq8_avx2(const std::int8_t* a, const std::int8_t* b, std::size_t n) noexcept {
     __m256i acc = _mm256_setzero_si256();
     std::size_t i = 0;
