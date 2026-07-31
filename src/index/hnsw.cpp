@@ -13,9 +13,9 @@
 
 #if defined(_MSC_VER)
 #  include <intrin.h>
-#  define RAGCPP_PREFETCH(addr, locality) _mm_prefetch(
-       reinterpret_cast<const char*>(addr),
-       (locality) > 0 ? _MM_HINT_T0 : _MM_HINT_NTA)
+#  define RAGCPP_PREFETCH(addr, locality) \
+    _mm_prefetch(reinterpret_cast<const char*>(addr), \
+                 (locality) > 0 ? _MM_HINT_T0 : _MM_HINT_NTA)
 #elif defined(__GNUC__) || defined(__clang__)
 #  define RAGCPP_PREFETCH(addr, locality) __builtin_prefetch((addr), 0, (locality))
 #else
