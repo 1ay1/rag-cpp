@@ -222,14 +222,23 @@ std::string rtf_to_text(std::string_view rtf) {
 // ─── PDF → text (via pdftotext) ───────────────────────────────────────────────
 Result<std::string> pdf_to_text(const fs::path& path) {
     // pdftotext <in> - : write extracted text to stdout.
-    std::string cmd = "pdftotext -q " + std::string("\"") + path.string() + "\" - 2>/dev/null";
+#ifdef _WIN32
+    std::string cmd = "pdftotext -q \"" + path.string() + "\" - 2>NUL";
+    std::FILE* pipe = ::_popen(cmd.c_str(), "r");
+#else
+    std::string cmd = "pdftotext -q \"" + path.string() + "\" - 2>/dev/null";
     std::FILE* pipe = ::popen(cmd.c_str(), "r");
+#endif
     if (!pipe) return fail<std::string>(Errc::unavailable, "pdftotext not available");
     std::string out;
     std::array<char, 4096> buf;
     std::size_t got;
     while ((got = std::fread(buf.data(), 1, buf.size(), pipe)) > 0) out.append(buf.data(), got);
+#ifdef _WIN32
+    int rc = ::_pclose(pipe);
+#else
     int rc = ::pclose(pipe);
+#endif
     if (rc != 0 && out.empty())
         return fail<std::string>(Errc::unavailable, "pdftotext failed (install poppler-utils)");
     return out;

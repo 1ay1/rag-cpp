@@ -51,18 +51,39 @@ std::string ext_of(std::string_view hint) {
     return lower(hint.substr(dot));
 }
 
+std::FILE* open_pipe(const std::string& command) {
+#ifdef _WIN32
+    return ::_popen(command.c_str(), "r");
+#else
+    return ::popen(command.c_str(), "r");
+#endif
+}
+
+int close_pipe(std::FILE* pipe) {
+#ifdef _WIN32
+    return ::_pclose(pipe);
+#else
+    return ::pclose(pipe);
+#endif
+}
+
 std::string run_capture(const std::string& cmd) {
     std::string out;
-    std::FILE* pipe = ::popen(cmd.c_str(), "r");
+    std::FILE* pipe = open_pipe(cmd);
     if (!pipe) return out;
     std::array<char, 4096> buf;
     std::size_t got;
     while ((got = std::fread(buf.data(), 1, buf.size(), pipe)) > 0) out.append(buf.data(), got);
-    ::pclose(pipe);
+    close_pipe(pipe);
     return out;
 }
 
 std::string shell_quote(const std::string& s) {
+#ifdef _WIN32
+    // Windows filenames cannot contain a double quote. Quoting the complete
+    // path keeps spaces and cmd metacharacters such as '&' literal.
+    return "\"" + s + "\"";
+#else
     std::string q = "'";
     for (char c : s) {
         if (c == '\'') q += "'\\''";
@@ -70,6 +91,15 @@ std::string shell_quote(const std::string& s) {
     }
     q += "'";
     return q;
+#endif
+}
+
+std::string null_redirect() {
+#ifdef _WIN32
+    return " 2>NUL";
+#else
+    return " 2>/dev/null";
+#endif
 }
 
 // Append one Unicode code point to `out` as UTF-8.
@@ -169,7 +199,11 @@ bool tool_available(std::string_view tool) {
         std::lock_guard lk(m);
         if (auto it = cache.find(t); it != cache.end()) return it->second;
     }
-    const bool ok = !run_capture("command -v " + shell_quote(t) + " 2>/dev/null").empty();
+#ifdef _WIN32
+    const bool ok = !run_capture("where " + shell_quote(t) + null_redirect()).empty();
+#else
+    const bool ok = !run_capture("command -v " + shell_quote(t) + null_redirect()).empty();
+#endif
     std::lock_guard lk(m);
     cache[t] = ok;
     return ok;
@@ -305,7 +339,7 @@ Result<ExtractResult> extract_file(const fs::path& path) {
         std::string cmd(c.argfmt);
         const std::string q = shell_quote(path.string());
         if (auto at = cmd.find("%s"); at != std::string::npos) cmd.replace(at, 2, q);
-        cmd += " 2>/dev/null";
+        cmd += null_redirect();
         std::string text = run_capture(cmd);
 
         if (ext == ".pdf" && looks_like_scanned_pdf(text, size)) {
