@@ -140,7 +140,8 @@ Result<void> Wal::append(const WalRecord& rec) {
     // allows. Loop because write() may legally be partial.
     std::size_t off = 0;
     while (off < frame.size()) {
-        const ssize_t n = ::write(fd_, frame.data() + off, frame.size() - off);
+        const auto n = ::write(fd_, frame.data() + off,
+                               static_cast<unsigned int>(frame.size() - off));
         if (n < 0) {
             if (errno == EINTR) continue;
             return fail<void>(Errc::io_error, std::string("wal write: ") + std::strerror(errno));
