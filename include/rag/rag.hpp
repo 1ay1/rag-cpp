@@ -42,6 +42,7 @@
 #include "rag/rerank/reranker.hpp"
 #include "rag/rerank/dartboard.hpp"
 #include "rag/rerank/mmr.hpp"
+#include "rag/rerank/refine.hpp"
 #include "rag/sparse/splade.hpp"
 #include "rag/store/container.hpp"
 #include "rag/store/format.hpp"

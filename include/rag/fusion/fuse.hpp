@@ -156,6 +156,20 @@ struct ConvexParams {
     // list is index 1; the paper's α weights the SEMANTIC side, hence the
     // default. Ignored unless exactly two lists are fused.
     std::size_t alpha_list = 1;
+
+    // Derive α PER QUERY from the two retrievers' score distributions instead
+    // of using the fixed value above. The intuition the header spells out — the
+    // best α tracks the relative strength of the two retrievers — is observable
+    // at query time: a retriever that returns a sharp, top-heavy score curve
+    // (one clear winner, fast decay) is more confident on THIS query than one
+    // returning a flat curve of near-ties. We measure that concentration for
+    // each list and shift α toward the more confident retriever, blended with
+    // the static prior so a single odd query never swings it wildly. Off by
+    // default (opt-in); when on, `alpha` acts as the prior it regresses toward.
+    bool  adaptive        = false;
+    // How far a query may pull α from the prior, in [0, 0.5]. 0 = ignore the
+    // signal (pure prior); 0.5 = let confidence span the full [prior±0.5].
+    float adaptive_weight = 0.35f;
 };
 
 // Reciprocal Rank Fusion (optionally weighted). Returns fused hits, best-first,

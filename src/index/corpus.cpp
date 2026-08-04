@@ -607,6 +607,52 @@ Result<std::vector<Hit>> Corpus::dense_search_locked(std::string_view query, std
     // own range into a private buffer, then we concatenate and select. Scoring
     // is pure (reads immutable embeddings), so no synchronization is needed
     // beyond the join.
+    //
+    // Prefer the CONTIGUOUS packed_ arena (SoA) over the per-chunk embedding
+    // vectors (AoS). chunks_[i].embedding is a separately-heap-allocated vector,
+    // so an AoS scan pointer-chases across scattered cache lines and stalls on
+    // misses it cannot prefetch. packed_ lays every row end-to-end in one buffer
+    // — the scan streams linearly, the hardware prefetcher keeps up, and dim is
+    // a compile-time-constant stride the loop can hoist. ensure_packed() already
+    // drops deleted + ragged rows and records the surviving chunk id per row in
+    // packed_ids_, so the metadata `allow` filter still applies per row. We take
+    // this path whenever the arena is populated; it falls back to AoS otherwise
+    // (e.g. a ragged/mixed-dimension corpus, which packs nothing).
+    ensure_packed();
+    if (packed_dim_ != 0 && !packed_ids_.empty()) {
+        const std::size_t np  = packed_ids_.size();
+        const std::size_t dim = packed_dim_;
+        const float*      base = packed_.data();
+        const float*      q    = qv->data();
+        std::vector<std::vector<Hit>> parts(util::block_count(np));
+
+        util::parallel_blocks(np, [&](std::size_t lo, std::size_t hi, std::size_t b) {
+            auto& local = parts[b];
+            local.reserve((hi - lo) / 4 + 8);
+            for (std::size_t r = lo; r < hi; ++r) {
+                const std::uint32_t cid = packed_ids_[r];
+                if (allow && !allow(cid)) continue;
+                const float* row = base + r * dim;
+                local.push_back(Hit{ChunkId{cid},
+                                    Score{dense::dot(std::span<const float>(row, dim),
+                                                     std::span<const float>(q, dim))}});
+            }
+        });
+
+        std::vector<Hit> hits;
+        std::size_t total = 0;
+        for (const auto& p : parts) total += p.size();
+        hits.reserve(total);
+        for (auto& p : parts) hits.insert(hits.end(), p.begin(), p.end());
+
+        const std::size_t kk = std::min(k, hits.size());
+        std::partial_sort(hits.begin(), hits.begin() + static_cast<std::ptrdiff_t>(kk), hits.end(),
+                          hit_order);
+        hits.resize(kk);
+        return hits;
+    }
+
+    // AoS fallback: ragged/mixed-dimension corpus that packed nothing.
     const std::size_t n = chunks_.size();
     std::vector<std::vector<Hit>> parts(util::block_count(n));
 

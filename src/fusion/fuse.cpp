@@ -43,6 +43,28 @@ float robust_ceiling(const std::vector<float>& sorted_desc, float raw_hi, float 
     return sorted_desc[idx];
 }
 
+// Per-query CONFIDENCE of a ranked list, in [0,1]. A retriever that is sure of
+// its answer returns a top-heavy curve: one clear leader, then a fast drop. An
+// unsure one returns a flat curve of near-ties. We quantify that as the gap
+// between the best score and the list's mean, normalized by the score spread —
+// scale-free (works for BM25's unbounded scores and cosine's [-1,1] alike) and
+// robust because a wider spread with a high leader still reads as confident.
+// A degenerate (empty / all-equal) list reads as 0.5: no signal either way.
+float list_confidence(const std::vector<float>& sorted_desc) {
+    const std::size_t n = sorted_desc.size();
+    if (n < 2) return 0.5f;
+    const float top = sorted_desc.front();
+    const float lo  = sorted_desc.back();
+    const float span = top - lo;
+    if (span <= 1e-9f) return 0.5f;   // all tied → no confidence signal
+    double sum = 0.0;
+    for (float s : sorted_desc) sum += s;
+    const float mean = static_cast<float>(sum / static_cast<double>(n));
+    // (top - mean) / span ∈ [0,1]: near 1 when the leader towers over a low
+    // mean (concentrated), near 0 when the leader barely beats the pack.
+    return std::clamp((top - mean) / span, 0.0f, 1.0f);
+}
+
 } // namespace
 
 std::vector<Hit> rrf(std::span<const RankedList> lists, RrfParams params, std::size_t top_k) {
@@ -106,6 +128,27 @@ std::vector<Hit> convex_combination(std::span<const RankedList> lists, ConvexPar
     // the paper's parameterization still applies.
     const bool use_alpha = lists.size() == 2;
 
+    // Adaptive α: when enabled and exactly two lists are fused, shift α toward
+    // whichever retriever is more CONFIDENT on this query (sharper score curve),
+    // regressing toward the static prior so no single query swings it far. The
+    // prior stays the default when adaptive is off.
+    float alpha = params.alpha;
+    if (use_alpha && params.adaptive) {
+        auto conf_of = [](const RankedList& L) {
+            std::vector<float> s; s.reserve(L.hits.size());
+            for (const auto& h : L.hits) s.push_back(h.score.get());
+            std::sort(s.begin(), s.end(), std::greater<float>{});
+            return list_confidence(s);
+        };
+        const float c_alpha = conf_of(lists[params.alpha_list]);
+        const float c_other = conf_of(lists[params.alpha_list == 0 ? 1 : 0]);
+        // signal ∈ [-1,1]: +1 when the α-list is far more confident, -1 the
+        // other way. Pull α from the prior by up to adaptive_weight.
+        const float signal = std::clamp(c_alpha - c_other, -1.0f, 1.0f);
+        const float pull   = std::clamp(params.adaptive_weight, 0.0f, 0.5f);
+        alpha = std::clamp(params.alpha + signal * pull, 0.0f, 1.0f);
+    }
+
     std::unordered_map<std::uint32_t, float> acc;
     std::vector<float> scores;
     for (std::size_t li = 0; li < lists.size(); ++li) {
@@ -148,7 +191,7 @@ std::vector<Hit> convex_combination(std::span<const RankedList> lists, ConvexPar
 
         float w = list.weight;
         if (use_alpha)
-            w = (li == params.alpha_list) ? params.alpha : (1.0f - params.alpha);
+            w = (li == params.alpha_list) ? alpha : (1.0f - alpha);
 
         for (const auto& h : list.hits) {
             // Clamp: a score may legitimately exceed an observed max used as a
