@@ -43,6 +43,7 @@
 // stays small — a document, not a re-linked graph.
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -104,6 +105,15 @@ public:
     // only after the data is as safe as `mode` promises \u2014 callers rely on that
     // to acknowledge a client write.
     [[nodiscard]] Result<void> append(const WalRecord& rec);
+
+    // Append MANY records as one group commit: write every frame, then sync
+    // ONCE. Semantically identical to calling append() per record but pays a
+    // single fsync for the whole batch instead of one each — the difference
+    // between N×4.3 ms and 4.3 ms on a durable-mode bulk load. Either the whole
+    // batch is made durable or the error names the first write that failed;
+    // records written before a mid-batch failure are still in the file (append
+    // is atomic per frame via O_APPEND), matching append()'s own guarantee.
+    [[nodiscard]] Result<void> append_batch(std::span<const WalRecord> recs);
 
     // Read every intact record. A torn trailing record \u2014 the normal outcome of
     // a crash mid-append \u2014 is DROPPED, not an error: it was never acknowledged,

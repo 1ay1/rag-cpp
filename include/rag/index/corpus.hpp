@@ -198,6 +198,28 @@ public:
     Result<DocId> upsert_document(std::string uri, std::string text, Metadata meta = {},
                                   std::string title = {});
 
+    // A single document to ingest, for the batch path below.
+    struct DocInput {
+        std::string uri;
+        std::string text;
+        Metadata    meta{};
+        std::string title{};
+    };
+
+    // Bulk ingest, acquiring the write lock ONCE for the whole batch.
+    //
+    // The per-document add_document() takes mu_ per call and (when a WAL is
+    // attached) issues one durable append per document. For bulk loads that is
+    // N lock round-trips and N fsyncs where one of each suffices: this holds the
+    // lock across the whole batch and, if a WAL is open, wraps the appends in a
+    // single group-commit so the batch costs ONE sync, not N. Chunking/indexing
+    // per document is unchanged (and already avoids the O(corpus) finalize —
+    // that stays lazy until build()/read). Returns one DocId per input, in
+    // order; on the first failure it stops and returns the error (documents
+    // already appended in this batch remain, exactly as a sequence of
+    // add_document() calls would leave them).
+    Result<std::vector<DocId>> add_documents(std::vector<DocInput> docs);
+
     // Rebuild dense structures (embed any un-embedded chunks, (re)build HNSW if
     // over threshold). Idempotent; safe to call after a batch of add_document.
     Result<void> build();

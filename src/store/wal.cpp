@@ -123,16 +123,21 @@ Result<void> Wal::sync_now() noexcept {
     return {};
 }
 
-Result<void> Wal::append(const WalRecord& rec) {
-    if (fd_ < 0) return fail<void>(Errc::io_error, "wal not open");
-
+// Encode one record into its on-disk frame (magic + length + crc + payload).
+static std::string frame_of(const WalRecord& rec) {
     const std::string payload = encode(rec);
     Writer w;
     w.u<std::uint32_t>(kRecordMagic);
     w.u<std::uint32_t>(static_cast<std::uint32_t>(payload.size()));
     w.u<std::uint32_t>(crc32(payload));
     w.bytes(payload);
-    const std::string& frame = w.data();
+    return std::move(w.data());
+}
+
+Result<void> Wal::append(const WalRecord& rec) {
+    if (fd_ < 0) return fail<void>(Errc::io_error, "wal not open");
+
+    const std::string frame = frame_of(rec);
 
     // ONE write() for header+payload. Splitting them would let a crash land
     // between the two and leave a header promising bytes that do not exist —
@@ -150,6 +155,32 @@ Result<void> Wal::append(const WalRecord& rec) {
     }
     if (auto s = sync_now(); !s) return s;
     bytes_ += frame.size();
+    return {};
+}
+
+Result<void> Wal::append_batch(std::span<const WalRecord> recs) {
+    if (fd_ < 0) return fail<void>(Errc::io_error, "wal not open");
+    if (recs.empty()) return {};
+
+    // Concatenate all frames and issue them, then sync ONCE for the whole group.
+    // Building one buffer keeps the number of write() syscalls low and lets the
+    // kernel coalesce; the single trailing sync_now() is the actual win over
+    // per-record append() (one fsync instead of N).
+    std::string buf;
+    for (const auto& r : recs) buf += frame_of(r);
+
+    std::size_t off = 0;
+    while (off < buf.size()) {
+        const auto n = ::write(fd_, buf.data() + off,
+                               static_cast<unsigned int>(buf.size() - off));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return fail<void>(Errc::io_error, std::string("wal write: ") + std::strerror(errno));
+        }
+        off += static_cast<std::size_t>(n);
+    }
+    if (auto s = sync_now(); !s) return s;
+    bytes_ += buf.size();
     return {};
 }
 

@@ -154,6 +154,46 @@ Result<DocId> Corpus::add_document_locked(std::string uri, std::string text, Met
     return did;
 }
 
+Result<std::vector<DocId>> Corpus::add_documents(std::vector<DocInput> docs) {
+    std::unique_lock lk(mu_);   // taken ONCE for the whole batch
+
+    // Group-commit the WAL up front: one durable append for all N documents
+    // instead of N. We log first (before any mutation) for the same reason
+    // add_document_locked does — a crash after the sync replays cleanly, a crash
+    // before it simply loses an unacknowledged batch. After this succeeds we
+    // insert with WAL logging SUPPRESSED (the records are already on disk), which
+    // is exactly what the replay path relies on via `replaying_`.
+    const bool log = wal_.is_open() && !replaying_;
+    if (log) {
+        std::vector<store::WalRecord> recs;
+        recs.reserve(docs.size());
+        for (const auto& d : docs) {
+            store::WalRecord rec;
+            rec.op = store::WalOp::add_document;
+            rec.uri = d.uri; rec.title = d.title; rec.text = d.text; rec.meta = d.meta;
+            recs.push_back(std::move(rec));
+        }
+        if (auto w = wal_.append_batch(recs); !w) return std::unexpected(w.error());
+    }
+
+    // Suppress per-document WAL logging while inserting (already logged above).
+    const bool prev_replaying = replaying_;
+    replaying_ = true;
+    struct RestoreFlag {
+        bool& f; bool v; ~RestoreFlag() { f = v; }
+    } restore{replaying_, prev_replaying};
+
+    std::vector<DocId> ids;
+    ids.reserve(docs.size());
+    for (auto& d : docs) {
+        auto r = add_document_locked(std::move(d.uri), std::move(d.text),
+                                     std::move(d.meta), std::move(d.title));
+        if (!r) return std::unexpected(r.error());
+        ids.push_back(*r);
+    }
+    return ids;
+}
+
 void Corpus::ensure_linked() const {
     // Double-checked: the common case is a clean corpus, where this is a single
     // relaxed read and no lock at all. Only the rare stale case pays for the

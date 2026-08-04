@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <optional>
 #include <unordered_map>
 
 namespace rag::lexical {
@@ -79,6 +81,29 @@ void Bm25Index::finalize() {
             pw_span_.emplace(term, std::pair{begin, cursor});
         }
     }
+
+    // Block-max metadata for BlockMax-WAND. One pass over the just-computed
+    // weights: for each term, chunk its postings into fixed-size blocks and
+    // record each block's last doc id (postings are sorted ascending) and the
+    // max weight in it. Cheap, derived-only, rebuilt every finalize().
+    block_meta_.clear();
+    block_meta_.reserve(postings_.size());
+    for (const auto& [term, plist] : postings_) {
+        auto sit = pw_span_.find(term);
+        if (sit == pw_span_.end()) continue;
+        const float* w = pw_.data() + sit->second.first;
+        const std::size_t m = plist.size();
+        std::vector<BlockMeta> blocks;
+        blocks.reserve((m + kBlockSize - 1) / kBlockSize);
+        for (std::size_t i = 0; i < m; i += kBlockSize) {
+            const std::size_t end = std::min(i + kBlockSize, m);
+            float bmax = 0.0f;
+            for (std::size_t j = i; j < end; ++j) bmax = std::max(bmax, w[j]);
+            blocks.push_back(BlockMeta{plist[end - 1].doc, bmax});
+        }
+        block_meta_.emplace(term, std::move(blocks));
+    }
+
     finalized_ = true;
 }
 
@@ -189,10 +214,195 @@ float Bm25Index::score_doc(const std::vector<std::string>& q_terms,
     return score;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BlockMax-WAND (Ding & Suel, SIGIR 2011).
+//
+// One cursor per distinct query term over its (doc-sorted) postings. Cursors
+// are kept sorted by current doc id. A running threshold θ = the k-th best score
+// found so far. Each round we pick the PIVOT: the first term (in doc order)
+// whose cumulative term-upper-bound Σ max_contrib crosses θ. Only documents at
+// or before the pivot's doc id can possibly beat θ, so everything below the
+// pivot is skipped in bulk. Block-max refines the bound with the CURRENT block's
+// max instead of the global term max, tightening the pivot and skipping more.
+// ─────────────────────────────────────────────────────────────────────────────
+std::optional<std::vector<Hit>>
+Bm25Index::search_wand(const std::vector<std::string>& q_terms, std::size_t k) const {
+    // Preconditions: dense ordinals + precomputed weights + block metadata.
+    if (dense_len_.empty() || pw_.empty() || block_meta_.empty()) return std::nullopt;
+    if (k == 0) return std::vector<Hit>{};
+
+    // One cursor per DISTINCT matched term. The block containing posting `i` is
+    // exactly `i / kBlockSize` because finalize() chunks postings into fixed,
+    // contiguous kBlockSize groups — so the current block is DERIVED from i,
+    // never tracked separately (which is what makes the walk provably correct).
+    struct Cursor {
+        const Posting*   post;    // base of the term's postings
+        const BlockMeta* blocks;  // base of the term's block metadata
+        const float*     w;       // base of the term's precomputed weights
+        std::uint32_t    n;       // posting count
+        std::uint32_t    nblk;    // block count
+        std::uint32_t    i;       // current posting index
+        float            idf;     // term idf
+        float            term_max;// idf * global max weight (WAND upper bound)
+        std::uint32_t    doc;     // current doc id (kExhausted == past end)
+    };
+
+    constexpr std::uint32_t kExhausted = std::numeric_limits<std::uint32_t>::max();
+
+    std::vector<Cursor> cur;
+    cur.reserve(q_terms.size());
+    {
+        // Collapse the query to DISTINCT terms with their query-term frequency
+        // (qtf). The exhaustive path iterates q_terms directly, so a term that
+        // appears twice in the query contributes twice; we fold that repeat
+        // into a per-term multiplier so a single cursor reproduces the exact
+        // same score instead of double-walking the postings.
+        std::unordered_map<std::string, std::uint32_t> qtf;
+        qtf.reserve(q_terms.size());
+        for (const auto& t : q_terms) ++qtf[t];
+        for (const auto& [term, freq] : qtf) {
+            auto pit = postings_.find(term);
+            if (pit == postings_.end()) continue;
+            auto sit = pw_span_.find(term);
+            if (sit == pw_span_.end()) continue;
+            auto bit = block_meta_.find(term);
+            if (bit == block_meta_.end()) continue;
+            const auto& plist = pit->second;
+            if (plist.empty()) continue;
+            Cursor c{};
+            c.post   = plist.data();
+            c.blocks = bit->second.data();
+            c.w      = pw_.data() + sit->second.first;
+            c.n      = static_cast<std::uint32_t>(plist.size());
+            c.nblk   = static_cast<std::uint32_t>(bit->second.size());
+            c.i      = 0;
+            c.idf    = idf(plist.size()) * static_cast<float>(freq); // fold qtf in
+            float gmax = 0.0f;
+            for (std::uint32_t bi = 0; bi < c.nblk; ++bi) gmax = std::max(gmax, c.blocks[bi].max_pw);
+            c.term_max = c.idf * gmax;
+            c.doc      = c.post[0].doc;
+            cur.push_back(c);
+        }
+    }
+    if (cur.empty()) return std::vector<Hit>{};
+
+    // Current block index for a cursor, derived from its posting index.
+    auto cur_blk = [](const Cursor& c) -> std::uint32_t { return c.i / kBlockSize; };
+    // idf * current-block max weight — the block-local upper bound on this
+    // term's contribution to any doc from here to the block boundary.
+    auto block_max = [&](const Cursor& c) -> float {
+        return c.idf * c.blocks[cur_blk(c)].max_pw;
+    };
+    // Advance a cursor to the first posting with doc >= target. Block metadata
+    // lets us hop whole blocks whose last_doc < target without touching their
+    // postings; the residual linear scan stays inside one block.
+    auto skip_to = [&](Cursor& c, std::uint32_t target) {
+        if (c.doc == kExhausted || target <= c.doc) return;
+        std::uint32_t bi = cur_blk(c);
+        while (bi < c.nblk && c.blocks[bi].last_doc < target) ++bi;
+        if (bi >= c.nblk) { c.i = c.n; c.doc = kExhausted; return; }
+        // Jump to the block start if we skipped blocks, then linear-scan within.
+        if (bi != cur_blk(c)) c.i = bi * kBlockSize;
+        while (c.i < c.n && c.post[c.i].doc < target) ++c.i;
+        c.doc = (c.i < c.n) ? c.post[c.i].doc : kExhausted;
+    };
+
+    // Top-k min-heap on score; theta is the current admission threshold.
+    struct Scored { float score; std::uint32_t doc; };
+    auto worse = [](const Scored& a, const Scored& b) { return a.score > b.score; }; // min-heap
+    std::vector<Scored> heap;
+    heap.reserve(k + 1);
+    float theta = 0.0f;
+
+    for (;;) {
+        // Keep cursors ordered by current doc id. Few query terms, so a full
+        // sort per round is cheaper than maintaining a heap of cursors.
+        std::sort(cur.begin(), cur.end(),
+                  [](const Cursor& a, const Cursor& b) { return a.doc < b.doc; });
+        if (cur.front().doc == kExhausted) break;
+
+        // WAND pivot: first term whose cumulative GLOBAL upper bound crosses
+        // theta. Documents below the pivot's doc id cannot beat theta.
+        float bound = 0.0f;
+        std::size_t pivot = cur.size();
+        for (std::size_t t = 0; t < cur.size(); ++t) {
+            if (cur[t].doc == kExhausted) break;
+            bound += cur[t].term_max;
+            if (bound > theta) { pivot = t; break; }
+        }
+        if (pivot == cur.size()) break;              // nothing can beat theta
+        const std::uint32_t pivot_doc = cur[pivot].doc;
+
+        if (cur.front().doc == pivot_doc) {
+            // Front cursors are aligned on pivot_doc. Block-max refinement: sum
+            // the CURRENT-block maxima of the ALIGNED terms (doc == pivot_doc)
+            // only. If even that upper bound cannot beat theta, pivot_doc cannot
+            // enter the top-k — skip scoring it and advance one aligned cursor.
+            // We use only aligned terms so the bound stays a valid upper bound
+            // on pivot_doc's exact score (terms with doc < pivot_doc do not
+            // contribute to pivot_doc; terms with doc > pivot_doc likewise).
+            float aligned_block_bound = 0.0f;
+            for (const auto& c : cur) {
+                if (c.doc != pivot_doc) break;
+                aligned_block_bound += block_max(c);
+            }
+            if (aligned_block_bound <= theta) {
+                // pivot_doc is pruned. Advance the first aligned cursor past it;
+                // the others realign next round. Correct because pivot_doc's
+                // exact score <= aligned_block_bound <= theta.
+                skip_to(cur.front(), pivot_doc + 1);
+                continue;
+            }
+            // Score pivot_doc fully over every aligned term.
+            float score = 0.0f;
+            for (auto& c : cur) {
+                if (c.doc != pivot_doc) break;
+                score += c.idf * c.w[c.i];
+                skip_to(c, pivot_doc + 1);
+            }
+            if (heap.size() < k) {
+                heap.push_back(Scored{score, pivot_doc});
+                std::push_heap(heap.begin(), heap.end(), worse);
+                if (heap.size() == k) theta = heap.front().score;
+            } else if (score > theta) {
+                std::pop_heap(heap.begin(), heap.end(), worse);
+                heap.back() = Scored{score, pivot_doc};
+                std::push_heap(heap.begin(), heap.end(), worse);
+                theta = heap.front().score;
+            }
+        } else {
+            // Not yet aligned: advance the earliest cursors up to pivot_doc so a
+            // later round can score it. Skipping to pivot_doc (not +1) is what
+            // lets the aligned branch collect every term present in pivot_doc.
+            for (auto& c : cur) {
+                if (c.doc >= pivot_doc) break;
+                skip_to(c, pivot_doc);
+            }
+        }
+    }
+
+    std::sort(heap.begin(), heap.end(),
+              [](const Scored& a, const Scored& b) {
+                  if (a.score != b.score) return a.score > b.score;
+                  return a.doc < b.doc;
+              });
+    std::vector<Hit> hits;
+    hits.reserve(heap.size());
+    for (const auto& s : heap) hits.push_back(Hit{ChunkId{s.doc}, Score{s.score}});
+    return hits;
+}
+
 std::vector<Hit> Bm25Index::search(std::string_view query, std::size_t k) const {
     if (doc_len_.empty()) return {};
     auto q_terms = tok_.tokenize(query);
     if (q_terms.empty()) return {};
+
+    // BlockMax-WAND dynamic pruning: same top-k as the exhaustive path, but it
+    // skips blocks that provably cannot enter the result. It pays off precisely
+    // when k is small relative to the number of postings touched — the common
+    // hybrid-retrieval case. Falls through to the exhaustive TAAT path when its
+    // preconditions (dense ordinals + precomputed weights) do not hold.
+    if (auto wand = search_wand(q_terms, k)) return std::move(*wand);
 
     const float avgdl = avgdl_ > 0 ? avgdl_ : 1.0f;
     const float k1 = params_.k1, b = params_.b;

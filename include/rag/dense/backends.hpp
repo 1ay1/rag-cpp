@@ -100,8 +100,11 @@ struct LlamaCppConfig {
     std::string   path    = "/embedding";
     std::size_t   dim     = 0;                  // 0 => inferred from first response
     std::chrono::milliseconds timeout{30'000};
-    // llama.cpp's server runs the model on all cores per request; concurrent
-    // requests mostly queue. Kept at 1 — raise only for a multi-slot server.
+    // llama.cpp's default single-slot server runs the model on all cores per
+    // request, so concurrent requests mostly queue — hence the default of 1.
+    // embed() now issues its N per-text requests across this many workers, so a
+    // MULTI-SLOT server (llama-server --parallel N) gets real speedup by raising
+    // this to the slot count; a single-slot server should leave it at 1.
     std::size_t   concurrency = 1;
 };
 

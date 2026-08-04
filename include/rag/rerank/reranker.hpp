@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "rag/core/types.hpp"
+#include "rag/cache/cache.hpp"           // RerankCache for the caching decorator
 #include "rag/dense/embedder.hpp"     // HttpTransport seam
 #include "rag/dense/local_embedder.hpp" // LocalEmbedderConfig (reused for paths)
 #include "rag/index/corpus.hpp"
@@ -135,6 +136,71 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+// ─── Caching decorator ────────────────────────────────────────────────────────
+// Wraps any Reranker and memoizes (query, passage) → score in a shared
+// RerankCache. A cross-encoder pass is the funnel's most expensive op and it
+// repeats constantly (interactive re-queries, overlapping retrieval windows);
+// this makes every repeat free. On a call it splits passages into cache hits
+// and misses, invokes the wrapped reranker on ONLY the misses (so a partial
+// overlap still shrinks the batch), then backfills the cache. Models the
+// Reranker concept itself, so it composes with AnyReranker and make_rerank_stage.
+//
+// The cache is shared (shared_ptr) so multiple stages/threads reuse one table;
+// `identity` pins entries to a specific model so a swap never returns a stale
+// logit. Pass a distinct identity per underlying reranker.
+template <Reranker R>
+class CachingReranker {
+public:
+    CachingReranker(R inner, std::shared_ptr<cache::RerankCache> cache, std::string identity)
+        : inner_(std::move(inner)), cache_(std::move(cache)), identity_(std::move(identity)) {
+        if (!cache_) cache_ = std::make_shared<cache::RerankCache>();
+    }
+
+    [[nodiscard]] Result<std::vector<float>>
+    rerank(std::string_view query, std::span<const std::string> passages) const {
+        std::vector<float>       out(passages.size(), 0.0f);
+        std::vector<std::string> miss;              // passages not in cache
+        std::vector<std::size_t> miss_idx;          // their positions in `out`
+        miss.reserve(passages.size());
+        miss_idx.reserve(passages.size());
+
+        for (std::size_t i = 0; i < passages.size(); ++i) {
+            if (auto hit = cache_->get(identity_, query, passages[i])) {
+                out[i] = *hit;
+            } else {
+                miss.push_back(passages[i]);
+                miss_idx.push_back(i);
+            }
+        }
+
+        if (!miss.empty()) {
+            auto scored = inner_.rerank(query, std::span<const std::string>(miss));
+            if (!scored) return std::unexpected(scored.error());
+            if (scored->size() != miss.size())
+                return fail<std::vector<float>>(Errc::invalid_argument, "reranker returned wrong count");
+            for (std::size_t j = 0; j < miss.size(); ++j) {
+                out[miss_idx[j]] = (*scored)[j];
+                cache_->put(identity_, query, miss[j], (*scored)[j]);
+            }
+        }
+        return out;
+    }
+
+    [[nodiscard]] const cache::RerankCache& cache() const { return *cache_; }
+
+private:
+    R                                   inner_;
+    std::shared_ptr<cache::RerankCache> cache_;
+    std::string                         identity_;
+};
+
+// Deduce-and-wrap helper: cached(myReranker, cache, "bge-reranker-v2").
+template <Reranker R>
+[[nodiscard]] CachingReranker<R>
+cached(R inner, std::shared_ptr<cache::RerankCache> cache, std::string identity) {
+    return CachingReranker<R>(std::move(inner), std::move(cache), std::move(identity));
+}
 
 // ─── Type-erased reranker ─────────────────────────────────────────────────────
 class AnyReranker {

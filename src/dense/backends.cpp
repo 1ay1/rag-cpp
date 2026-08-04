@@ -2,9 +2,12 @@
 
 #include "rag/dense/backends.hpp"
 #include "rag/dense/simd.hpp"
+#include "rag/util/parallel.hpp"
 
+#include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <mutex>
 
 #include <nlohmann/json.hpp>
 
@@ -118,31 +121,55 @@ Result<std::vector<Vector>> OpenAIEmbedder::embed(std::span<const std::string> t
 
 // ─── llama.cpp server /embedding ──────────────────────────────────────────────
 // Newer builds accept {"content": "..."} and return {"embedding":[...]}; batch
-// builds return an array of {"embedding":[...]} objects. We handle both, one
-// request per text to stay compatible with all server versions.
+// builds return an array of {"embedding":[...]} objects. We handle both. The
+// server takes one text per request, so a batch is N requests — but they are
+// independent and the transport is thread-safe, so we issue them CONCURRENTLY
+// (up to cfg_.concurrency) instead of serially: ingest latency drops from N×RTT
+// toward ceil(N/concurrency)×RTT. Results are written to their own slots so
+// order is preserved, and the first error wins.
 Result<std::vector<Vector>> LlamaCppEmbedder::embed(std::span<const std::string> texts) const {
-    std::vector<Vector> out;
-    out.reserve(texts.size());
-    for (const auto& t : texts) {
-        json req; req["content"] = t;
+    if (texts.empty()) return std::vector<Vector>{};
+
+    std::vector<Vector> out(texts.size());
+    std::atomic<bool>   failed{false};
+    Error               first_err{};
+    std::mutex          err_mu;
+
+    auto one = [&](std::size_t i) {
+        if (failed.load(std::memory_order_acquire)) return;
+        json req; req["content"] = texts[i];
         auto resp = tp_->post_json(cfg_.host, cfg_.port, cfg_.path, req.dump(), cfg_.timeout);
-        if (!resp) return std::unexpected(resp.error());
-        if (resp->status != 200)
-            return fail<std::vector<Vector>>(Errc::transport_error, "llamacpp status " + std::to_string(resp->status));
+        auto set_err = [&](Error e) {
+            std::lock_guard lk(err_mu);
+            if (!failed.exchange(true, std::memory_order_acq_rel)) first_err = std::move(e);
+        };
+        if (!resp) { set_err(resp.error()); return; }
+        if (resp->status != 200) {
+            set_err(Error{Errc::transport_error, "llamacpp status " + std::to_string(resp->status)});
+            return;
+        }
         auto j = json::parse(resp->body, nullptr, false);
-        if (j.is_discarded()) return fail<std::vector<Vector>>(Errc::parse_error, "llamacpp json");
+        if (j.is_discarded()) { set_err(Error{Errc::parse_error, "llamacpp json"}); return; }
 
         const json* emb = nullptr;
         if (j.contains("embedding")) emb = &j["embedding"];
         else if (j.is_array() && !j.empty() && j[0].contains("embedding")) emb = &j[0]["embedding"];
-        if (!emb || !emb->is_array()) return fail<std::vector<Vector>>(Errc::parse_error, "llamacpp: no embedding");
+        if (!emb || !emb->is_array()) { set_err(Error{Errc::parse_error, "llamacpp: no embedding"}); return; }
 
         Vector v; v.reserve(emb->size());
         for (const auto& x : *emb) v.push_back(x.get<float>());
         normalize(v);
-        if (dim_ == 0) dim_ = v.size();
-        out.push_back(std::move(v));
-    }
+        out[i] = std::move(v);
+    };
+
+    const std::size_t workers = std::max<std::size_t>(1, cfg_.concurrency);
+    if (workers <= 1 || texts.size() == 1)
+        for (std::size_t i = 0; i < texts.size(); ++i) one(i);
+    else
+        util::parallel_for_dynamic(texts.size(), workers, one);
+
+    if (failed.load(std::memory_order_acquire)) return std::unexpected(first_err);
+    if (dim_ == 0 && !out.empty()) dim_ = out.front().size();
     return out;
 }
 

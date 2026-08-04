@@ -118,4 +118,34 @@ private:
     LruCache<std::vector<Hit>> lru_;
 };
 
+// Rerank score cache: key = identity ⊕ '\0' ⊕ query ⊕ '\0' ⊕ passage → logit.
+//
+// A cross-encoder forward pass over (query, passage) is the single most
+// expensive op in the funnel, and it repeats constantly: interactive sessions
+// re-ask near-identical queries, and overlapping retrieval windows surface the
+// same passage for the same query across turns. Unlike the embedding cache the
+// key is the PAIR — relevance is joint — and the identity pins it to a specific
+// reranker so a model swap never returns a stale logit. Bounded LRU, thread-safe.
+class RerankCache {
+public:
+    explicit RerankCache(std::size_t capacity = 65536) : lru_(capacity) {}
+    [[nodiscard]] std::optional<float>
+    get(std::string_view identity, std::string_view query, std::string_view passage) {
+        return lru_.get(key(identity, query, passage));
+    }
+    void put(std::string_view identity, std::string_view query, std::string_view passage, float score) {
+        lru_.put(key(identity, query, passage), score);
+    }
+    void clear() { lru_.clear(); }
+    [[nodiscard]] double hit_rate() const { return lru_.hit_rate(); }
+    [[nodiscard]] std::size_t size() const { return lru_.size(); }
+private:
+    static std::string key(std::string_view id, std::string_view q, std::string_view p) {
+        std::string k; k.reserve(id.size() + q.size() + p.size() + 2);
+        k.append(id); k.push_back('\0'); k.append(q); k.push_back('\0'); k.append(p);
+        return k;
+    }
+    LruCache<float> lru_;
+};
+
 } // namespace rag::cache

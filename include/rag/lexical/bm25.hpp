@@ -10,6 +10,7 @@
 // always positive so common terms never contribute negatively).
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -132,11 +133,39 @@ private:
     // term -> [begin,end) range into pw_, aligned with that term's postings.
     std::unordered_map<std::string, std::pair<std::uint32_t, std::uint32_t>> pw_span_;
 
+    // ── Block-max metadata for BlockMax-WAND dynamic pruning ────────────
+    // The TAAT fast path scores EVERY posting of EVERY query term, then keeps
+    // top-k. That is O(total postings touched) regardless of k, so a common
+    // word in a large corpus is paid in full even when only 10 results are
+    // wanted. BlockMax-WAND (Ding & Suel, SIGIR 2011) instead walks postings
+    // document-at-a-time and, using a per-block upper bound on each term's
+    // contribution, skips whole blocks that provably cannot enter the current
+    // top-k. Same results, a fraction of the work once k << corpus.
+    //
+    // We chunk each term's postings into fixed-size blocks and store, per block,
+    // the last doc id in the block (for skip-to) and the maximum PRECOMPUTED
+    // weight in it. A term's block-max CONTRIBUTION is idf(term)*block_max_pw;
+    // the global per-term max (used for the WAND pivot bound) is the max over
+    // its blocks. All derived from pw_, rebuilt by finalize(), never serialized.
+    static constexpr std::uint32_t kBlockSize = 128;
+    struct BlockMeta {
+        std::uint32_t last_doc;   // largest doc id in this block
+        float         max_pw;     // largest precomputed weight in this block
+    };
+    // term -> its blocks (aligned with the term's postings slice).
+    std::unordered_map<std::string, std::vector<BlockMeta>> block_meta_;
+
     double  total_len_ = 0.0;
     float   avgdl_     = 0.0f;
     bool    finalized_ = false;
 
     [[nodiscard]] float idf(std::size_t n_t) const;
+
+    // BlockMax-WAND top-k over dense ordinals + precomputed weights. Returns
+    // std::nullopt when its preconditions do not hold (sparse ids, no weights,
+    // degenerate k) so search() can fall back to the exhaustive path.
+    [[nodiscard]] std::optional<std::vector<Hit>>
+    search_wand(const std::vector<std::string>& q_terms, std::size_t k) const;
 };
 
 } // namespace rag::lexical

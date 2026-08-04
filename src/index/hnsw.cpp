@@ -134,9 +134,14 @@ void HnswIndex::seal() const {
                           && (!pq_active || cfg_.drop_floats);
     if (need_sq8 && q8_.size() != n * dim_ && !store_.empty()) {
         q8_.resize(n * dim_);
-        for (std::size_t i = 0; i < n; ++i)
+        // Embarrassingly parallel: each row quantizes independently. On the
+        // incremental-add path seal() runs outside build_batch, so this loop
+        // (which is otherwise the serial tail of a bulk rebuild) fans out across
+        // cores just like build_batch's own quantization pass.
+        util::parallel_for(n, [&](std::size_t i) {
             dense::quantize_sq8(vec_at(i),
                                 std::span<std::int8_t>(q8_.data() + i * dim_, dim_));
+        });
     } else if (!need_sq8 && !q8_.empty()) {
         q8_.clear();
         q8_.shrink_to_fit();
@@ -327,10 +332,10 @@ namespace {
 // re-computation would be 200 extra dot products per link operation.
 // `sim_between(a,b)` is the similarity between two candidates.
 template <class SimAB>
-std::vector<std::uint32_t>
-select_neighbours_heuristic(const std::vector<std::pair<float, std::uint32_t>>& scored,
-                            std::size_t M, SimAB&& sim_between) {
-    std::vector<std::uint32_t> picked;
+void select_neighbours_heuristic_into(const std::vector<std::pair<float, std::uint32_t>>& scored,
+                                     std::size_t M, SimAB&& sim_between,
+                                     std::vector<std::uint32_t>& picked) {
+    picked.clear();
     picked.reserve(M);
     for (const auto& [c_q, c] : scored) {
         if (picked.size() >= M) break;
@@ -351,6 +356,16 @@ select_neighbours_heuristic(const std::vector<std::pair<float, std::uint32_t>>& 
                 picked.push_back(c);
         }
     }
+}
+
+// Allocating convenience wrapper for the serial connect() path. The hot,
+// parallel connect_locked() path uses the _into form with a thread_local buffer.
+template <class SimAB>
+std::vector<std::uint32_t>
+select_neighbours_heuristic(const std::vector<std::pair<float, std::uint32_t>>& scored,
+                            std::size_t M, SimAB&& sim_between) {
+    std::vector<std::uint32_t> picked;
+    select_neighbours_heuristic_into(scored, M, std::forward<SimAB>(sim_between), picked);
     return picked;
 }
 
@@ -417,13 +432,23 @@ void HnswIndex::connect_locked(std::uint32_t node, int layer,
     const std::size_t maxM = (layer == 0) ? cfg_.M * 2 : cfg_.M;
     const std::size_t L    = static_cast<std::size_t>(layer);
 
+    // Scratch reused across every connect_locked call ON THIS THREAD. Phase 2
+    // links millions of nodes; a fresh `scored`/`snapshot`/`keep` per node was
+    // three heap allocations per link op (plus the O(M²) prune's re-scores),
+    // all churning the allocator under parallel contention. thread_local keeps
+    // one buffer set per worker — no locking, no per-node allocation, and the
+    // capacity converges after the first few nodes. Mirrors the Scratch pattern
+    // the search path already uses.
+    thread_local std::vector<std::pair<float, std::uint32_t>> scored;
+    thread_local std::vector<std::uint32_t>                   keep;
+    thread_local std::vector<std::uint32_t>                   snapshot;
+
     // Rank candidates by similarity to `node`, then apply the diversity
     // heuristic. This read-only scoring needs no locks: vectors are immutable
     // after staging and neither arena reallocates during phase 2.
-    std::vector<std::pair<float, std::uint32_t>> scored;
     score_and_sort(node, neighbours, scored);
-    auto keep = select_neighbours_heuristic(scored, maxM,
-            [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); });
+    select_neighbours_heuristic_into(scored, maxM,
+            [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); }, keep);
 
     {   // Publish this node's own adjacency. Written in place (capacity was
         // reserved to maxM+1 at staging) so the buffer address never changes
@@ -435,7 +460,6 @@ void HnswIndex::connect_locked(std::uint32_t node, int layer,
 
     // Add back-links, pruning each neighbour to its own maxM. Each neighbour is
     // locked individually and only for the duration of its own edit.
-    std::vector<std::uint32_t> snapshot;
     for (std::uint32_t nb : keep) {
         locks[nb].lock();
         auto& NL = nodes_[nb].links[L];
@@ -449,8 +473,9 @@ void HnswIndex::connect_locked(std::uint32_t node, int layer,
         // is O(M²) dot products, far too long to hold a spinlock that readers
         // and other writers are contending for.
         score_and_sort(nb, snapshot, scored);
-        auto pruned = select_neighbours_heuristic(scored, maxM,
-                [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); });
+        thread_local std::vector<std::uint32_t> pruned;
+        select_neighbours_heuristic_into(scored, maxM,
+                [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); }, pruned);
         locks[nb].lock();
         auto& NL2 = nodes_[nb].links[L];
         // Re-check under the lock: another thread may have pruned already, and

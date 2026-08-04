@@ -55,6 +55,47 @@ bool has_avx2() {
     return v;
 }
 
+// AVX-512F + AVX-512BW (byte/word ops, needed for the int16 madd path) let one
+// 512-bit FMA replace two 256-bit ones — half the loop trips, same rounding.
+bool has_avx512() {
+    static const bool v = [] {
+#  if defined(__GNUC__) || defined(__clang__)
+        unsigned eax, ebx, ecx, edx;
+        if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
+        const bool f  = (ebx & (1u << 16)) != 0; // AVX-512F
+        const bool bw = (ebx & (1u << 30)) != 0; // AVX-512BW
+        return f && bw;
+#  elif defined(_MSC_VER)
+        int regs[4]{};
+        __cpuidex(regs, 7, 0);
+        return (regs[1] & (1 << 16)) != 0 && (regs[1] & (1 << 30)) != 0;
+#  else
+        return false;
+#  endif
+    }();
+    return v;
+}
+
+// AVX-512-VNNI: _mm512_dpbusd_epi32 does an 8-bit multiply + int32 accumulate
+// in ONE instruction, collapsing the sign-extend + madd + add chain of the
+// SQ8 kernel. This is the single biggest win for the quantized graph walk.
+bool has_avx512_vnni() {
+    static const bool v = [] {
+#  if defined(__GNUC__) || defined(__clang__)
+        unsigned eax, ebx, ecx, edx;
+        if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
+        return (ecx & (1u << 11)) != 0; // AVX512-VNNI
+#  elif defined(_MSC_VER)
+        int regs[4]{};
+        __cpuidex(regs, 7, 0);
+        return (regs[2] & (1 << 11)) != 0;
+#  else
+        return false;
+#  endif
+    }();
+    return v && has_avx512();
+}
+
 // Four independent accumulators. A single acc chains every FMA through one
 // dependency (~4-cycle latency each); four lets the CPU keep its FMA units
 // saturated, which is what actually makes this throughput- rather than
@@ -84,6 +125,27 @@ float dot_avx2(const float* a, const float* b, std::size_t n) noexcept {
     lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
     lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
     float s = _mm_cvtss_f32(lo);
+    for (; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+
+// AVX-512 float dot: two 512-bit accumulators (16 floats each) cover 32 dims
+// per trip, matching dot_avx2's unroll width in half the instructions. Gated
+// behind has_avx512() at the call site; the target attribute only permits the
+// compiler to EMIT zmm code here (see dot_sq8_avx2's note on always_inline).
+RAGCPP_TARGET("avx512f,avx512bw")
+float dot_avx512(const float* a, const float* b, std::size_t n) noexcept {
+    __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        _mm_prefetch(reinterpret_cast<const char*>(a + i + 128), _MM_HINT_T0);
+        _mm_prefetch(reinterpret_cast<const char*>(b + i + 128), _MM_HINT_T0);
+        a0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i +  0), _mm512_loadu_ps(b + i +  0), a0);
+        a1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16), a1);
+    }
+    for (; i + 16 <= n; i += 16)
+        a0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), a0);
+    float s = _mm512_reduce_add_ps(_mm512_add_ps(a0, a1));
     for (; i < n; ++i) s += a[i] * b[i];
     return s;
 }
@@ -119,7 +181,8 @@ float dot_neon(const float* a, const float* b, std::size_t n) noexcept {
 float dot(std::span<const float> a, std::span<const float> b) noexcept {
     const std::size_t n = a.size() < b.size() ? a.size() : b.size();
 #if defined(RAGCPP_X86)
-    if (has_avx2()) return dot_avx2(a.data(), b.data(), n);
+    if (has_avx512()) return dot_avx512(a.data(), b.data(), n);
+    if (has_avx2())   return dot_avx2(a.data(), b.data(), n);
 #elif defined(RAGCPP_NEON)
     return dot_neon(a.data(), b.data(), n);
 #endif
@@ -178,6 +241,36 @@ std::int32_t dot_sq8_avx2(const std::int8_t* a, const std::int8_t* b, std::size_
     for (; i < n; ++i) sum += static_cast<std::int32_t>(a[i]) * static_cast<std::int32_t>(b[i]);
     return sum;
 }
+
+// AVX-512-VNNI SQ8 dot. _mm512_dpbusd_epi32 fuses "multiply 8-bit × 8-bit,
+// horizontally add groups of four, accumulate into int32" into a single uop —
+// replacing the cvtepi8_epi16 + madd_epi16 + add chain of the AVX2 path.
+//
+// VNNI's first operand is UNSIGNED bytes, the second SIGNED. Our codes are
+// signed in [-127,127]. We shift a into [0,254] by adding 128 (making it a
+// valid u8), which injects a bias term 128*Σb that we subtract back out using
+// a separate signed sum of b. Net: exact same integer result, one dpbusd per
+// 64 dims. bias = 128 * Σ b_i is removed after the loop.
+RAGCPP_TARGET("avx512f,avx512bw,avx512vnni")
+std::int32_t dot_sq8_vnni(const std::int8_t* a, const std::int8_t* b, std::size_t n) noexcept {
+    __m512i acc  = _mm512_setzero_si512();
+    __m512i bsum = _mm512_setzero_si512();   // Σ b_i (as int32) for de-biasing
+    const __m512i k128 = _mm512_set1_epi8(static_cast<char>(128));
+    const __m512i ones = _mm512_set1_epi8(1);
+    std::size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        const __m512i va = _mm512_loadu_si512(reinterpret_cast<const void*>(a + i));
+        const __m512i vb = _mm512_loadu_si512(reinterpret_cast<const void*>(b + i));
+        const __m512i ua = _mm512_add_epi8(va, k128);      // a + 128 -> unsigned
+        acc  = _mm512_dpbusd_epi32(acc,  ua,   vb);        // Σ (a+128)*b
+        bsum = _mm512_dpbusd_epi32(bsum, ones, vb);        // Σ 1*b = Σ b
+    }
+    std::int32_t sum  = _mm512_reduce_add_epi32(acc);
+    std::int32_t sb   = _mm512_reduce_add_epi32(bsum);
+    sum -= 128 * sb;                                        // remove the bias
+    for (; i < n; ++i) sum += static_cast<std::int32_t>(a[i]) * static_cast<std::int32_t>(b[i]);
+    return sum;
+}
 #endif
 
 std::int32_t dot_sq8(const std::int8_t* a, const std::int8_t* b, std::size_t n) noexcept {
@@ -201,7 +294,8 @@ std::int32_t dot_sq8(const std::int8_t* a, const std::int8_t* b, std::size_t n) 
         return sum;
     }
 #elif defined(RAGCPP_X86)
-    if (has_avx2()) return dot_sq8_avx2(a, b, n);
+    if (has_avx512_vnni()) return dot_sq8_vnni(a, b, n);
+    if (has_avx2())        return dot_sq8_avx2(a, b, n);
 #endif
     std::int32_t s = 0;
     for (std::size_t i = 0; i < n; ++i)
@@ -235,6 +329,8 @@ std::uint32_t hamming(std::span<const std::uint64_t> a,
 
 const char* simd_tier() noexcept {
 #if defined(RAGCPP_X86)
+    if (has_avx512_vnni()) return "avx512+vnni";
+    if (has_avx512())      return "avx512";
     return has_avx2() ? "avx2+fma" : "scalar-x86";
 #elif defined(RAGCPP_NEON)
     return "neon";
