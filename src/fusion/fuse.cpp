@@ -32,10 +32,13 @@ float robust_ceiling(const std::vector<float>& sorted_desc, float raw_hi, float 
     // Need enough samples for a percentile to mean anything; below this the raw
     // max IS the robust estimate.
     if (n < 8) return raw_hi;
-    // sorted_desc is best-first. The p-th percentile from the top is at index
-    // floor((1-p) * n), clamped into range. p=0.99 -> ~1% from the top.
-    const float frac = std::clamp(1.0f - p, 0.0f, 1.0f);
+    // sorted_desc is best-first. Trim the top (1-p) fraction, but ALWAYS at
+    // least one element — otherwise a lone spike (the exact case we guard) is
+    // never trimmed because index 0 rounds to the max itself. Clamp so we never
+    // trim so far we cross the median.
+    const float frac = std::clamp(1.0f - p, 0.0f, 0.5f);
     std::size_t idx = static_cast<std::size_t>(frac * static_cast<float>(n));
+    if (idx == 0) idx = 1;               // trim the single worst outlier at minimum
     if (idx >= n) idx = n - 1;
     return sorted_desc[idx];
 }

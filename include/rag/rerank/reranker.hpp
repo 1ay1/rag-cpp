@@ -240,6 +240,18 @@ private:
 make_rerank_stage(AnyReranker reranker, std::size_t top_n = 50, float blend = 0.5f,
                   std::string label = "cross_encoder");
 
+// Same, but memoizes (query, passage) → score through a shared RerankCache so a
+// repeated or overlapping query never re-runs the cross-encoder forward pass.
+// `identity` pins cache entries to this specific model (pass the reranker's
+// identity() or any stable name); a distinct identity per model prevents a swap
+// from returning a stale logit. The cache is shared — hand the same shared_ptr
+// to multiple stages/engines to pool it. Everything else matches the overload
+// above; the cache is purely additive and transparent.
+[[nodiscard]] pipeline::StagePtr
+make_cached_rerank_stage(AnyReranker reranker, std::shared_ptr<cache::RerankCache> cache,
+                         std::string identity, std::size_t top_n = 50, float blend = 0.5f,
+                         std::string label = "cross_encoder");
+
 static_assert(Reranker<CrossEncoderReranker>);
 static_assert(Reranker<ScoreFnReranker>);
 static_assert(Reranker<OnnxReranker>);

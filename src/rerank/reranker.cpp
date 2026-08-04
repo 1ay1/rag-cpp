@@ -216,8 +216,10 @@ OnnxReranker::rerank(std::string_view query, std::span<const std::string> passag
 namespace {
 class RerankStageImpl final : public pipeline::RetrievalStage {
 public:
-    RerankStageImpl(AnyReranker r, std::size_t top_n, float blend, std::string label)
-        : reranker_(std::move(r)), top_n_(top_n), blend_(blend), label_(std::move(label)) {}
+    RerankStageImpl(AnyReranker r, std::size_t top_n, float blend, std::string label,
+                    std::shared_ptr<cache::RerankCache> cache = nullptr, std::string identity = {})
+        : reranker_(std::move(r)), top_n_(top_n), blend_(blend), label_(std::move(label)),
+          cache_(std::move(cache)), identity_(std::move(identity)) {}
     std::string_view name() const noexcept override { return label_; }
 
     Result<pipeline::Context> process(pipeline::Context ctx) const override {
@@ -232,7 +234,7 @@ public:
             passages.push_back(ch ? ch->indexed_text() : std::string{});
         }
 
-        auto scores = reranker_.rerank(ctx.query, passages);
+        auto scores = rerank_cached(ctx.query, passages);
         if (!scores) {  // graceful degradation: leave order untouched
             ctx.trace.push_back(std::string("rerank unavailable: ") + std::string(to_string(scores.error().code)));
             return ctx;
@@ -259,15 +261,52 @@ public:
         return ctx;
     }
 private:
+    // Rerank `passages`, serving cache hits and asking the model only for the
+    // misses when a cache is attached; a straight pass-through otherwise.
+    Result<std::vector<float>>
+    rerank_cached(std::string_view query, const std::vector<std::string>& passages) const {
+        if (!cache_) return reranker_.rerank(query, passages);
+
+        std::vector<float>       out(passages.size(), 0.0f);
+        std::vector<std::string> miss;
+        std::vector<std::size_t> miss_idx;
+        for (std::size_t i = 0; i < passages.size(); ++i) {
+            if (auto hit = cache_->get(identity_, query, passages[i])) out[i] = *hit;
+            else { miss.push_back(passages[i]); miss_idx.push_back(i); }
+        }
+        if (!miss.empty()) {
+            auto scored = reranker_.rerank(query, std::span<const std::string>(miss));
+            if (!scored) return std::unexpected(scored.error());
+            if (scored->size() != miss.size())
+                return fail<std::vector<float>>(Errc::invalid_argument, "reranker returned wrong count");
+            for (std::size_t j = 0; j < miss.size(); ++j) {
+                out[miss_idx[j]] = (*scored)[j];
+                cache_->put(identity_, query, miss[j], (*scored)[j]);
+            }
+        }
+        return out;
+    }
+
     AnyReranker reranker_;
     std::size_t top_n_;
     float       blend_;
     std::string label_;
+    std::shared_ptr<cache::RerankCache> cache_;
+    std::string                         identity_;
 };
 } // namespace
 
 pipeline::StagePtr make_rerank_stage(AnyReranker reranker, std::size_t top_n, float blend, std::string label) {
     return std::make_shared<RerankStageImpl>(std::move(reranker), top_n, blend, std::move(label));
+}
+
+pipeline::StagePtr make_cached_rerank_stage(AnyReranker reranker,
+                                            std::shared_ptr<cache::RerankCache> cache,
+                                            std::string identity, std::size_t top_n, float blend,
+                                            std::string label) {
+    if (!cache) cache = std::make_shared<cache::RerankCache>();
+    return std::make_shared<RerankStageImpl>(std::move(reranker), top_n, blend, std::move(label),
+                                             std::move(cache), std::move(identity));
 }
 
 } // namespace rag::rerank
