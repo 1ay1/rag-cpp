@@ -108,23 +108,80 @@ if(WIN32)
 endif()
 
 # ── Optional in-process embedder backends ────────────────────────────────────
+# Pin the ONNX Runtime version fetched when no system install is present.
+set(RAGCPP_ONNXRUNTIME_VERSION "1.20.1" CACHE STRING
+    "ONNX Runtime release version to auto-download when not found on the system")
 if(RAGCPP_WITH_ONNX)
-    # Point CMake at your ONNX Runtime install via -Donnxruntime_ROOT=... .
+    # Preference order: (1) a CMake-package install (find_package), (2) a manual
+    # path via onnxruntime_ROOT / ONNXRUNTIME_INCLUDE_DIR+LIB, (3) auto-download
+    # the official prebuilt release from GitHub. (3) is what makes
+    # -DRAGCPP_WITH_ONNX=ON self-contained on a machine with no ORT installed,
+    # mirroring how the RCP SDK falls back to FetchContent below.
     find_package(onnxruntime QUIET)
     if(onnxruntime_FOUND)
         target_link_libraries(ragcpp PUBLIC onnxruntime::onnxruntime)
+        target_compile_definitions(ragcpp PUBLIC RAGCPP_WITH_ONNX)
     else()
         find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
             PATH_SUFFIXES onnxruntime onnxruntime/core/session)
         find_library(ONNXRUNTIME_LIB onnxruntime)
         if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIB)
-            message(FATAL_ERROR "RAGCPP_WITH_ONNX=ON but ONNX Runtime not found. "
-                "Set onnxruntime_ROOT or ONNXRUNTIME_INCLUDE_DIR/ONNXRUNTIME_LIB.")
+            # ── Auto-download the official prebuilt release ──────────────────
+            # Microsoft ships per-platform tarballs of the C/C++ API + shared
+            # library on the GitHub releases page. We pick the tarball for this
+            # host triple, unpack it via FetchContent (download-only: it is a
+            # prebuilt binary, nothing to configure), and point the include +
+            # link at it. The runtime .so is copied next to consumers so it is
+            # found without touching LD_LIBRARY_PATH.
+            set(_ort_ver ${RAGCPP_ONNXRUNTIME_VERSION})
+            if(WIN32)
+                set(_ort_pkg "onnxruntime-win-x64-${_ort_ver}")
+                set(_ort_ext "zip")
+                set(_ort_lib_sub "lib/onnxruntime.lib")
+                set(_ort_dll_sub "lib/onnxruntime.dll")
+            elseif(APPLE)
+                if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+                    set(_ort_pkg "onnxruntime-osx-arm64-${_ort_ver}")
+                else()
+                    set(_ort_pkg "onnxruntime-osx-x86_64-${_ort_ver}")
+                endif()
+                set(_ort_ext "tgz")
+                set(_ort_lib_sub "lib/libonnxruntime.dylib")
+            else()
+                if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+                    set(_ort_pkg "onnxruntime-linux-aarch64-${_ort_ver}")
+                else()
+                    set(_ort_pkg "onnxruntime-linux-x64-${_ort_ver}")
+                endif()
+                set(_ort_ext "tgz")
+                set(_ort_lib_sub "lib/libonnxruntime.so")
+            endif()
+            set(_ort_url "https://github.com/microsoft/onnxruntime/releases/download/v${_ort_ver}/${_ort_pkg}.${_ort_ext}")
+            message(STATUS "rag-cpp: ONNX Runtime not found; auto-downloading ${_ort_url}")
+            FetchContent_Declare(onnxruntime_prebuilt URL "${_ort_url}")
+            FetchContent_MakeAvailable(onnxruntime_prebuilt)
+            set(ONNXRUNTIME_INCLUDE_DIR "${onnxruntime_prebuilt_SOURCE_DIR}/include"
+                CACHE PATH "" FORCE)
+            set(ONNXRUNTIME_LIB "${onnxruntime_prebuilt_SOURCE_DIR}/${_ort_lib_sub}"
+                CACHE FILEPATH "" FORCE)
+            # Make the shared library discoverable at runtime for anything the
+            # top-level build links (tests/bench/CLI) without an env var.
+            file(GLOB _ort_runtime
+                "${onnxruntime_prebuilt_SOURCE_DIR}/lib/*.so*"
+                "${onnxruntime_prebuilt_SOURCE_DIR}/lib/*.dylib"
+                "${onnxruntime_prebuilt_SOURCE_DIR}/lib/*.dll")
+            if(_ort_runtime)
+                file(COPY ${_ort_runtime} DESTINATION "${CMAKE_BINARY_DIR}")
+            endif()
         endif()
-        target_include_directories(ragcpp PUBLIC ${ONNXRUNTIME_INCLUDE_DIR})
+        target_include_directories(ragcpp PUBLIC $<BUILD_INTERFACE:${ONNXRUNTIME_INCLUDE_DIR}>)
         target_link_libraries(ragcpp PUBLIC ${ONNXRUNTIME_LIB})
+        # rpath so the auto-downloaded .so is found next to the built binaries.
+        set_target_properties(ragcpp PROPERTIES
+            BUILD_RPATH "${CMAKE_BINARY_DIR}"
+            INSTALL_RPATH "$ORIGIN")
+        target_compile_definitions(ragcpp PUBLIC RAGCPP_WITH_ONNX)
     endif()
-    target_compile_definitions(ragcpp PUBLIC RAGCPP_WITH_ONNX)
 endif()
 
 if(RAGCPP_WITH_LLAMA)

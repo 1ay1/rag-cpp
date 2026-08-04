@@ -117,24 +117,33 @@ int main(int argc, char** argv) {
 
     // One corpus, reused across every ranking policy, so the only difference
     // between variants is the policy itself.
-    rag::index::Corpus corpus;
+    rag::index::CorpusConfig ccfg;
+    // --no-hnsw forces the exact brute-force dense scan (the SoA arena path)
+    // instead of building an ANN graph. On a few-thousand-doc BEIR set the
+    // graph build dominates wall time and brute force is both exact and fast,
+    // so this is the right default for a quality measurement.
+    if (std::atoi(opt(argc, argv, "--no-hnsw", "0").c_str()))
+        ccfg.hnsw_threshold = 100'000'000;
+    rag::index::Corpus corpus{ccfg};
 
     // Attach a real embedding model when one is given. This is the difference
     // between measuring BM25 and measuring the ENGINE: with no embedder the
     // hybrid stage has only one retriever to fuse.
     const std::string model = opt(argc, argv, "--model", "");
     const std::string tok   = opt(argc, argv, "--tokenizer", "");
+    const int max_toks = std::atoi(opt(argc, argv, "--max-tokens", "256").c_str());
     if (!model.empty()) {
         rag::dense::LocalEmbedderConfig ec;
         ec.model_path     = model;
         ec.tokenizer_path = tok;
-        ec.max_tokens     = 256;
+        ec.max_tokens     = max_toks > 0 ? static_cast<std::size_t>(max_toks) : 256;
         auto emb = rag::dense::OnnxEmbedder::load(ec);
         if (!emb) {
             std::printf("embedder error: %s\n", emb.error().message.c_str());
             return 1;
         }
-        std::printf("embedder: %s (dim %zu)\n", model.c_str(), emb->dimension());
+        std::printf("embedder: %s (dim %zu, max_tokens %d)\n", model.c_str(), emb->dimension(), max_toks);
+        std::fflush(stdout);
         corpus.set_embedder(rag::dense::AnyEmbedder{std::move(*emb)});
     } else if (std::size_t hd = std::strtoul(opt(argc, argv, "--hash-embed", "0").c_str(), nullptr, 10)) {
         // No model, but still exercise the HYBRID path: the deterministic hash
@@ -149,6 +158,7 @@ int main(int argc, char** argv) {
 
     auto doc_uri = index_dataset(*ds, corpus);
     std::printf("indexed %zu chunks\n\n", corpus.chunk_count());
+    std::fflush(stdout);
 
     // Optionally attach an in-process cross-encoder. Reranking is the accuracy
     // ceiling of the funnel: retrieval decides WHICH ~100 chunks are candidates,
