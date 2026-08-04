@@ -230,6 +230,32 @@ public:
     // standard_with exists.
     [[nodiscard]] static Pipeline context_with(HybridRetrieveConfig cfg, std::size_t max_gap = 1);
 
+    // OPT-IN: the "kitchen-sink" quality policy, composing the refinement stages
+    // added on top of standard():
+    //
+    //   retrieve(ADAPTIVE convex fusion) → filter → feature_rerank
+    //     → dedup (fold near-duplicate passages)
+    //     → autocut (trim the low-relevance tail at the score knee)
+    //     → top-k
+    //
+    // Rationale for the order: dedup runs AFTER the relevance rerank so it folds
+    // duplicates into the higher-ranked representative (same slot argument as
+    // MMR/stitch), and BEFORE autocut so the tail is measured on distinct
+    // passages. Autocut runs last before top-k so it cuts on the final order.
+    // Fusion uses the per-query ADAPTIVE alpha so the retriever that is more
+    // confident on each query carries more weight.
+    //
+    // Like quality()/context() this is NOT the default: dedup can shorten the
+    // result below k when a corpus is genuinely redundant, and autocut trades
+    // recall for precision — both are wins for grounded generation (an LLM
+    // context window) but changes in behaviour a caller should opt into.
+    // Attach a real cross-encoder via make_cached_rerank_stage() on top for the
+    // full SOTA funnel.
+    [[nodiscard]] static Pipeline best();
+
+    // best() with the retrieval stage configured.
+    [[nodiscard]] static Pipeline best_with(HybridRetrieveConfig cfg);
+
 private:
     std::vector<StagePtr> stages_;
 };

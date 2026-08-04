@@ -2,6 +2,7 @@
 
 #include "rag/pipeline/pipeline.hpp"
 #include "rag/rerank/mmr.hpp"
+#include "rag/rerank/refine.hpp"
 
 #include <algorithm>
 #include <thread>
@@ -319,6 +320,31 @@ Pipeline Pipeline::context_with(HybridRetrieveConfig cfg, std::size_t max_gap) {
      // that order, and BEFORE the top-k that would trim away the pool it
      // promotes distinct locations from. Same slot-ordering argument as MMR.
      .add(std::make_shared<ParentStitchStage>(max_gap))
+     .add(std::make_shared<TopKStage>());
+    return p;
+}
+
+Pipeline Pipeline::best() {
+    HybridRetrieveConfig cfg;
+    // Per-query adaptive alpha: weight the more confident retriever more on
+    // each query. The static prior (cfg.convex.alpha) is the fallback it
+    // regresses toward, so this never strays far on a normal query.
+    cfg.convex.adaptive = true;
+    return best_with(std::move(cfg));
+}
+
+Pipeline Pipeline::best_with(HybridRetrieveConfig cfg) {
+    Pipeline p;
+    p.add(std::make_shared<HybridRetrieveStage>(std::move(cfg)))
+     .add(std::make_shared<FilterStage>())
+     .add(std::make_shared<RerankStage>("feature_rerank", feature_rerank))
+     // Dedup AFTER rerank so it keeps the higher-ranked member of each
+     // near-duplicate cluster; BEFORE autocut/top-k so the survivors are
+     // distinct and the tail is measured on real content, not paraphrases.
+     .add(rerank::make_dedup_stage())
+     // Autocut trims the low-relevance tail at the score knee. Last refinement
+     // before top-k so it cuts on the final relevance order.
+     .add(rerank::make_autocut_stage())
      .add(std::make_shared<TopKStage>());
     return p;
 }

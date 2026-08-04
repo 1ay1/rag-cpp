@@ -134,7 +134,14 @@ public:
     Result<pipeline::Context> process(pipeline::Context ctx) const override {
         if (ctx.candidates.size() <= 1) return ctx;
         const std::size_t before = ctx.candidates.size();
-        ctx.candidates = autocut(ctx.candidates, cfg_);
+        // Never cut below what the caller actually asked for: autocut trims the
+        // low-relevance TAIL past k, it must not starve the requested result
+        // set. A noisy/weak retriever can otherwise produce a sharp early knee
+        // inside the top-k and collapse recall (seen on a weak-embedder hybrid
+        // run). Floor min_keep at ctx.k so the cut only ever removes surplus.
+        AutocutConfig cfg = cfg_;
+        cfg.min_keep = std::max(cfg.min_keep, ctx.k);
+        ctx.candidates = autocut(ctx.candidates, cfg);
         ctx.trace.push_back("autocut " + std::to_string(before) + " -> " +
                             std::to_string(ctx.candidates.size()));
         return ctx;

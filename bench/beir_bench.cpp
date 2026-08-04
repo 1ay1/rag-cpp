@@ -136,8 +136,15 @@ int main(int argc, char** argv) {
         }
         std::printf("embedder: %s (dim %zu)\n", model.c_str(), emb->dimension());
         corpus.set_embedder(rag::dense::AnyEmbedder{std::move(*emb)});
+    } else if (std::size_t hd = std::strtoul(opt(argc, argv, "--hash-embed", "0").c_str(), nullptr, 10)) {
+        // No model, but still exercise the HYBRID path: the deterministic hash
+        // embedder gives a genuine second retriever to fuse (a weak dense
+        // signal, but it makes fusion do real work and lets the fusion policies
+        // be A/B'd end-to-end without a network or a model file).
+        std::printf("embedder: hash (dim %zu — weak dense signal, exercises fusion)\n", hd);
+        corpus.set_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{hd}});
     } else {
-        std::printf("embedder: none (LEXICAL ONLY — pass --model for hybrid)\n");
+        std::printf("embedder: none (LEXICAL ONLY — pass --model or --hash-embed for hybrid)\n");
     }
 
     auto doc_uri = index_dataset(*ds, corpus);
@@ -195,6 +202,7 @@ int main(int argc, char** argv) {
     if (all || variant == "standard") pipeline_variant("standard", rag::pipeline::Pipeline::standard());
     if (all || variant == "quality")  pipeline_variant("quality",  rag::pipeline::Pipeline::quality());
     if (all || variant == "context")  pipeline_variant("context",  rag::pipeline::Pipeline::context());
+    if (all || variant == "best")     pipeline_variant("best",     rag::pipeline::Pipeline::best());
 
     // The rerank arm: same retrieval, then an in-process cross-encoder reorders
     // the top-N. This is where hybrid retrieval crosses into SOTA — if the
