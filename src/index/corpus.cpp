@@ -196,13 +196,16 @@ Result<std::vector<DocId>> Corpus::add_documents(std::vector<DocInput> docs) {
 
 void Corpus::ensure_linked() const {
     // Double-checked: the common case is a clean corpus, where this is a single
-    // relaxed read and no lock at all. Only the rare stale case pays for the
+    // acquire read and no lock at all. Only the rare stale case pays for the
     // mutex, and the re-check inside it stops two readers from both relinking.
-    if (!meta_stale_) return;
+    // Atomic acquire/release (not a plain bool): the unlocked fast-path read
+    // races with the locked clear below, and the acquire must also see the
+    // relink's writes — TSan flagged the plain-bool version.
+    if (!meta_stale_.load(std::memory_order_acquire)) return;
     std::lock_guard lk(lazy_mu_);
-    if (!meta_stale_) return;
+    if (!meta_stale_.load(std::memory_order_relaxed)) return;
     const_cast<Corpus*>(this)->relink_meta();
-    meta_stale_ = false;
+    meta_stale_.store(false, std::memory_order_release);
 }
 
 Result<void> Corpus::embed_pending() {

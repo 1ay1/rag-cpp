@@ -32,7 +32,7 @@ std::size_t Bm25Index::add(std::uint32_t id, std::string_view text) {
 
     doc_len_[id]   = static_cast<std::uint32_t>(terms.size());
     total_len_    += terms.size();
-    finalized_     = false;
+    finalized_.store(false, std::memory_order_release);
     return terms.size();
 }
 
@@ -104,7 +104,7 @@ void Bm25Index::finalize() {
         block_meta_.emplace(term, std::move(blocks));
     }
 
-    finalized_ = true;
+    finalized_.store(true, std::memory_order_release);
 }
 
 float Bm25Index::idf(std::size_t n_t) const {

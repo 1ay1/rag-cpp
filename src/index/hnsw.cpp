@@ -565,6 +565,10 @@ void HnswIndex::build_batch(std::size_t n,
     // portion of the graph is already visible, exactly as in serial insertion.
     std::vector<NodeLock> locks(total);
     std::mutex entry_mu;
+    // Expose the lock array to neighbours(): phase-2 searches read adjacency
+    // that phase-2 writers mutate, so readers must snapshot under the same
+    // per-node lock. Cleared before the (single-threaded) seal below.
+    build_locks_ = &locks;
 
     util::parallel_for(total - start, [&](std::size_t idx) {
         const std::uint32_t ordinal = static_cast<std::uint32_t>(start + idx);
@@ -599,6 +603,7 @@ void HnswIndex::build_batch(std::size_t n,
             if (level > max_layer_) { max_layer_ = level; entry_ = ordinal; }
         }
     });
+    build_locks_ = nullptr;   // locks dies with this scope
 
     // The graph is final: freeze the adjacency into CSR so every subsequent
     // query walks contiguous memory. Done once here rather than lazily on

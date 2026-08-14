@@ -319,6 +319,13 @@ private:
         void unlock() noexcept { flag.clear(std::memory_order_release); }
     };
 
+    // Non-null ONLY while build_batch's parallel phase 2 is running: points at
+    // that build's per-node lock array so concurrent readers (the phase-2
+    // searches) can snapshot adjacency under the same lock the writers hold.
+    // Set/cleared single-threaded at the phase boundaries; the parallel_for
+    // fork/join provides the happens-before for worker visibility.
+    mutable std::vector<NodeLock>* build_locks_ = nullptr;
+
     HnswConfig    cfg_{};
     std::size_t   dim_       = 0;
     int           max_layer_ = -1;
@@ -469,7 +476,14 @@ private:
 
     // Neighbours of `n` in layer `L`, or {} if it does not reach that layer.
     // Reads the sealed CSR when available and falls back to the mutable
-    // vector-of-vectors during a build.
+    // vector-of-vectors during a build. During a CONCURRENT build (phase 2 of
+    // build_batch), writers mutate lk[L] under the per-node spinlock — so the
+    // reader takes the same lock and copies the adjacency into per-thread
+    // scratch. The copy is ≤ 2M+1 ids (≤132 B at M=16) under a few-ns
+    // spinlock; the previous lock-free read was a real data race on the
+    // vector's size (ASan container-overflow at search_layer_into, the
+    // source of the flaky 20-min CI hangs on libstdc++). Steady-state search
+    // (sealed CSR, or unsealed with no build running) is untouched.
     [[nodiscard]] std::span<const std::uint32_t>
     neighbours(std::uint32_t n, std::size_t L) const noexcept {
         if (sealed_) {
@@ -480,6 +494,14 @@ private:
         }
         const auto& lk = nodes_[n].links;
         if (L >= lk.size()) return {};
+        if (auto* locks = build_locks_) {
+            thread_local std::vector<std::uint32_t> snap;
+            auto& gate = (*locks)[n];
+            gate.lock();
+            snap.assign(lk[L].begin(), lk[L].end());
+            gate.unlock();
+            return {snap.data(), snap.size()};
+        }
         return {lk[L].data(), lk[L].size()};
     }
 

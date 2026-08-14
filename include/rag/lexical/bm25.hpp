@@ -9,6 +9,7 @@
 // with idf(t) = ln(1 + (N - n_t + 0.5)/(n_t + 0.5))  (BM25+ smoothed idf,
 // always positive so common terms never contribute negatively).
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -38,6 +39,30 @@ public:
     explicit Bm25Index(Bm25Params p, text::TokenizeOptions topts = {})
         : params_(p), tok_(topts) {}
 
+    // The atomic `finalized_` deletes the defaulted moves; spell them out.
+    // Moves are single-threaded by contract (Corpus's own move ctor/assign),
+    // so a relaxed snapshot of the flag is sufficient.
+    Bm25Index(Bm25Index&& o) noexcept { *this = std::move(o); }
+    Bm25Index& operator=(Bm25Index&& o) noexcept {
+        if (this == &o) return *this;
+        params_     = o.params_;
+        tok_        = std::move(o.tok_);
+        postings_   = std::move(o.postings_);
+        doc_len_    = std::move(o.doc_len_);
+        dense_len_  = std::move(o.dense_len_);
+        max_doc_    = o.max_doc_;
+        pw_         = std::move(o.pw_);
+        pw_span_    = std::move(o.pw_span_);
+        block_meta_ = std::move(o.block_meta_);
+        total_len_  = o.total_len_;
+        avgdl_      = o.avgdl_;
+        finalized_.store(o.finalized_.load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
+        return *this;
+    }
+    Bm25Index(const Bm25Index&)            = delete;
+    Bm25Index& operator=(const Bm25Index&) = delete;
+
     // Add a document identified by ordinal `id` (must be unique, monotonically
     // assigned by the caller). Returns the number of indexed terms.
     std::size_t add(std::uint32_t id, std::string_view text);
@@ -48,8 +73,13 @@ public:
 
     // True once finalize() has run and no add() has invalidated it since.
     // Lets a caller (Corpus) skip the work when it is already up to date, and
-    // do it lazily on the read path when it is not.
-    [[nodiscard]] bool finalized() const noexcept { return finalized_; }
+    // do it lazily on the read path when it is not. Atomic acquire/release:
+    // Corpus's double-checked lazy-finalize reads this OUTSIDE lazy_mu_ while
+    // another reader's locked finalize() writes it — and the acquire must
+    // order the finalize's table writes before this reader uses them.
+    [[nodiscard]] bool finalized() const noexcept {
+        return finalized_.load(std::memory_order_acquire);
+    }
 
     // Top-k by BM25. Returns hits sorted by descending score.
     [[nodiscard]] std::vector<Hit> search(std::string_view query, std::size_t k) const;
@@ -157,7 +187,7 @@ private:
 
     double  total_len_ = 0.0;
     float   avgdl_     = 0.0f;
-    bool    finalized_ = false;
+    std::atomic<bool> finalized_{false};
 
     [[nodiscard]] float idf(std::size_t n_t) const;
 

@@ -466,7 +466,7 @@ private:
     // per document — quadratic ingest), we mark the pointers stale and repair
     // them lazily, before any accessor can hand one out. Mutable + const
     // ensure_linked() because this is memoization, not observable state.
-    mutable bool                      meta_stale_ = false;
+    mutable std::atomic<bool>         meta_stale_{false};
 
     // Monotonic count of structural mutations (add/upsert/remove/build). Every
     // snapshot records the epoch it was taken at, so save() can refuse to
