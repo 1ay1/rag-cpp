@@ -8,6 +8,7 @@
 #include "rag/dense/embedder.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstring>
 #include <string>
 
@@ -19,8 +20,10 @@
 #  endif
 #else
 #  include <arpa/inet.h>
+#  include <fcntl.h>
 #  include <netdb.h>
 #  include <netinet/in.h>
+#  include <poll.h>
 #  include <sys/socket.h>
 #  include <sys/time.h>
 #  include <unistd.h>
@@ -63,7 +66,9 @@ public:
             fd = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
             if (fd == kInvalid) continue;
             set_timeout(fd, req.timeout);
-            if (::connect(fd, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) break;
+            if (connect_with_timeout(fd, ai->ai_addr,
+                                     static_cast<int>(ai->ai_addrlen),
+                                     req.timeout)) break;
             close_sock(fd); fd = kInvalid;
         }
         ::freeaddrinfo(res);
@@ -82,12 +87,28 @@ public:
 
         if (!send_all(fd, r)) { close_sock(fd); return fail<HttpResponse>(Errc::transport_error, "send"); }
 
-        // Read full response.
+        // Read full response (server sends Connection: close, so EOF ends it).
         std::string raw;
         std::array<char, 8192> buf;
         while (true) {
             auto n = ::recv(fd, buf.data(), static_cast<int>(buf.size()), 0);
-            if (n <= 0) break;
+            if (n == 0) break;                 // clean EOF: response complete
+            if (n < 0) {
+                // A read timeout (SO_RCVTIMEO) or reset arrived mid-body. If we
+                // have a complete header+body already the parser will validate
+                // it; otherwise surface a transport error rather than silently
+                // returning a truncated response that parses as "success".
+#if defined(_WIN32)
+                int e = WSAGetLastError();
+                bool timed_out = (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK);
+#else
+                bool timed_out = (errno == EAGAIN || errno == EWOULDBLOCK);
+#endif
+                if (raw.empty())
+                    return fail<HttpResponse>(Errc::transport_error,
+                        timed_out ? "recv timeout" : "recv error");
+                break;
+            }
             raw.append(buf.data(), static_cast<std::size_t>(n));
         }
         close_sock(fd);
@@ -106,6 +127,51 @@ private:
         tv.tv_usec = static_cast<long>((t.count() % 1000) * 1000);
         ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+    }
+
+    // Connect with a bounded wait. SO_RCVTIMEO/SO_SNDTIMEO do NOT bound
+    // connect(2) — a routable-but-silent host (dropped SYN, firewall) would
+    // otherwise block on the OS default TCP handshake timeout (~2 minutes),
+    // hanging every embed call and even agentty's startup availability probe.
+    // Do a non-blocking connect, poll for writability up to `t`, then restore
+    // blocking mode so the existing send/recv timeouts apply as before.
+    static bool connect_with_timeout(socket_t fd, const sockaddr* addr,
+                                     int addrlen, std::chrono::milliseconds t) {
+        int timeout_ms = t.count() > 0 ? static_cast<int>(t.count()) : 2000;
+#if defined(_WIN32)
+        u_long nb = 1;
+        ::ioctlsocket(fd, FIONBIO, &nb);
+        int rc = ::connect(fd, addr, addrlen);
+        bool in_progress = (rc != 0) && (WSAGetLastError() == WSAEWOULDBLOCK);
+        bool ok = (rc == 0);
+        if (in_progress) {
+            WSAPOLLFD pfd{}; pfd.fd = fd; pfd.events = POLLWRNORM;
+            if (::WSAPoll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLWRNORM)) {
+                int err = 0; int len = sizeof(err);
+                ok = (::getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                                   reinterpret_cast<char*>(&err), &len) == 0) && err == 0;
+            }
+        }
+        nb = 0; ::ioctlsocket(fd, FIONBIO, &nb);
+        return ok;
+#else
+        int flags = ::fcntl(fd, F_GETFL, 0);
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int rc = ::connect(fd, addr, addrlen);
+        bool ok = (rc == 0);
+        if (rc != 0 && errno == EINPROGRESS) {
+            pollfd pfd{}; pfd.fd = fd; pfd.events = POLLOUT;
+            int pr;
+            do { pr = ::poll(&pfd, 1, timeout_ms); }
+            while (pr < 0 && errno == EINTR);
+            if (pr > 0 && (pfd.revents & POLLOUT)) {
+                int err = 0; socklen_t len = sizeof(err);
+                ok = (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0) && err == 0;
+            }
+        }
+        ::fcntl(fd, F_SETFL, flags);   // restore blocking mode
+        return ok;
 #endif
     }
 
