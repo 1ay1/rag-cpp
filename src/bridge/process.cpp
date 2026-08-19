@@ -284,9 +284,26 @@ Result<std::shared_ptr<ProcessChannel>> ProcessChannel::spawn(ProcessConfig cfg)
 
     int in_pipe[2];   // host writes -> child stdin
     int out_pipe[2];  // child stdout -> host reads
-    if (::pipe(in_pipe) != 0)
+    // CLOEXEC from birth: rag bridge children can be spawned concurrently
+    // with other subprocess machinery in the host (MCP servers, tool runs).
+    // A sibling fork() between a bare pipe() and our exec inherits these
+    // ends; a long-lived sibling child then pins our child's stdout write
+    // end open, so the host never sees EOF after the child dies and any
+    // teardown join wedges (same field bug class as mcp-cpp's ChildProcess).
+    // dup2() onto 0/1 in our own child clears the flag on the duplicate.
+    auto mk_pipe = [](int fds[2]) -> bool {
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        return ::pipe2(fds, O_CLOEXEC) == 0;
+#else
+        if (::pipe(fds) != 0) return false;
+        (void)::fcntl(fds[0], F_SETFD, ::fcntl(fds[0], F_GETFD) | FD_CLOEXEC);
+        (void)::fcntl(fds[1], F_SETFD, ::fcntl(fds[1], F_GETFD) | FD_CLOEXEC);
+        return true;
+#endif
+    };
+    if (!mk_pipe(in_pipe))
         return fail<std::shared_ptr<ProcessChannel>>(Errc::transport_error, "pipe() failed");
-    if (::pipe(out_pipe) != 0) {
+    if (!mk_pipe(out_pipe)) {
         ::close(in_pipe[0]); ::close(in_pipe[1]);
         return fail<std::shared_ptr<ProcessChannel>>(Errc::transport_error, "pipe() failed");
     }
