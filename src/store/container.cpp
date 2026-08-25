@@ -102,14 +102,30 @@ Result<Container> Container::parse(std::string_view blob) {
     if (!r.u(c.flags_) || !r.u(nsections) || !r.u(reserved))
         return fail<Container>(Errc::corrupt_index, "header");
 
+    // A corrupt/hostile index can declare a section count that has no
+    // relationship to the file it came in. Each entry occupies entry_size
+    // bytes in the table, so the blob physically cannot hold more than
+    // (blob.size() / entry_size) entries — reject anything larger BEFORE
+    // allocating, or a 4-byte field could request a ~100 GB vector and
+    // OOM-kill the process.
+    constexpr std::uint64_t entry_size = 4 + 8 + 8;  // tag + off + len
+    if (static_cast<std::uint64_t>(nsections) > blob.size() / entry_size)
+        return fail<Container>(Errc::corrupt_index, "section count too large");
+
     struct Entry { std::uint32_t tag; std::uint64_t off, len; };
     std::vector<Entry> entries(nsections);
     for (auto& e : entries)
         if (!r.u(e.tag) || !r.u(e.off) || !r.u(e.len))
             return fail<Container>(Errc::corrupt_index, "section table");
 
+    // The CRC-32 trailer occupies the last 4 bytes; sections live before it.
+    const std::uint64_t limit = blob.size() - 4;
     for (const auto& e : entries) {
-        if (e.off + e.len > blob.size() - 4)
+        // Overflow-safe bounds check: `e.off + e.len` on two uint64s read
+        // straight from disk can wrap (e.g. off=~0ULL) and slip past a
+        // naive `off + len > limit` test, after which substr(off, len)
+        // with off > size() throws. Compare with subtraction instead.
+        if (e.off > limit || e.len > limit - e.off)
             return fail<Container>(Errc::corrupt_index, "section out of bounds");
         c.sections_[e.tag] = std::string(blob.substr(e.off, e.len));
     }
