@@ -1,30 +1,24 @@
 #pragma once
-// rag/util/parallel.hpp — a minimal, dependency-free work-stealing-free thread
-// pool plus the two parallel primitives the engine actually needs.
+// rag/util/parallel.hpp — the parallel primitives the engine needs, run on an
+// Executor the host installs. rag-cpp owns no threads.
 //
 // Design notes:
-//   • One global pool, lazily constructed, sized to hardware_concurrency. The
-//     engine is a library: we must not spawn a pool per index build, and we
-//     must not fight the host application for cores on every call.
-//   • `parallel_for` splits [0,n) into contiguous blocks — one per worker —
+//   • One process executor, installed by the host (set_executor). The engine
+//     is a library: the program decides what threads run its work.
+//   • `parallel_for` splits [0,n) into contiguous blocks — one per share —
 //     rather than per-item tasks. Retrieval workloads are uniform-cost, so
 //     static blocking beats a task queue and costs no atomics in the hot loop.
-//   • The calling thread participates. With a pool of P threads we run P+1
-//     workers and never idle the caller.
-//   • Exceptions are not used for control flow anywhere in rag-cpp; a worker
-//     that throws would terminate, so worker bodies must be noexcept in spirit
-//     (all engine bodies return Result and never throw).
+//   • Exceptions are not used for control flow anywhere in rag-cpp; worker
+//     bodies must be noexcept in spirit (all engine bodies return Result).
 //
 // Threading is OFF by default for tiny inputs: below `kParallelMin` items the
 // primitives run inline, so small corpora pay zero synchronization cost.
 
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <functional>
-#include <mutex>
-#include <queue>
-#include <thread>
+#include <memory>
+#include <thread>   // the fallback executor only
 #include <vector>
 
 namespace rag::util {
@@ -33,72 +27,65 @@ namespace rag::util {
 // overhead dominates and the cache stays warm on one core.
 inline constexpr std::size_t kParallelMin = 512;
 
-class ThreadPool {
+// ── The host's executor ─────────────────────────────────────────────────
+// rag-cpp owns no threads. Every parallel region below hands its blocks to
+// an Executor the HOST installs (rag::util::set_executor), so the program
+// decides what runs where — agentty runs them on its own runtime. A host that
+// installs nothing gets the fallback: one std::jthread per extra block,
+// joined before the region returns. It is the only place rag-cpp names a
+// thread.
+class Executor {
 public:
-    explicit ThreadPool(unsigned n) {
-        workers_.reserve(n);
-        for (unsigned i = 0; i < n; ++i)
-            workers_.emplace_back([this] { run(); });
-    }
-
-    ~ThreadPool() {
-        {
-            std::lock_guard lk(mu_);
-            stop_ = true;
-        }
-        cv_.notify_all();
-        for (auto& t : workers_) if (t.joinable()) t.join();
-    }
-
-    ThreadPool(const ThreadPool&)            = delete;
-    ThreadPool& operator=(const ThreadPool&) = delete;
-
-    [[nodiscard]] std::size_t size() const noexcept { return workers_.size(); }
-
-    // Enqueue a job. Fire-and-forget; completion is tracked by the caller's
-    // own latch (see parallel_for), which keeps the pool free of futures.
-    void submit(std::function<void()> job) {
-        {
-            std::lock_guard lk(mu_);
-            jobs_.push(std::move(job));
-        }
-        cv_.notify_one();
-    }
-
-private:
-    void run() {
-        for (;;) {
-            std::function<void()> job;
-            {
-                std::unique_lock lk(mu_);
-                cv_.wait(lk, [this] { return stop_ || !jobs_.empty(); });
-                if (stop_ && jobs_.empty()) return;
-                job = std::move(jobs_.front());
-                jobs_.pop();
-            }
-            job();
-        }
-    }
-
-    std::vector<std::thread>          workers_;
-    std::queue<std::function<void()>> jobs_;
-    std::mutex                        mu_;
-    std::condition_variable           cv_;
-    bool                              stop_ = false;
+    virtual ~Executor() = default;
+    // Run fn(i) for every i in [0, n); return when all have finished. Calls
+    // may run concurrently. Must not deadlock when called from inside one of
+    // its own fn(i) (rag regions nest: a query inside a server worker).
+    virtual void parallel_for(std::size_t n,
+                              const std::function<void(std::size_t)>& fn) = 0;
+    // How many concurrent shares a region should be split into.
+    [[nodiscard]] virtual std::size_t width() const noexcept = 0;
 };
 
-// The process-wide pool. Sized to hardware_concurrency-1 because the calling
-// thread participates in every parallel_for.
-inline ThreadPool& pool() {
-    static ThreadPool p{[] {
-        unsigned hc = std::thread::hardware_concurrency();
-        return hc > 1 ? hc - 1 : 0u;
-    }()};
-    return p;
+class ThreadExecutor final : public Executor {
+public:
+    void parallel_for(std::size_t n,
+                      const std::function<void(std::size_t)>& fn) override {
+        if (n <= 1) { if (n) fn(0); return; }
+        std::vector<std::jthread> ts;
+        ts.reserve(n - 1);
+        for (std::size_t i = 1; i < n; ++i) ts.emplace_back([&fn, i] { fn(i); });
+        fn(0);
+    }   // joined here
+    [[nodiscard]] std::size_t width() const noexcept override {
+        const unsigned hc = std::thread::hardware_concurrency();
+        return hc ? hc : 1;
+    }
+};
+
+namespace detail {
+inline std::shared_ptr<Executor>& installed_executor() {
+    static std::shared_ptr<Executor> e;
+    return e;
+}
+} // namespace detail
+
+// Install the process executor, once, at startup. nullptr restores the
+// fallback. Not for swapping while a region runs.
+inline void set_executor(std::shared_ptr<Executor> e) {
+    detail::installed_executor() = std::move(e);
+}
+
+inline Executor& executor() {
+    static ThreadExecutor fallback;
+    auto& e = detail::installed_executor();
+    return e ? *e : fallback;
 }
 
 // How many workers a parallel region will use (including the caller).
-[[nodiscard]] inline std::size_t max_workers() noexcept { return pool().size() + 1; }
+[[nodiscard]] inline std::size_t max_workers() noexcept {
+    const std::size_t w = executor().width();
+    return w ? w : 1;
+}
 
 // How many contiguous blocks parallel_blocks(n) will produce. Callers that
 // need one private accumulator per block can size their vector up front.
@@ -122,29 +109,11 @@ void parallel_for(std::size_t n, F&& body) {
 
     const std::size_t blocks = workers < n ? workers : n;
     const std::size_t chunk  = (n + blocks - 1) / blocks;
-
-    std::atomic<std::size_t> remaining{blocks - 1};
-    std::mutex              done_mu;
-    std::condition_variable done_cv;
-
-    // Dispatch all but the final block to the pool.
-    for (std::size_t b = 0; b + 1 < blocks; ++b) {
+    executor().parallel_for(blocks, [&](std::size_t b) {
         const std::size_t lo = b * chunk;
         const std::size_t hi = lo + chunk < n ? lo + chunk : n;
-        pool().submit([lo, hi, &body, &remaining, &done_mu, &done_cv] {
-            for (std::size_t i = lo; i < hi; ++i) body(i);
-            if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                std::lock_guard lk(done_mu);
-                done_cv.notify_one();
-            }
-        });
-    }
-
-    // The caller runs the tail block itself.
-    for (std::size_t i = (blocks - 1) * chunk; i < n; ++i) body(i);
-
-    std::unique_lock lk(done_mu);
-    done_cv.wait(lk, [&] { return remaining.load(std::memory_order_acquire) == 0; });
+        for (std::size_t i = lo; i < hi; ++i) body(i);
+    });
 }
 
 // Run `body(lo, hi, block_index)` once per contiguous block. Use when a worker
@@ -159,26 +128,11 @@ void parallel_blocks(std::size_t n, F&& body) {
 
     const std::size_t blocks = workers < n ? workers : n;
     const std::size_t chunk  = (n + blocks - 1) / blocks;
-
-    std::atomic<std::size_t> remaining{blocks - 1};
-    std::mutex              done_mu;
-    std::condition_variable done_cv;
-
-    for (std::size_t b = 0; b + 1 < blocks; ++b) {
+    executor().parallel_for(blocks, [&](std::size_t b) {
         const std::size_t lo = b * chunk;
         const std::size_t hi = lo + chunk < n ? lo + chunk : n;
-        pool().submit([lo, hi, b, &body, &remaining, &done_mu, &done_cv] {
-            body(lo, hi, b);
-            if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                std::lock_guard lk(done_mu);
-                done_cv.notify_one();
-            }
-        });
-    }
-    body((blocks - 1) * chunk, n, blocks - 1);
-
-    std::unique_lock lk(done_mu);
-    done_cv.wait(lk, [&] { return remaining.load(std::memory_order_acquire) == 0; });
+        body(lo, hi, b);
+    });
 }
 
 // Run `body(i)` for i in [0,n) with an EXPLICIT worker count and DYNAMIC
@@ -193,12 +147,8 @@ void parallel_blocks(std::size_t n, F&& body) {
 //     is NOT clamped to the core count. These items are typically IO-bound —
 //     eight in-flight HTTP requests are useful on a two-core box, where a
 //     core-clamped pool would leave 6/8 of the throughput on the table;
-//   • helpers are transient std::threads rather than the shared pool. At this
-//     granularity thread creation (~20µs) rounds to zero against a batch that
-//     costs milliseconds, and staying off the pool means this primitive can be
-//     called from inside a pool worker without the classic nested-parallelism
-//     deadlock (queued tasks that can never be dequeued because every pool
-//     thread is blocked waiting for them);
+//   • it runs on the same Executor; the Executor contract (no deadlock when
+//     nested) is what makes calling it from inside another region safe;
 //   • work is claimed one index at a time, so uneven items self-balance.
 template <class F>
 void parallel_for_dynamic(std::size_t n, std::size_t workers, F&& body) {
@@ -219,14 +169,8 @@ void parallel_for_dynamic(std::size_t n, std::size_t workers, F&& body) {
         }
     };
 
-    // The calling thread is worker 0 and joins the rest — join() is the only
-    // synchronization needed, so there is no condition-variable protocol to
-    // get wrong and no way to leak a running worker past this call.
-    std::vector<std::thread> helpers;
-    helpers.reserve(w - 1);
-    for (std::size_t t = 0; t + 1 < w; ++t) helpers.emplace_back(drain);
-    drain();
-    for (auto& th : helpers) th.join();
+    // w drainers on the executor, all finished before this returns.
+    executor().parallel_for(w, [&](std::size_t) { drain(); });
 }
 
 } // namespace rag::util

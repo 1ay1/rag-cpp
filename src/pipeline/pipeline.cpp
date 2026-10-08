@@ -1,11 +1,11 @@
 // rag/pipeline/pipeline.cpp — stage implementations + the standard pipeline.
 
+#include "rag/util/parallel.hpp"
 #include "rag/pipeline/pipeline.hpp"
 #include "rag/rerank/mmr.hpp"
 #include "rag/rerank/refine.hpp"
 
 #include <algorithm>
-#include <thread>
 #include <array>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,13 +51,12 @@ Result<Context> HybridRetrieveStage::process(Context ctx) const {
     };
 
     if (run_dense) {
-        // Dense on a helper, lexical on this thread. A plain std::thread rather
-        // than the shared pool: this may itself be running on a pool worker
-        // (a server handling queries in parallel), and blocking a pool thread
-        // on work queued to that same pool is the classic way to deadlock.
-        std::thread helper(do_dense);
-        do_lexical();
-        helper.join();
+        // Dense and lexical side by side on the host's executor (it must not
+        // deadlock when nested, which is what makes this safe inside a
+        // server handling queries in parallel).
+        util::executor().parallel_for(2, [&](std::size_t i) {
+            if (i == 0) do_lexical(); else do_dense();
+        });
     } else {
         do_lexical();
     }
