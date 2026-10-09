@@ -57,7 +57,7 @@ engine.with_embedder_spec({{"type", "hash"},   {"dim", 256}});
 Two decorators wrap **any** `AnyEmbedder` (they model `Embedder` themselves, so
 they compose):
 
-- **`RetryingEmbedder`** — bounded exponential backoff on transient failures.
+- **`RetryingEmbedder`** — retries transient failures a bounded number of times (no waiting; backoff is up to the host).
 
   ```cpp
   auto robust = rag::dense::AnyEmbedder{

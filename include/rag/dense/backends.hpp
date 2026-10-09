@@ -10,8 +10,8 @@
 //
 // Every network backend takes an injected HttpTransport and degrades to
 // Errc::unavailable on failure so callers can fall back to lexical-only search.
-// The `RetryingEmbedder` decorator wraps any Embedder with bounded exponential
-// backoff, and `FallbackEmbedder` chains a primary → secondary (e.g. hosted →
+// The `RetryingEmbedder` decorator retries transient failures a bounded number
+// of times (no waiting: backoff is the host's call), and `FallbackEmbedder` chains a primary → secondary (e.g. hosted →
 // local hash) so retrieval never hard-fails.
 
 #include "rag/util/parallel.hpp"
@@ -142,40 +142,30 @@ private:
 };
 
 // ─── Decorators ───────────────────────────────────────────────────────────────
-// Retry any embedder with bounded exponential backoff on transient failures.
-// The library keeps no clock: `wait` is the host's (sleep, or a cancellable
-// delay); without one the retries go back to back.
+// Retry any embedder up to max_attempts times on transient failures, back to
+// back. The library never waits; a host that wants backoff retries itself.
 class RetryingEmbedder {
 public:
-    using Wait = std::function<void(std::chrono::milliseconds)>;
-    RetryingEmbedder(AnyEmbedder inner, int max_attempts = 3,
-                     std::chrono::milliseconds base_delay = std::chrono::milliseconds(200),
-                     Wait wait = {})
-        : inner_(std::move(inner)), attempts_(max_attempts), delay_(base_delay), wait_(std::move(wait)) {}
+    RetryingEmbedder(AnyEmbedder inner, int max_attempts = 3)
+        : inner_(std::move(inner)), attempts_(max_attempts) {}
     [[nodiscard]] std::size_t dimension() const { return inner_.dimension(); }
     [[nodiscard]] std::string_view identity() const { return inner_.identity(); }
     [[nodiscard]] std::size_t max_concurrency() const { return inner_.max_concurrency(); }
     [[nodiscard]] Result<std::vector<Vector>> embed(std::span<const std::string> texts) const {
         Result<std::vector<Vector>> last = fail<std::vector<Vector>>(Errc::unavailable);
-        auto d = delay_;
         for (int i = 0; i < attempts_; ++i) {
             last = inner_.embed(texts);
             if (last) return last;
             if (last.error().code != Errc::transport_error &&
                 last.error().code != Errc::unavailable) return last; // non-transient
-            if (i + 1 < attempts_) { if (wait_) wait_(d); d *= 2; }
         }
         return last;
     }
 private:
     AnyEmbedder inner_;
     int attempts_;
-    std::chrono::milliseconds delay_;
-    Wait wait_;
 };
 
-// Try primary; on unavailable/transport error, fall through to secondary.
-// Dimension follows the primary (so both should agree, or the corpus keys on it).
 class FallbackEmbedder {
 public:
     FallbackEmbedder(AnyEmbedder primary, AnyEmbedder secondary)

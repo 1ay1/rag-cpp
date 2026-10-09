@@ -135,13 +135,12 @@ AnyX wrap_any(Concrete&& c) {
 
 // What the network and subprocess backends need from the host. rag-cpp
 // opens no socket and starts no process itself: an HTTP backend posts through
-// `http`, a {"transport":"process"} bridge talks to the channel `spawn` opens,
-// and a retry waits with `wait`. Leave one empty and the backends that need
-// it report Errc::unavailable when built.
+// `http`, and a {"transport":"process"} bridge talks to the channel `spawn`
+// opens. Leave one empty and the backends that need it report
+// Errc::unavailable when built.
 struct HostIo {
     std::shared_ptr<dense::HttpTransport> http;
     std::function<Result<std::shared_ptr<bridge::Channel>>(const bridge::ProcessSpec&)> spawn;
-    std::function<void(std::chrono::milliseconds)> wait;
 };
 
 // Every component registry, as one value. builtin() is the set this library

@@ -154,8 +154,8 @@ code:
                  "inner": { "type": "ollama", "model": "nomic-embed-text" } } }
 ```
 
-- **`retry`** — wraps `inner` with bounded exponential backoff on transient
-  failures (`max_attempts`, `base_delay_ms`).
+- **`retry`** — retries `inner` on transient failures, back to back
+  (`max_attempts`).
 - **`fallback`** — tries `primary`, then `secondary`. If the primary cannot even
   be *constructed* (missing feature flag, missing key), it degrades to the
   secondary at construction time — so a config naming a local model this build

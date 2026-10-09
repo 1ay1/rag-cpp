@@ -105,7 +105,7 @@ your seam):
 ### Embedders (pluggable)
 `Ollama` · `OpenAI`-compatible (+ **Together**, **TEI** presets) · `llama.cpp`
 server · deterministic local `Hash` (no network). Decorators: `RetryingEmbedder`
-(exponential backoff), `FallbackEmbedder` (primary → secondary). All behind an
+(bounded retries), `FallbackEmbedder` (primary → secondary). All behind an
 injectable **`HttpTransport`** seam — bring your own TLS/gRPC/mock.
 
 **In-process** (no server): **ONNX Runtime** (`OnnxEmbedder`, with WordPiece

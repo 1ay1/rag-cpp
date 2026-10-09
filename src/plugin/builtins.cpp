@@ -154,15 +154,13 @@ void register_embedders(Registries& r) {
     // Take NESTED embedder specs and resolve them through the same registry, so
     // config expresses resilience declaratively. Nesting is unbounded because
     // Registry invokes factories unlocked (see registry.hpp).
-    r.embedder("retry", "retry an inner embedder with backoff (keys: inner, max_attempts, base_delay_ms)",
+    r.embedder("retry", "retry an inner embedder on transient failure (keys: inner, max_attempts)",
         [](Config c) -> Result<AnyEmbedder> {
             auto spec = c.sub("inner");
             if (!spec) return std::unexpected(spec.error());
             auto inner = c.resolve<AnyEmbedder>(*spec);
             if (!inner) return std::unexpected(inner.error());
-            auto delay = std::chrono::milliseconds(c.get<long>("base_delay_ms", 200));
-            dense::RetryingEmbedder wrapped(std::move(*inner), c.get<int>("max_attempts", 3), delay,
-                                            c.io().wait);
+            dense::RetryingEmbedder wrapped(std::move(*inner), c.get<int>("max_attempts", 3));
             return AnyEmbedder{std::move(wrapped)};
         });
 

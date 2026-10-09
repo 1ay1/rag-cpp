@@ -46,7 +46,7 @@ blob. Always available (no dependencies), so retrieval never hard-fails.
 The `Embedder` concept + the injectable `HttpTransport` seam (the library's only
 outbound I/O). Backends: Ollama, OpenAI-compatible (+ Together/TEI presets),
 llama.cpp, and a deterministic local Hash embedder. Decorators `RetryingEmbedder`
-(exponential backoff) and `FallbackEmbedder` (primary → secondary) compose over
+(bounded retries) and `FallbackEmbedder` (primary → secondary) compose over
 any embedder. SIMD kernels (AVX2 / NEON / scalar) for dot, cosine, sign-packing,
 Hamming.
 
