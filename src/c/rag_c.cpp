@@ -2,6 +2,8 @@
 
 #include "rag/c/rag.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <optional>
@@ -15,8 +17,13 @@
 
 namespace {
 
-// Per-thread last-error message.
-thread_local std::string g_last_error;
+
+// An owned C copy, for rag_string_free().
+char* dup_string(const std::string& s) {
+    auto* out = static_cast<char*>(std::malloc(s.size() + 1));
+    if (out) std::memcpy(out, s.c_str(), s.size() + 1);
+    return out;
+}
 
 rag_status map_errc(rag::Errc e) {
     using E = rag::Errc;
@@ -37,14 +44,14 @@ rag_status map_errc(rag::Errc e) {
 }
 
 template <class T>
-rag_status set_err(const rag::Result<T>& r) {
-    if (r) { g_last_error.clear(); return RAG_OK; }
-    g_last_error = r.error().message;
+rag_status set_err(std::string& last, const rag::Result<T>& r) {
+    if (r) { last.clear(); return RAG_OK; }
+    last = r.error().message;
     return map_errc(r.error().code);
 }
-rag_status set_err_void(const rag::Result<void>& r) {
-    if (r) { g_last_error.clear(); return RAG_OK; }
-    g_last_error = r.error().message;
+rag_status set_err_void(std::string& last, const rag::Result<void>& r) {
+    if (r) { last.clear(); return RAG_OK; }
+    last = r.error().message;
     return map_errc(r.error().code);
 }
 
@@ -58,7 +65,7 @@ rag::Metadata make_meta(const char** keys, const char** vals, size_t n) {
 } // namespace
 
 // Opaque wrappers.
-struct rag_engine   { rag::Engine eng; };
+struct rag_engine   { rag::Engine eng; std::string last_error; };
 struct rag_embedder { std::optional<rag::dense::AnyEmbedder> e; };
 struct rag_reranker { std::optional<rag::rerank::AnyReranker> r; };
 struct rag_results  { std::vector<rag::SearchResult> items; };
@@ -66,7 +73,7 @@ struct rag_results  { std::vector<rag::SearchResult> items; };
 extern "C" {
 
 const char* rag_version(void) { return "0.1.0"; }
-const char* rag_last_error(void) { return g_last_error.c_str(); }
+const char* rag_engine_last_error(const rag_engine* h) { return h ? h->last_error.c_str() : ""; }
 
 // ── Embedders ────────────────────────────────────────────────────────────────
 rag_embedder* rag_embedder_hash(size_t dim) {
@@ -74,68 +81,9 @@ rag_embedder* rag_embedder_hash(size_t dim) {
     if (h) h->e.emplace(rag::dense::HashEmbedder{dim ? dim : 256});
     return h;
 }
-rag_embedder* rag_embedder_ollama(const char* host, uint16_t port, const char* model, size_t dim) {
-    auto* h = new (std::nothrow) rag_embedder;
-    if (!h) return nullptr;
-    rag::dense::OllamaConfig c;
-    if (host) c.host = host;
-    if (port) c.port = port;
-    if (model) c.model = model;
-    if (dim) c.dim = dim;
-    h->e.emplace(rag::dense::OllamaEmbedder{std::move(c)});
-    return h;
-}
-rag_embedder* rag_embedder_openai(const char* host, uint16_t port, int tls,
-                                  const char* path, const char* model,
-                                  const char* api_key, size_t dim) {
-    auto* h = new (std::nothrow) rag_embedder;
-    if (!h) return nullptr;
-    rag::dense::OpenAIConfig c;
-    if (host) c.host = host;
-    if (port) c.port = port;
-    c.tls = tls != 0;
-    if (path) c.path = path;
-    if (model) c.model = model;
-    if (api_key) c.api_key = api_key;
-    if (dim) c.dim = dim;
-    h->e.emplace(rag::dense::OpenAIEmbedder{std::move(c)});
-    return h;
-}
-rag_embedder* rag_embedder_llamacpp(const char* host, uint16_t port, size_t dim) {
-    auto* h = new (std::nothrow) rag_embedder;
-    if (!h) return nullptr;
-    rag::dense::LlamaCppConfig c;
-    if (host) c.host = host;
-    if (port) c.port = port;
-    if (dim) c.dim = dim;
-    h->e.emplace(rag::dense::LlamaCppEmbedder{std::move(c)});
-    return h;
-}
 void rag_embedder_free(rag_embedder* h) { delete h; }
 
 // ── Rerankers ────────────────────────────────────────────────────────────────
-rag_reranker* rag_reranker_tei(const char* host, uint16_t port) {
-    auto* h = new (std::nothrow) rag_reranker;
-    if (!h) return nullptr;
-    h->r.emplace(rag::rerank::CrossEncoderReranker{
-        rag::rerank::CrossEncoderConfig::tei(host ? host : "127.0.0.1", port ? port : 8080)});
-    return h;
-}
-rag_reranker* rag_reranker_cohere(const char* host, uint16_t port, int tls,
-                                  const char* model, const char* api_key) {
-    auto* h = new (std::nothrow) rag_reranker;
-    if (!h) return nullptr;
-    rag::rerank::CrossEncoderConfig c;
-    if (host) c.host = host;
-    if (port) c.port = port;
-    c.tls = tls != 0;
-    c.path = "/v1/rerank";
-    c.wire = rag::rerank::CrossEncoderConfig::Wire::cohere;
-    if (model) c.model = model;
-    if (api_key) c.api_key = api_key;
-    h->r.emplace(rag::rerank::CrossEncoderReranker{std::move(c)});
-    return h;
-}
 void rag_reranker_free(rag_reranker* h) { delete h; }
 
 // ── Engine ───────────────────────────────────────────────────────────────────
@@ -166,7 +114,7 @@ rag_status rag_engine_add(rag_engine* h, const char* uri, const char* text, cons
                           const char** mk, const char** mv, size_t mn, uint32_t* out_id) {
     if (!h || !uri || !text) return RAG_ERR_INVALID_ARGUMENT;
     auto r = h->eng.add(uri, text, make_meta(mk, mv, mn), title ? title : "");
-    if (!r) return set_err(r);
+    if (!r) return set_err(h->last_error, r);
     if (out_id) *out_id = r->get();
     return RAG_OK;
 }
@@ -174,7 +122,7 @@ rag_status rag_engine_add(rag_engine* h, const char* uri, const char* text, cons
 rag_status rag_engine_add_directory(rag_engine* h, const char* root, size_t* out_count) {
     if (!h || !root) return RAG_ERR_INVALID_ARGUMENT;
     auto docs = rag::loaders::load_directory(root);
-    if (!docs) return set_err(docs);
+    if (!docs) return set_err(h->last_error, docs);
     size_t n = 0;
     for (auto& d : *docs) {
         auto r = h->eng.add(d.uri, d.text, d.meta, d.title);
@@ -186,7 +134,7 @@ rag_status rag_engine_add_directory(rag_engine* h, const char* root, size_t* out
 
 rag_status rag_engine_build(rag_engine* h) {
     if (!h) return RAG_ERR_INVALID_ARGUMENT;
-    return set_err_void(h->eng.build());
+    return set_err_void(h->last_error, h->eng.build());
 }
 
 rag_status rag_engine_search(rag_engine* h, const char* query, size_t k,
@@ -204,7 +152,7 @@ rag_status rag_engine_search(rag_engine* h, const char* query, size_t k,
         };
     }
     auto res = h->eng.search(query, k ? k : 10, std::move(filter));
-    if (!res) return set_err(res);
+    if (!res) return set_err(h->last_error, res);
     auto* r = new (std::nothrow) rag_results;
     if (!r) return RAG_ERR_UNKNOWN;
     r->items = std::move(*res);
@@ -225,14 +173,15 @@ void rag_results_free(rag_results* r) { delete r; }
 
 rag_status rag_engine_save(rag_engine* h, const char* path) {
     if (!h || !path) return RAG_ERR_INVALID_ARGUMENT;
-    return set_err_void(h->eng.save(path));
+    return set_err_void(h->last_error, h->eng.save(path));
 }
 
-rag_engine* rag_engine_load(const char* path, rag_status* out_status) {
+rag_engine* rag_engine_load(const char* path, rag_status* out_status, char** out_message) {
+    if (out_message) *out_message = nullptr;
     if (!path) { if (out_status) *out_status = RAG_ERR_INVALID_ARGUMENT; return nullptr; }
     auto corpus = rag::index::Corpus::load(path);
     if (!corpus) {
-        g_last_error = corpus.error().message;
+        if (out_message) *out_message = dup_string(corpus.error().message);
         if (out_status) *out_status = map_errc(corpus.error().code);
         return nullptr;
     }

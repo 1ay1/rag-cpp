@@ -14,12 +14,13 @@
 // backoff, and `FallbackEmbedder` chains a primary → secondary (e.g. hosted →
 // local hash) so retrieval never hard-fails.
 
+#include "rag/util/parallel.hpp"
 #include <chrono>
 #include <algorithm>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -44,7 +45,7 @@ struct OllamaConfig {
 class OllamaEmbedder {
 public:
     explicit OllamaEmbedder(OllamaConfig cfg,
-                            std::shared_ptr<HttpTransport> tp = default_http_transport())
+                            std::shared_ptr<HttpTransport> tp)
         : cfg_(std::move(cfg)), tp_(std::move(tp)) {}
     [[nodiscard]] std::size_t dimension() const noexcept { return cfg_.dim; }
     [[nodiscard]] std::string_view identity() const noexcept { return cfg_.model; }
@@ -82,7 +83,7 @@ struct OpenAIConfig {
 class OpenAIEmbedder {
 public:
     explicit OpenAIEmbedder(OpenAIConfig cfg,
-                            std::shared_ptr<HttpTransport> tp = default_http_transport())
+                            std::shared_ptr<HttpTransport> tp)
         : cfg_(std::move(cfg)), tp_(std::move(tp)) {}
     [[nodiscard]] std::size_t dimension() const noexcept { return cfg_.dim; }
     [[nodiscard]] std::string_view identity() const noexcept { return cfg_.model; }
@@ -106,12 +107,13 @@ struct LlamaCppConfig {
     // MULTI-SLOT server (llama-server --parallel N) gets real speedup by raising
     // this to the slot count; a single-slot server should leave it at 1.
     std::size_t   concurrency = 1;
+    util::Splitter split;   // runs the concurrent requests (empty: one at a time)
 };
 
 class LlamaCppEmbedder {
 public:
     explicit LlamaCppEmbedder(LlamaCppConfig cfg,
-                              std::shared_ptr<HttpTransport> tp = default_http_transport())
+                              std::shared_ptr<HttpTransport> tp)
         : cfg_(std::move(cfg)), tp_(std::move(tp)) {}
     [[nodiscard]] std::size_t dimension() const noexcept { return dim_; }
     [[nodiscard]] std::string_view identity() const noexcept { return "llamacpp-embed"; }
@@ -126,28 +128,30 @@ private:
 // ─── Deterministic local hash embedder (no network) ───────────────────────────
 class HashEmbedder {
 public:
-    explicit HashEmbedder(std::size_t dim = 256) : dim_(dim) {}
+    // `concurrency`: how many batches are worth running at once — the host's
+    // core count, typically. Pure CPU, so nothing beyond the cores.
+    explicit HashEmbedder(std::size_t dim = 256, std::size_t concurrency = 1)
+        : dim_(dim), conc_(concurrency ? concurrency : 1) {}
     [[nodiscard]] std::size_t dimension() const noexcept { return dim_; }
     [[nodiscard]] std::string_view identity() const noexcept { return "hash-embed-v1"; }
-    // Pure CPU, no shared state, no internal threading — scales with cores, and
-    // NOT beyond them: unlike a network backend there is nothing to overlap, so
-    // extra workers would only contend.
-    [[nodiscard]] std::size_t max_concurrency() const noexcept {
-        const unsigned hc = std::thread::hardware_concurrency();
-        return hc ? hc : 1u;
-    }
+    [[nodiscard]] std::size_t max_concurrency() const noexcept { return conc_; }
     [[nodiscard]] Result<std::vector<Vector>> embed(std::span<const std::string> texts) const;
 private:
     std::size_t dim_;
+    std::size_t conc_;
 };
 
 // ─── Decorators ───────────────────────────────────────────────────────────────
 // Retry any embedder with bounded exponential backoff on transient failures.
+// The library keeps no clock: `wait` is the host's (sleep, or a cancellable
+// delay); without one the retries go back to back.
 class RetryingEmbedder {
 public:
+    using Wait = std::function<void(std::chrono::milliseconds)>;
     RetryingEmbedder(AnyEmbedder inner, int max_attempts = 3,
-                     std::chrono::milliseconds base_delay = std::chrono::milliseconds(200))
-        : inner_(std::move(inner)), attempts_(max_attempts), delay_(base_delay) {}
+                     std::chrono::milliseconds base_delay = std::chrono::milliseconds(200),
+                     Wait wait = {})
+        : inner_(std::move(inner)), attempts_(max_attempts), delay_(base_delay), wait_(std::move(wait)) {}
     [[nodiscard]] std::size_t dimension() const { return inner_.dimension(); }
     [[nodiscard]] std::string_view identity() const { return inner_.identity(); }
     [[nodiscard]] std::size_t max_concurrency() const { return inner_.max_concurrency(); }
@@ -159,7 +163,7 @@ public:
             if (last) return last;
             if (last.error().code != Errc::transport_error &&
                 last.error().code != Errc::unavailable) return last; // non-transient
-            if (i + 1 < attempts_) { std::this_thread::sleep_for(d); d *= 2; }
+            if (i + 1 < attempts_) { if (wait_) wait_(d); d *= 2; }
         }
         return last;
     }
@@ -167,6 +171,7 @@ private:
     AnyEmbedder inner_;
     int attempts_;
     std::chrono::milliseconds delay_;
+    Wait wait_;
 };
 
 // Try primary; on unavailable/transport error, fall through to secondary.

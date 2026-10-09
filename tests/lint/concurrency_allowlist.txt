@@ -1,24 +1,10 @@
 # rag-cpp — concurrency allowlist (checked by agentty's concurrency_banlist_rag).
 #
-# rag-cpp owns no thread pool: every parallel region runs on the
-# rag::util::Executor the host installs. Entries are the standalone fallback
-# executor in util/parallel.hpp (the one place a thread is named) and the
-# locks, atomics and per-thread scratch buffers that keep the index, caches
-# and plugins safe under the host's threads.
-
-include/rag/util/parallel.hpp: thread atomic
-include/rag/cache/cache.hpp: mutex
-include/rag/index/corpus.hpp: mutex atomic
-include/rag/index/hnsw.hpp: thread_local
-include/rag/lexical/bm25.hpp: atomic
-include/rag/plugin/registry.hpp: mutex
-src/bridge/process.cpp: const_cast
-src/c/rag_c.cpp: thread_local
-src/dense/backends.cpp: mutex atomic
-src/gpu/device.cpp: atomic
+# rag-cpp has no runtime: no threads, locks, atomics, thread_locals or global
+# state. Parallel regions split through the host's Splitter, plugin registries
+# and caches are values the caller owns, and network/process IO comes from the
+# host via HostIo. Nothing may appear below except the one entry here.
+#
+# OpenCL's clCreateBuffer takes a non-const host pointer even for read-only
+# buffers.
 src/gpu/opencl_backend.cpp: const_cast
-src/index/corpus.cpp: mutex atomic const_cast
-src/index/hnsw.cpp: mutex thread_local
-src/loaders/extract.cpp: mutex
-src/store/container.cpp: atomic
-src/text/tokenizer.cpp: thread_local

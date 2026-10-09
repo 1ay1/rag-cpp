@@ -8,11 +8,11 @@
 // RemoteReranker, RemoteRetriever, RemoteGraph) is written once against this
 // seam. Concrete channels:
 //
-//   * ProcessChannel — spawn a subprocess and speak newline-delimited JSON over
-//     its stdin/stdout (bridge/process.hpp). Zero deps; the universal bridge for
-//     a Python engine/graph.
-//   * HttpChannel    — POST JSON to a REST endpoint using the library's existing
-//     injectable HttpTransport (bridge/http_channel.hpp).
+//   * LineChannel — newline-delimited JSON over a subprocess's stdin/stdout,
+//     which the host spawns (bridge/process.hpp). The universal bridge for a
+//     Python engine/graph.
+//   * HttpChannel — POST JSON to a REST endpoint through the host's
+//     HttpTransport (bridge/http_channel.hpp).
 //
 // Protocol (deliberately minimal, JSON-RPC-ish): a request is
 //   {"method": "<name>", "params": { ... }}

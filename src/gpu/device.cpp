@@ -8,7 +8,6 @@
 
 #include "rag/gpu/device.hpp"
 
-#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
@@ -67,13 +66,6 @@ bool opencl_score_batch(const float*, const float*, unsigned long, unsigned long
                         unsigned long, float*) noexcept;
 }
 #endif
-
-// One-way kill switch. Relaxed ordering is right: this is a hint that flips at
-// most once, and a query racing the flip may legitimately observe either value.
-std::atomic<bool>& disabled() noexcept {
-    static std::atomic<bool> d{false};
-    return d;
-}
 
 DeviceInfo& info() noexcept {
     static DeviceInfo i;
@@ -139,18 +131,12 @@ bool initialized() noexcept {
 
 } // namespace detail
 
-bool available() noexcept {
-    if (detail::disabled().load(std::memory_order_relaxed)) return false;
-    return detail::initialized();
-}
+bool available() noexcept { return detail::initialized(); }
 
 const DeviceInfo& device_info() noexcept {
     (void)available();          // ensure the probe has run before reporting
-    static const DeviceInfo cpu{};
-    return detail::disabled().load(std::memory_order_relaxed) ? cpu : detail::info();
+    return detail::info();
 }
-
-void disable() noexcept { detail::disabled().store(true, std::memory_order_relaxed); }
 
 std::size_t min_batch_work() noexcept {
     // Measured crossover, not a guess.

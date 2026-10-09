@@ -8,9 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,16 +21,6 @@ namespace rag::loaders {
 namespace fs = std::filesystem;
 
 namespace {
-
-std::shared_mutex& registry_mutex() {
-    static std::shared_mutex m;
-    return m;
-}
-struct Custom { ExtractFn fn; std::string desc; };
-std::unordered_map<std::string, Custom>& registry() {
-    static std::unordered_map<std::string, Custom> r;
-    return r;
-}
 
 std::string lower(std::string_view s) {
     std::string o(s);
@@ -49,57 +37,6 @@ std::string ext_of(std::string_view hint) {
     auto dot = hint.rfind('.');
     if (dot == std::string_view::npos) return {};
     return lower(hint.substr(dot));
-}
-
-std::FILE* open_pipe(const std::string& command) {
-#ifdef _WIN32
-    return ::_popen(command.c_str(), "r");
-#else
-    return ::popen(command.c_str(), "r");
-#endif
-}
-
-int close_pipe(std::FILE* pipe) {
-#ifdef _WIN32
-    return ::_pclose(pipe);
-#else
-    return ::pclose(pipe);
-#endif
-}
-
-std::string run_capture(const std::string& cmd) {
-    std::string out;
-    std::FILE* pipe = open_pipe(cmd);
-    if (!pipe) return out;
-    std::array<char, 4096> buf;
-    std::size_t got;
-    while ((got = std::fread(buf.data(), 1, buf.size(), pipe)) > 0) out.append(buf.data(), got);
-    close_pipe(pipe);
-    return out;
-}
-
-std::string shell_quote(const std::string& s) {
-#ifdef _WIN32
-    // Windows filenames cannot contain a double quote. Quoting the complete
-    // path keeps spaces and cmd metacharacters such as '&' literal.
-    return "\"" + s + "\"";
-#else
-    std::string q = "'";
-    for (char c : s) {
-        if (c == '\'') q += "'\\''";
-        else q += c;
-    }
-    q += "'";
-    return q;
-#endif
-}
-
-std::string null_redirect() {
-#ifdef _WIN32
-    return " 2>NUL";
-#else
-    return " 2>/dev/null";
-#endif
 }
 
 // Append one Unicode code point to `out` as UTF-8.
@@ -158,23 +95,30 @@ std::optional<std::string> decode_bom_text(std::string_view b) {
 }
 
 // External converters, in preference order per extension. The first one
-// present on the machine wins.
-struct Converter { const char* tool; const char* argfmt; };
+// that runs wins. "%s" in an argv entry is the file's path.
+struct Converter { const char* tool; std::vector<const char*> argv; };
 
 const std::unordered_map<std::string, std::vector<Converter>>& converters() {
     static const std::unordered_map<std::string, std::vector<Converter>> k = {
-        {".pdf",  {{"pdftotext", "pdftotext -q %s -"},
-                   {"mutool",    "mutool draw -F txt %s"}}},
-        {".doc",  {{"antiword",  "antiword %s"},
-                   {"catdoc",    "catdoc %s"},
-                   {"textutil",  "textutil -stdout -convert txt %s"}}},
+        {".pdf",  {{"pdftotext", {"pdftotext", "-q", "%s", "-"}},
+                   {"mutool",    {"mutool", "draw", "-F", "txt", "%s"}}}},
+        {".doc",  {{"antiword",  {"antiword", "%s"}},
+                   {"catdoc",    {"catdoc", "%s"}},
+                   {"textutil",  {"textutil", "-stdout", "-convert", "txt", "%s"}}}},
         // .rtf is handled in-process (rtf_to_text); no converter needed.
-        {".xls",  {{"xls2csv",   "xls2csv %s"}}},
-        {".ppt",  {{"catppt",    "catppt %s"}}},
+        {".xls",  {{"xls2csv",   {"xls2csv", "%s"}}}},
+        {".ppt",  {{"catppt",    {"catppt", "%s"}}}},
         // .epub / .odt / .ods / .odp are handled in-process (ZIP of XML), so no
         // external converter is listed for them — see zip_document_to_text.
     };
     return k;
+}
+
+std::vector<std::string> argv_for(const Converter& c, const fs::path& path) {
+    std::vector<std::string> out;
+    for (const char* a : c.argv)
+        out.push_back(std::string_view{a} == "%s" ? path.string() : std::string{a});
+    return out;
 }
 
 // A PDF whose pages carry images but no text layer. pdftotext returns almost
@@ -191,55 +135,30 @@ bool looks_like_scanned_pdf(const std::string& extracted, std::uintmax_t file_by
 
 } // namespace
 
-bool tool_available(std::string_view tool) {
-    static std::mutex m;
-    static std::unordered_map<std::string, bool> cache;
-    std::string t(tool);
-    {
-        std::lock_guard lk(m);
-        if (auto it = cache.find(t); it != cache.end()) return it->second;
-    }
-#ifdef _WIN32
-    const bool ok = !run_capture("where " + shell_quote(t) + null_redirect()).empty();
-#else
-    const bool ok = !run_capture("command -v " + shell_quote(t) + null_redirect()).empty();
-#endif
-    std::lock_guard lk(m);
-    cache[t] = ok;
-    return ok;
-}
-
-void register_extractor(std::string extension, ExtractFn fn, std::string description) {
+void Extractors::add(std::string extension, ExtractFn fn, std::string description) {
     std::string e = lower(extension);
     if (!e.empty() && e.front() != '.') e.insert(e.begin(), '.');
-    std::unique_lock lk(registry_mutex());
-    registry()[std::move(e)] = Custom{std::move(fn), std::move(description)};
+    customs[std::move(e)] = Custom{std::move(fn), std::move(description)};
 }
 
-std::vector<std::string> custom_extractors() {
-    std::shared_lock lk(registry_mutex());
+std::vector<std::string> Extractors::custom() const {
     std::vector<std::string> out;
-    out.reserve(registry().size());
-    for (const auto& [k, v] : registry()) out.push_back(k);
-    std::sort(out.begin(), out.end());
+    out.reserve(customs.size());
+    for (const auto& [k, _] : customs) out.push_back(k);
     return out;
 }
 
-Result<ExtractResult> extract_bytes(std::string_view bytes, std::string_view hint) {
+Result<ExtractResult> extract_bytes(std::string_view bytes, std::string_view hint,
+                                    const Extractors& ex) {
     const std::string ext = ext_of(hint);
 
     // A custom extractor is the caller's explicit instruction and outranks
     // everything, including content sniffing: if someone registered a handler
     // for ".rpt" they know more about their format than we do.
-    {
-        std::shared_lock lk(registry_mutex());
-        if (auto it = registry().find(ext); it != registry().end()) {
-            ExtractFn fn = it->second.fn;
-            lk.unlock();
-            auto t = fn(bytes);
-            if (!t) return std::unexpected(t.error());
-            return ExtractResult{std::move(*t), ExtractKind::native, "custom"};
-        }
+    if (auto it = ex.customs.find(ext); it != ex.customs.end()) {
+        auto t = it->second.fn(bytes);
+        if (!t) return std::unexpected(t.error());
+        return ExtractResult{std::move(*t), ExtractKind::native, "custom"};
     }
 
     // Content sniffing beats the extension. A .docx renamed to .txt is common
@@ -295,7 +214,7 @@ Result<ExtractResult> extract_bytes(std::string_view bytes, std::string_view hin
     return ExtractResult{std::string(bytes), ExtractKind::native, {}};
 }
 
-Result<ExtractResult> extract_file(const fs::path& path) {
+Result<ExtractResult> extract_file(const fs::path& path, const Extractors& ex) {
     std::error_code ec;
     if (!fs::is_regular_file(path, ec)) return fail<ExtractResult>(Errc::not_found, path.string());
     const std::string ext = lower(path.extension().string());
@@ -304,11 +223,7 @@ Result<ExtractResult> extract_file(const fs::path& path) {
     // Custom extractors and in-process formats work from bytes.
     const auto& conv = converters();
     auto cit = conv.find(ext);
-    bool has_custom = false;
-    {
-        std::shared_lock lk(registry_mutex());
-        has_custom = registry().contains(ext);
-    }
+    const bool has_custom = ex.customs.contains(ext);
 
     // ZIP-container documents (OOXML + OpenDocument + EPUB) are extracted
     // in-process; the converter, if any, is only a fallback. So even though
@@ -326,21 +241,19 @@ Result<ExtractResult> extract_file(const fs::path& path) {
         std::ostringstream ss;
         ss << in.rdbuf();
         std::string bytes = ss.str();
-        auto r = extract_bytes(bytes, path.filename().string());
+        auto r = extract_bytes(bytes, path.filename().string(), ex);
         if (r) return r;
         // Fall through to a converter when one exists for the sniffed type
         // (a .pdf named .bin, say); otherwise report the original error.
         if (cit == conv.end()) return r;
     }
 
-    // An external converter is needed. Pick the first installed one.
+    // An external converter is needed. The first one that runs wins.
     for (const Converter& c : cit->second) {
-        if (!tool_available(c.tool)) continue;
-        std::string cmd(c.argfmt);
-        const std::string q = shell_quote(path.string());
-        if (auto at = cmd.find("%s"); at != std::string::npos) cmd.replace(at, 2, q);
-        cmd += null_redirect();
-        std::string text = run_capture(cmd);
+        if (!ex.run) break;
+        auto out = ex.run(argv_for(c, path));
+        if (!out) continue;   // not installed / didn't start
+        std::string text = std::move(*out);
 
         if (ext == ".pdf" && looks_like_scanned_pdf(text, size)) {
             // Be explicit. This is the case people spend an afternoon on,
@@ -364,7 +277,7 @@ Result<ExtractResult> extract_file(const fs::path& path) {
         "no extractor for " + ext + ": install " + tools);
 }
 
-std::vector<FormatSupport> capabilities() {
+std::vector<FormatSupport> capabilities(const Extractors& ex) {
     std::vector<FormatSupport> out;
     auto native = [&](const char* e, const char* note) {
         out.push_back({e, ExtractKind::native, true, {}, note});
@@ -388,8 +301,10 @@ std::vector<FormatSupport> capabilities() {
         FormatSupport f;
         f.extension = ext;
         f.kind = ExtractKind::external;
+        // Available if the host can start it at all (RunFn answers nullopt
+        // only when the program could not run; its exit code is ignored).
         for (const Converter& c : list) {
-            if (tool_available(c.tool)) { f.available = true; f.requires_tool = c.tool; break; }
+            if (ex.run && ex.run({c.tool, "-v"})) { f.available = true; f.requires_tool = c.tool; break; }
         }
         if (!f.available) {
             for (const Converter& c : list) {
@@ -406,8 +321,7 @@ std::vector<FormatSupport> capabilities() {
     out.push_back({"(scanned pdf)", ExtractKind::ocr, false, "ocrmypdf / tesseract",
                    "no OCR engine bundled; detected and reported, never guessed"});
 
-    std::shared_lock lk(registry_mutex());
-    for (const auto& [ext, c] : registry())
+    for (const auto& [ext, c] : ex.customs)
         out.push_back({ext, ExtractKind::native, true, {}, c.desc.empty() ? "custom" : c.desc});
 
     std::sort(out.begin(), out.end(), [](const FormatSupport& a, const FormatSupport& b) {

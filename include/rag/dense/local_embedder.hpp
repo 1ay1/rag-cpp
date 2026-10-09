@@ -38,7 +38,7 @@ struct LocalEmbedderConfig {
     Pooling     pooling      = Pooling::mean;
     bool        normalize    = true;        // L2-normalize output (cosine-ready)
     std::size_t max_tokens   = 512;         // truncate long inputs
-    int         threads      = 0;           // 0 = auto (hardware_concurrency)
+    int         threads      = 0;           // 0 = the runtime's default; hosts pass their core count
     std::string identity_tag = "local";     // model id for cache keying
 };
 

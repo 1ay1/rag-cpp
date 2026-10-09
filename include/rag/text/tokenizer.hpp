@@ -7,6 +7,7 @@
 // concept.
 
 #include <string>
+#include <unordered_map>
 #include <string_view>
 #include <vector>
 
@@ -28,12 +29,25 @@ public:
     Tokenizer() = default;
     explicit Tokenizer(TokenizeOptions opts) : opts_(opts) {}
 
+    // A copy takes the options, not the stem memo (it refills on use).
+    Tokenizer(const Tokenizer& o) : opts_(o.opts_) {}
+    Tokenizer& operator=(const Tokenizer& o) { opts_ = o.opts_; stems_.clear(); return *this; }
+    Tokenizer(Tokenizer&&) noexcept            = default;
+    Tokenizer& operator=(Tokenizer&&) noexcept = default;
+
+    // Not safe to call on one Tokenizer from two threads at once (it fills
+    // its stem memo); copies are independent.
     [[nodiscard]] std::vector<std::string> tokenize(std::string_view text) const;
 
     [[nodiscard]] const TokenizeOptions& options() const noexcept { return opts_; }
 
 private:
+    [[nodiscard]] const std::string& stem_cached(const std::string& word) const;
+
     TokenizeOptions opts_{};
+    // porter_stem memo: a pure function of the word, and word frequency is
+    // Zipfian, so a few thousand entries cover most of any text.
+    mutable std::unordered_map<std::string, std::string> stems_;
 };
 
 // The Porter (1980) stemming algorithm. In-place-ish: returns the stem.

@@ -7,7 +7,7 @@
 
 namespace rag::plugin {
 
-std::vector<LoadedPlugin> load_plugin_dir(std::string_view dir, std::vector<Error>* errors) {
+std::vector<LoadedPlugin> load_plugin_dir(std::string_view dir, Registries& regs, std::vector<Error>* errors) {
     namespace fs = std::filesystem;
     std::vector<LoadedPlugin> loaded;
 
@@ -37,7 +37,7 @@ std::vector<LoadedPlugin> load_plugin_dir(std::string_view dir, std::vector<Erro
     std::sort(candidates.begin(), candidates.end());
 
     for (const auto& p : candidates) {
-        auto r = load_plugin(p.string());
+        auto r = load_plugin(p.string(), regs);
         if (r) {
             loaded.push_back(std::move(*r));
         } else if (errors) {

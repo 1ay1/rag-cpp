@@ -32,7 +32,9 @@ int HnswIndex::random_level() {
     std::uniform_real_distribution<float> u(0.0f, 1.0f);
     float r = u(rng_);
     if (r <= 0.0f) r = 1e-9f;
-    return static_cast<int>(-std::log(r) * cfg_.ml);
+    // Capped so a layer always fits the 8 bits build_batch packs it in
+    // (unreachable in practice: at M=16 level 30 is already ~1e-36).
+    return std::min(255, static_cast<int>(-std::log(r) * cfg_.ml));
 }
 
 float HnswIndex::sim(std::size_t node, std::span<const float> q,
@@ -106,7 +108,7 @@ void HnswIndex::seal() const {
         const std::size_t ntrain = std::min(n, kMaxTrain);
         auto pq = ProductQuantizer::train_flat(
             std::span<const float>(store_.data(), ntrain * dim_), ntrain, dim_,
-            PqConfig{.m = cfg_.pq_codes, .ksub = 256, .iters = 15, .seed = cfg_.seed});
+            PqConfig{.split = cfg_.split, .m = cfg_.pq_codes, .ksub = 256, .iters = 15, .seed = cfg_.seed});
         if (pq) {
             pq_   = std::move(*pq);
             pq_m_ = cfg_.pq_codes;
@@ -138,7 +140,7 @@ void HnswIndex::seal() const {
         // incremental-add path seal() runs outside build_batch, so this loop
         // (which is otherwise the serial tail of a bulk rebuild) fans out across
         // cores just like build_batch's own quantization pass.
-        util::parallel_for(n, [&](std::size_t i) {
+        util::parallel_for(cfg_.split, n, [&](std::size_t i) {
             dense::quantize_sq8(vec_at(i),
                                 std::span<std::int8_t>(q8_.data() + i * dim_, dim_));
         });
@@ -223,11 +225,13 @@ std::vector<std::uint32_t>
 HnswIndex::search_layer(std::span<const float> q, std::span<const std::uint64_t> q_bits,
                         std::uint32_t entry, int layer, std::size_t ef) const {
     std::vector<std::uint32_t> out;
-    search_layer_into(q, q_bits, {}, {}, entry, layer, ef, out);
+    Scratch sc;
+    search_layer_into(sc, q, q_bits, {}, {}, entry, layer, ef, out);
     return out;
 }
 
-void HnswIndex::search_layer_into(std::span<const float> q, std::span<const std::uint64_t> q_bits,
+void HnswIndex::search_layer_into(Scratch& sc,
+                                  std::span<const float> q, std::span<const std::uint64_t> q_bits,
                                   std::span<const std::int8_t> q8,
                                   std::span<const float> adc,
                                   std::uint32_t entry, int layer, std::size_t ef,
@@ -236,14 +240,13 @@ void HnswIndex::search_layer_into(std::span<const float> q, std::span<const std:
     //   cand   — max-heap by sim: the frontier, best-first expansion order.
     //   result — min-heap by sim: the running top-ef; its root is the WEAKEST
     //            member, so admitting a better node is a pop+push.
-    // Both live in thread-local scratch and keep their capacity across calls,
+    // Both live in the caller's scratch and keep their capacity across calls,
     // and `visited` is an epoch-stamped array rather than a hash set, so this
     // function performs no allocation in steady state.
     using PQ = std::pair<float, std::uint32_t>;
     auto near_less = [](const PQ& a, const PQ& b) { return a.first <  b.first; }; // max-heap
     auto far_less  = [](const PQ& a, const PQ& b) { return a.first >  b.first; }; // min-heap
 
-    Scratch& sc = scratch();
     sc.reset(nodes_.size());
     auto& cand   = sc.cand;
     auto& result = sc.result;
@@ -262,9 +265,7 @@ void HnswIndex::search_layer_into(std::span<const float> q, std::span<const std:
         if (!result.empty() && csim < result.front().first && result.size() >= ef) break;
 
         // One span, one bounds check, contiguous ids — see the CSR note in the
-        // header. During a concurrent build another thread may publish a taller
-        // entry point before its adjacency is filled, so an empty span here is
-        // normal rather than exceptional.
+        // header. An empty span (a node above its own top layer) is normal.
         const std::span<const std::uint32_t> links = neighbours(cnode, L);
         if (links.empty()) continue;
 
@@ -358,8 +359,7 @@ void select_neighbours_heuristic_into(const std::vector<std::pair<float, std::ui
     }
 }
 
-// Allocating convenience wrapper for the serial connect() path. The hot,
-// parallel connect_locked() path uses the _into form with a thread_local buffer.
+// Allocating convenience wrapper over the _into form.
 template <class SimAB>
 std::vector<std::uint32_t>
 select_neighbours_heuristic(const std::vector<std::pair<float, std::uint32_t>>& scored,
@@ -405,16 +405,29 @@ float HnswIndex::sim_nodes(std::uint32_t a, std::uint32_t b) const {
     return dense::dot(vec_at(a), vec_at(b));
 }
 
-void HnswIndex::connect(std::uint32_t node, int layer, std::vector<std::uint32_t> neighbours) {
+// The node's own neighbours in `layer`, chosen from the search's candidates
+// by the diversity heuristic. Reads the graph only.
+std::vector<std::uint32_t> HnswIndex::select_links(std::uint32_t node, int layer,
+                                                   const std::vector<std::uint32_t>& cands) const {
     const std::size_t maxM = (layer == 0) ? cfg_.M * 2 : cfg_.M;
     std::vector<std::pair<float, std::uint32_t>> scored;
-    score_and_sort(node, neighbours, scored);
-    auto& L = nodes_[node].links[static_cast<std::size_t>(layer)];
-    L = select_neighbours_heuristic(scored, maxM,
+    score_and_sort(node, cands, scored);
+    return select_neighbours_heuristic(scored, maxM,
             [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); });
+}
 
-    // Add back-links, pruning each neighbour to its own maxM with the same
-    // heuristic so the reverse edges stay diverse too.
+void HnswIndex::connect(std::uint32_t node, int layer, std::vector<std::uint32_t> neighbours) {
+    link(node, layer, select_links(node, layer, neighbours));
+}
+
+// Install `links` as node's neighbours in `layer` and add the back-links,
+// pruning each neighbour to its own maxM with the same heuristic so the
+// reverse edges stay diverse too.
+void HnswIndex::link(std::uint32_t node, int layer, std::vector<std::uint32_t> links) {
+    const std::size_t maxM = (layer == 0) ? cfg_.M * 2 : cfg_.M;
+    std::vector<std::pair<float, std::uint32_t>> scored;
+    auto& L = nodes_[node].links[static_cast<std::size_t>(layer)];
+    L = std::move(links);
     for (std::uint32_t nb : L) {
         auto& NL = nodes_[nb].links[static_cast<std::size_t>(layer)];
         if (std::find(NL.begin(), NL.end(), node) == NL.end()) NL.push_back(node);
@@ -423,66 +436,6 @@ void HnswIndex::connect(std::uint32_t node, int layer, std::vector<std::uint32_t
             NL = select_neighbours_heuristic(scored, maxM,
                     [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); });
         }
-    }
-}
-
-void HnswIndex::connect_locked(std::uint32_t node, int layer,
-                               std::vector<std::uint32_t> neighbours,
-                               std::vector<NodeLock>& locks) {
-    const std::size_t maxM = (layer == 0) ? cfg_.M * 2 : cfg_.M;
-    const std::size_t L    = static_cast<std::size_t>(layer);
-
-    // Scratch reused across every connect_locked call ON THIS THREAD. Phase 2
-    // links millions of nodes; a fresh `scored`/`snapshot`/`keep` per node was
-    // three heap allocations per link op (plus the O(M²) prune's re-scores),
-    // all churning the allocator under parallel contention. thread_local keeps
-    // one buffer set per worker — no locking, no per-node allocation, and the
-    // capacity converges after the first few nodes. Mirrors the Scratch pattern
-    // the search path already uses.
-    thread_local std::vector<std::pair<float, std::uint32_t>> scored;
-    thread_local std::vector<std::uint32_t>                   keep;
-    thread_local std::vector<std::uint32_t>                   snapshot;
-
-    // Rank candidates by similarity to `node`, then apply the diversity
-    // heuristic. This read-only scoring needs no locks: vectors are immutable
-    // after staging and neither arena reallocates during phase 2.
-    score_and_sort(node, neighbours, scored);
-    select_neighbours_heuristic_into(scored, maxM,
-            [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); }, keep);
-
-    {   // Publish this node's own adjacency. Written in place (capacity was
-        // reserved to maxM+1 at staging) so the buffer address never changes
-        // and a concurrent reader can never chase a freed pointer.
-        locks[node].lock();
-        nodes_[node].links[L].assign(keep.begin(), keep.end());
-        locks[node].unlock();
-    }
-
-    // Add back-links, pruning each neighbour to its own maxM. Each neighbour is
-    // locked individually and only for the duration of its own edit.
-    for (std::uint32_t nb : keep) {
-        locks[nb].lock();
-        auto& NL = nodes_[nb].links[L];
-        if (std::find(NL.begin(), NL.end(), node) == NL.end()) NL.push_back(node);
-        const bool over = NL.size() > maxM;
-        if (over) snapshot.assign(NL.begin(), NL.end());
-        locks[nb].unlock();
-        if (!over) continue;
-
-        // Prune outside the lock — scoring maxM+1 candidates against each other
-        // is O(M²) dot products, far too long to hold a spinlock that readers
-        // and other writers are contending for.
-        score_and_sort(nb, snapshot, scored);
-        thread_local std::vector<std::uint32_t> pruned;
-        select_neighbours_heuristic_into(scored, maxM,
-                [&](std::uint32_t a, std::uint32_t b) { return sim_nodes(a, b); }, pruned);
-        locks[nb].lock();
-        auto& NL2 = nodes_[nb].links[L];
-        // Re-check under the lock: another thread may have pruned already, and
-        // anything it appended meanwhile must not be silently dropped, so only
-        // overwrite when our pruned set still covers the current size.
-        if (NL2.size() > maxM) NL2.assign(pruned.begin(), pruned.end());  // in place: capacity is stable
-        locks[nb].unlock();
     }
 }
 
@@ -544,7 +497,7 @@ void HnswIndex::build_batch(std::size_t n,
     // pointers into it.
     if (!cfg_.binary && cfg_.matryoshka_dim == 0 && dim_ > 0) {
         q8_.resize(total * dim_);
-        util::parallel_for(total - base, [&](std::size_t i) {
+        util::parallel_for(cfg_.split, total - base, [&](std::size_t i) {
             const std::size_t node = base + i;
             dense::quantize_sq8(vec_at(node),
                                 std::span<std::int8_t>(q8_.data() + node * dim_, dim_));
@@ -559,51 +512,103 @@ void HnswIndex::build_batch(std::size_t n,
         ++start;
     }
 
-    // ── Phase 2 (parallel): search + link. ──────────────────────────────
-    // The entry point and max_layer_ are promoted under a mutex; every other
-    // mutation is per-node and spinlock-guarded. Nodes link against whatever
-    // portion of the graph is already visible, exactly as in serial insertion.
-    std::vector<NodeLock> locks(total);
-    std::mutex entry_mu;
-    // Expose the lock array to neighbours(): phase-2 searches read adjacency
-    // that phase-2 writers mutate, so readers must snapshot under the same
-    // per-node lock. Cleared before the (single-threaded) seal below.
-    build_locks_ = &locks;
+    // ── Phase 2: search + link, in waves. ───────────────────────────────
+    // Nodes are linked in waves. Within a wave every node SEARCHES the graph
+    // as it stood when the wave began, in parallel and read-only, writing its
+    // chosen neighbours into its own slot; then the wave's links are applied
+    // one node at a time. Nothing is written while anything reads, so the
+    // build needs no lock and comes out the same however the splitter runs.
+    //
+    // A node can't link to another node of its own wave (neither is in the
+    // graph its search sees), so waves start at one node and grow with the
+    // graph — 1/16 of what is linked so far, capped — which keeps every
+    // wave a small fraction of the graph it searches. The recall gates
+    // (hnsw_parallel_build_matches_serial_recall) hold the result to the
+    // serial build's quality.
+    struct Picks { std::vector<std::vector<std::uint32_t>> per_layer; };
+    std::vector<Picks> picks;
+    std::size_t next = start;
+    while (next < total) {
+        const std::size_t linked = next;
+        const std::size_t wave =
+            std::min<std::size_t>(total - next, std::clamp<std::size_t>(linked / 16, 1, 4096));
+        const int top = max_layer_;
+        const std::uint32_t entry = entry_;
+        picks.assign(wave, {});
 
-    util::parallel_for(total - start, [&](std::size_t idx) {
-        const std::uint32_t ordinal = static_cast<std::uint32_t>(start + idx);
-        const int level = static_cast<int>(nodes_[ordinal].links.size()) - 1;
+        // Each node's walk is ~ef_construction distance computations, so even
+        // a small wave is worth splitting (no kParallelMin gate). One scratch
+        // per share: its visited array is sized to the graph, so allocating
+        // it per node would cost more than the walk.
+        const std::size_t shares = std::min(wave, cfg_.split.width());
+        util::parallel_for_strided(cfg_.split, shares, shares, [&](std::size_t k) {
+          Scratch sc;
+          std::vector<std::uint32_t> hop;
+          for (std::size_t w = k; w < wave; w += shares) {
+            const std::uint32_t ordinal = static_cast<std::uint32_t>(next + w);
+            const int level = static_cast<int>(nodes_[ordinal].links.size()) - 1;
+            std::span<const float>         q  = vec_at(ordinal);
+            std::span<const std::uint64_t> qb = nodes_[ordinal].bits;
+            // This node's own SQ8 row doubles as the quantized query for its walk.
+            std::span<const std::int8_t>   q8 =
+                q8_.empty() ? std::span<const std::int8_t>{}
+                            : std::span<const std::int8_t>(q8_at(ordinal), dim_);
+            std::uint32_t cur = entry;
+            for (int lc = top; lc > level; --lc) {
+                // No ADC during construction: PQ is trained in seal(), after
+                // the graph exists, so the build always walks on SQ8/floats.
+                search_layer_into(sc, q, qb, q8, {}, cur, lc, 1, hop);
+                if (!hop.empty()) cur = hop.front();
+            }
+            auto& out = picks[w].per_layer;
+            out.resize(static_cast<std::size_t>(std::max(level, 0)) + 1);
+            for (int lc = std::min(level, top); lc >= 0; --lc) {
+                search_layer_into(sc, q, qb, q8, {}, cur, lc, cfg_.ef_construction, hop);
+                if (!hop.empty()) cur = hop.front();
+                out[static_cast<std::size_t>(lc)] = select_links(ordinal, lc, hop);
+            }
+          }
+        });
 
-        std::span<const float>         q  = vec_at(ordinal);
-        std::span<const std::uint64_t> qb = nodes_[ordinal].bits;
-        // This node's own SQ8 row doubles as the quantized query for its walk.
-        std::span<const std::int8_t>   q8 =
-            q8_.empty() ? std::span<const std::int8_t>{}
-                        : std::span<const std::int8_t>(q8_at(ordinal), dim_);
-
-        int top;
-        std::uint32_t cur;
-        { std::lock_guard lk(entry_mu); top = max_layer_; cur = entry_; }
-
-        std::vector<std::uint32_t> hop;
-        for (int lc = top; lc > level; --lc) {
-            // No ADC during construction: PQ is trained in seal(), after the
-            // graph exists, so the build always walks on SQ8/floats.
-            search_layer_into(q, qb, q8, {}, cur, lc, 1, hop);
-            if (!hop.empty()) cur = hop.front();
-        }
-        for (int lc = std::min(level, top); lc >= 0; --lc) {
-            search_layer_into(q, qb, q8, {}, cur, lc, cfg_.ef_construction, hop);
-            if (!hop.empty()) cur = hop.front();
-            connect_locked(ordinal, lc, hop, locks);
-        }
-
-        if (level > top) {
-            std::lock_guard lk(entry_mu);
+        // Apply. Each new node gets its own links (its slot alone); the
+        // back-links are grouped by the neighbour they land on, and each
+        // neighbour then takes and prunes its own list, in parallel — every
+        // write still goes to one slot only.
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> back;   // ((nb<<8)|layer, node)
+        for (std::size_t w = 0; w < wave; ++w) {
+            const std::uint32_t ordinal = static_cast<std::uint32_t>(next + w);
+            const int level = static_cast<int>(nodes_[ordinal].links.size()) - 1;
+            for (int lc = std::min(level, top); lc >= 0; --lc) {
+                auto& L = nodes_[ordinal].links[static_cast<std::size_t>(lc)];
+                L = std::move(picks[w].per_layer[static_cast<std::size_t>(lc)]);
+                for (std::uint32_t nb : L)
+                    back.emplace_back((static_cast<std::uint64_t>(nb) << 8) | static_cast<std::uint64_t>(lc), ordinal);
+            }
             if (level > max_layer_) { max_layer_ = level; entry_ = ordinal; }
         }
-    });
-    build_locks_ = nullptr;   // locks dies with this scope
+        std::sort(back.begin(), back.end());
+        std::vector<std::size_t> starts;
+        for (std::size_t i = 0; i < back.size(); ++i)
+            if (i == 0 || back[i].first != back[i - 1].first) starts.push_back(i);
+        starts.push_back(back.size());
+        util::parallel_for(cfg_.split, starts.size() - 1, [&](std::size_t g) {
+            const auto key = back[starts[g]].first;
+            const auto nb  = static_cast<std::uint32_t>(key >> 8);
+            const int  lc  = static_cast<int>(key & 0xff);
+            const std::size_t maxM = (lc == 0) ? cfg_.M * 2 : cfg_.M;
+            auto& NL = nodes_[nb].links[static_cast<std::size_t>(lc)];
+            for (std::size_t i = starts[g]; i < starts[g + 1]; ++i)
+                if (std::find(NL.begin(), NL.end(), back[i].second) == NL.end())
+                    NL.push_back(back[i].second);
+            if (NL.size() > maxM) {
+                std::vector<std::pair<float, std::uint32_t>> scored;
+                score_and_sort(nb, NL, scored);
+                NL = select_neighbours_heuristic(scored, maxM,
+                        [&](std::uint32_t x, std::uint32_t y) { return sim_nodes(x, y); });
+            }
+        });
+        next += wave;
+    }
 
     // The graph is final: freeze the adjacency into CSR so every subsequent
     // query walks contiguous memory. Done once here rather than lazily on
@@ -668,9 +673,9 @@ std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k,
     seal();     // memoized: no-op on every query after the first
 
     // The query vector is the ONE unavoidable allocation per search (it must be
-    // normalized, and the caller's span is const), so it comes from thread-local
-    // scratch too rather than a fresh heap block per query.
-    Scratch& sc = scratch();
+    // normalized, and the caller's span is const), so it comes from the
+    // index's scratch too rather than a fresh heap block per query.
+    Scratch& sc = scratch_;
     sc.query.assign(query.begin(), query.end());
     if (sc.query.size() != dim_) sc.query.resize(dim_, 0.0f);
     dense::normalize(sc.query);
@@ -696,11 +701,11 @@ std::vector<Hit> HnswIndex::search(std::span<const float> query, std::size_t k,
     auto& hop = sc.hop;
     std::uint32_t cur = entry_;
     for (int lc = max_layer_; lc > 0; --lc) {
-        search_layer_into(q, qb, q8, adc, cur, lc, 1, hop);
+        search_layer_into(sc, q, qb, q8, adc, cur, lc, 1, hop);
         if (!hop.empty()) cur = hop.front();
     }
     std::size_t ef = std::max(ef_override ? ef_override : cfg_.ef_search, k);
-    search_layer_into(q, qb, q8, adc, cur, 0, ef, hop);
+    search_layer_into(sc, q, qb, q8, adc, cur, 0, ef, hop);
 
     // Rescore candidates on the FULL float vector (exact cosine) — corrects any
     // approximation introduced by matryoshka/binary/SQ8/PQ during the walk.
@@ -777,7 +782,7 @@ std::vector<Hit> HnswIndex::search_filtered(std::span<const float> query, std::s
     // walking on raw floats with a freshly allocated query vector, so a
     // metadata-filtered query paid several times the latency of an unfiltered
     // one for no reason — the filter applies at rescore, not during the walk.
-    Scratch& sc = scratch();
+    Scratch& sc = scratch_;
     sc.query.assign(query.begin(), query.end());
     if (sc.query.size() != dim_) sc.query.resize(dim_, 0.0f);
     dense::normalize(sc.query);
@@ -801,7 +806,7 @@ std::vector<Hit> HnswIndex::search_filtered(std::span<const float> query, std::s
     auto& hop = sc.hop;
     std::uint32_t cur = entry_;
     for (int lc = max_layer_; lc > 0; --lc) {
-        search_layer_into(q, qb, q8, adc, cur, lc, 1, hop);
+        search_layer_into(sc, q, qb, q8, adc, cur, lc, 1, hop);
         if (!hop.empty()) cur = hop.front();
     }
     // Widen the base-layer beam so a selective filter still yields k results.
@@ -809,7 +814,7 @@ std::vector<Hit> HnswIndex::search_filtered(std::span<const float> query, std::s
         std::max<float>(static_cast<float>(std::max(cfg_.ef_search, k)) * std::max(1.0f, ef_boost),
                         static_cast<float>(k)));
     ef = std::min(ef, nodes_.size());
-    search_layer_into(q, qb, q8, adc, cur, 0, ef, hop);
+    search_layer_into(sc, q, qb, q8, adc, cur, 0, ef, hop);
 
     // Rescore on the full vector, keeping only ALLOWED candidates.
     std::vector<Hit> hits;

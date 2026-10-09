@@ -29,16 +29,19 @@
 #include "rag/bridge/remote.hpp"
 #include "rag/core/types.hpp"
 
+namespace rag::plugin { struct Registries; struct HostIo; }
+
 namespace rag::bridge {
 
-// Build a Channel from a JSON spec. `transport` (or `type`) selects:
+// Build a Channel from a JSON spec, through the host's IO. `transport` (or
+// `type`) selects:
 //   "process": { "argv": [str,...], "env": [str,...], "cwd": str, "name": str }
 //   "http"   : { "host","port","tls","base_path","headers":{...},"name" }
-[[nodiscard]] Result<std::shared_ptr<Channel>> open_channel(const Json& spec);
+[[nodiscard]] Result<std::shared_ptr<Channel>> open_channel(const Json& spec, const plugin::HostIo& io);
 
-// Registers "process" and "http" embedder + reranker factories with the plugin
-// registry. Referenced by rag::plugin::ensure_builtins_registered() so config
-// like {"type":"process", "argv":[...], "dim":384} builds a RemoteEmbedder.
-void ensure_bridge_registered() noexcept;
+// Registers the "process", "http" and "rest" embedder + reranker factories
+// into `r`. Part of Registries::builtin(), so config like
+// {"type":"process", "argv":[...], "dim":384} builds a RemoteEmbedder.
+void register_bridge(plugin::Registries& r);
 
 } // namespace rag::bridge

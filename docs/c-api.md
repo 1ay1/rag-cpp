@@ -8,7 +8,8 @@ exceptions; strings you receive must be freed with the matching `*_free`.
 
 Everything is an opaque handle (`rag_engine`, `rag_embedder`, `rag_reranker`,
 `rag_results`) plus functions that take one. Fallible calls return a
-`rag_status`; on failure, `rag_last_error()` returns a human-readable message.
+`rag_status`; on failure, `rag_engine_last_error(engine)` returns a
+human-readable message (the library keeps no per-thread state).
 
 ```c
 #include <rag/c/rag.h>
@@ -35,9 +36,9 @@ rag_engine_free(e);
 
 | Group | Functions |
 |-------|-----------|
-| Version / errors | `rag_version`, `rag_last_error` |
-| Embedders | `rag_embedder_hash`, `rag_embedder_ollama`, `rag_embedder_openai`, `rag_embedder_llamacpp`, `rag_embedder_free` |
-| Rerankers | `rag_reranker_tei`, `rag_reranker_cohere`, `rag_reranker_free` |
+| Version / errors | `rag_version`, `rag_engine_last_error` |
+| Embedders | `rag_embedder_hash`, `rag_embedder_free` (network backends are C++ only: they take the host's HttpTransport) |
+| Rerankers | `rag_reranker_free` |
 | Engine lifecycle | `rag_engine_new`, `rag_engine_free`, `rag_engine_set_embedder`, `rag_engine_set_reranker` |
 | Ingest | `rag_engine_add`, `rag_engine_add_directory`, `rag_engine_build` |
 | Search | `rag_engine_search` → `rag_results_*` accessors |
@@ -52,7 +53,7 @@ authoritative.
 - Strings returned by the library must be released with `rag_string_free()` (or
   the whole result via `rag_results_free()`).
 - The ABI is exception-free: a C++ exception never crosses the boundary; failures
-  surface as `rag_status` + `rag_last_error()`.
+  surface as `rag_status` + `rag_engine_last_error()`.
 
 ## Bindings
 

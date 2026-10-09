@@ -11,12 +11,11 @@
 //   • QueryCache — memoizes (query, k) → ranked hits, so a repeated query short-
 //     circuits the whole pipeline. Invalidate on corpus mutation.
 //
-// Both are thread-safe (a single mutex; the workloads are read-heavy and the
-// critical sections tiny) so they can sit in front of a concurrent query path.
+// A cache belongs to one owner at a time; one shared across threads is the
+// host's to guard.
 
 #include <cstddef>
 #include <list>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -33,7 +32,6 @@ public:
     explicit LruCache(std::size_t capacity = 4096) : cap_(capacity ? capacity : 1) {}
 
     [[nodiscard]] std::optional<V> get(const std::string& key) {
-        std::lock_guard lk(mu_);
         auto it = map_.find(key);
         if (it == map_.end()) { ++misses_; return std::nullopt; }
         order_.splice(order_.begin(), order_, it->second.pos);   // touch (MRU)
@@ -42,7 +40,6 @@ public:
     }
 
     void put(const std::string& key, V value) {
-        std::lock_guard lk(mu_);
         auto it = map_.find(key);
         if (it != map_.end()) {
             it->second.value = std::move(value);
@@ -58,19 +55,17 @@ public:
         }
     }
 
-    void clear() { std::lock_guard lk(mu_); map_.clear(); order_.clear(); }
-    [[nodiscard]] std::size_t size() const { std::lock_guard lk(mu_); return map_.size(); }
-    [[nodiscard]] std::size_t hits()   const { std::lock_guard lk(mu_); return hits_; }
-    [[nodiscard]] std::size_t misses() const { std::lock_guard lk(mu_); return misses_; }
+    void clear() { map_.clear(); order_.clear(); }
+    [[nodiscard]] std::size_t size() const { return map_.size(); }
+    [[nodiscard]] std::size_t hits()   const { return hits_; }
+    [[nodiscard]] std::size_t misses() const { return misses_; }
     [[nodiscard]] double hit_rate() const {
-        std::lock_guard lk(mu_);
         std::size_t t = hits_ + misses_;
         return t ? (double)hits_ / (double)t : 0.0;
     }
 
 private:
     struct Entry { V value; typename std::list<std::string>::iterator pos; };
-    mutable std::mutex mu_;
     std::size_t cap_;
     std::list<std::string> order_;                       // MRU front → LRU back
     std::unordered_map<std::string, Entry> map_;

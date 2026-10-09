@@ -27,13 +27,12 @@
 namespace rag::dense {
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HttpTransport — the injectable network seam.
+// HttpTransport — the network seam. rag-cpp opens no sockets: every network
+// backend posts through a transport the host supplies (HostIo::http).
 //
 // A single POST primitive, but rich enough for every hosted backend: custom
 // headers carry Bearer auth (OpenAI, TEI, Cohere) and `tls` requests an
-// encrypted connection. The default transport speaks plaintext HTTP/1.1 for
-// localhost model servers; for TLS endpoints inject a transport backed by your
-// own TLS stack — that is exactly why the seam exists.
+// encrypted connection.
 // ─────────────────────────────────────────────────────────────────────────────
 struct HttpResponse {
     int         status = 0;
@@ -64,11 +63,6 @@ struct HttpTransport {
         return post(HttpRequest{host, port, path, body, {}, false, timeout});
     }
 };
-
-// The library's default transport (blocking POSIX/Winsock sockets, plaintext
-// HTTP/1.1 — intended for localhost model servers like Ollama / llama.cpp).
-// A `tls=true` request against this transport fails with Errc::unavailable.
-[[nodiscard]] std::shared_ptr<HttpTransport> default_http_transport();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Embedding concurrency hint.

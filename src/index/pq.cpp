@@ -64,13 +64,11 @@ ProductQuantizer::train_flat(std::span<const float> data, std::size_t n, std::si
     // slices of the data and disjoint slices of centroids_, so they run
     // concurrently with no synchronization at all.
     //
-    // Dynamic scheduling with an explicit worker count, not parallel_for:
-    // there are only m (8-64) items, far below kParallelMin, so parallel_for
-    // would run them serially — and each item is a full k-means costing
-    // hundreds of milliseconds, which is exactly the coarse/uneven shape
-    // parallel_for_dynamic exists for. Using transient threads also keeps this
-    // callable from inside a pool worker.
-    util::parallel_for_dynamic(cfg.m, util::max_workers(), [&](std::size_t s) {
+    // Strided shares with an explicit count, not parallel_for: there are
+    // only m (8-64) items, far below kParallelMin, so parallel_for would run
+    // them serially — and each item is a full k-means costing hundreds of
+    // milliseconds, the coarse/uneven shape parallel_for_strided is for.
+    util::parallel_for_strided(cfg.split, cfg.m, cfg.split.width(), [&](std::size_t s) {
         // Gather this subspace's slice contiguously: the k-means inner loop
         // then walks it with unit stride instead of striding by `dim`.
         std::vector<float> sub(n * dsub);
@@ -194,7 +192,7 @@ void ProductQuantizer::encode_flat(std::span<const float> data, std::size_t n,
     if (dim_ == 0 || out.size() < n * cfg_.m) return;
     // Encoding is n independent nearest-centroid searches (m*ksub*dsub flops
     // each) writing to disjoint output rows — embarrassingly parallel.
-    util::parallel_for(n, [&](std::size_t i) {
+    util::parallel_for(cfg_.split, n, [&](std::size_t i) {
         encode_into(std::span<const float>(data.data() + i * dim_, dim_),
                     out.subspan(i * cfg_.m, cfg_.m));
     });

@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <thread>
 
 #include <nlohmann/json.hpp>
 
@@ -117,9 +116,9 @@ Result<OnnxReranker> OnnxReranker::load(dense::LocalEmbedderConfig cfg) {
     auto& im = *r.impl_;
     im.cfg = std::move(cfg);
     if (!im.cfg.identity_tag.empty()) im.id = im.cfg.identity_tag;
-    int threads = im.cfg.threads > 0 ? im.cfg.threads
-                : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
-    im.opts.SetIntraOpNumThreads(threads);
+    // 0 lets onnxruntime size its own intra-op pool (it uses the core
+    // count); the host can pin it with cfg.threads.
+    im.opts.SetIntraOpNumThreads(im.cfg.threads > 0 ? im.cfg.threads : 0);
     im.opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     try {
         auto tk = dense::WordPieceTokenizer::load(im.cfg.tokenizer_path);

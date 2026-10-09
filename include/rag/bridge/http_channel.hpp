@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "rag/bridge/channel.hpp"
-#include "rag/dense/embedder.hpp"   // HttpTransport, default_http_transport
+#include "rag/dense/embedder.hpp"   // HttpTransport
 #include "rag/core/types.hpp"
 
 namespace rag::bridge {
@@ -31,7 +31,7 @@ struct HttpChannelConfig {
 class HttpChannel final : public Channel {
 public:
     explicit HttpChannel(HttpChannelConfig cfg,
-                         std::shared_ptr<dense::HttpTransport> tp = dense::default_http_transport())
+                         std::shared_ptr<dense::HttpTransport> tp)
         : cfg_(std::move(cfg)), tp_(std::move(tp)) {}
 
     [[nodiscard]] Result<Json> call(std::string_view method, const Json& params) override {

@@ -3,7 +3,7 @@
 
 #include "rag/bridge/bridge.hpp"
 
-#include "rag/plugin/registry.hpp"
+#include "rag/plugin/builder.hpp"
 #include "rag/dense/embedder.hpp"
 #include "rag/rerank/reranker.hpp"
 
@@ -12,7 +12,7 @@
 
 namespace rag::bridge {
 
-Result<std::shared_ptr<Channel>> open_channel(const Json& spec) {
+Result<std::shared_ptr<Channel>> open_channel(const Json& spec, const plugin::HostIo& io) {
     if (!spec.is_object())
         return fail<std::shared_ptr<Channel>>(Errc::invalid_argument,
                                               "channel spec must be an object");
@@ -25,16 +25,20 @@ Result<std::shared_ptr<Channel>> open_channel(const Json& spec) {
     }
 
     if (transport == "process" || transport == "subprocess") {
-        ProcessConfig cfg;
+        if (!io.spawn)
+            return fail<std::shared_ptr<Channel>>(Errc::unavailable,
+                "process transport: the host runs no processes for rag");
+        ProcessSpec cfg;
         if (auto it = spec.find("argv"); it != spec.end() && it->is_array())
             for (const auto& a : *it) if (a.is_string()) cfg.argv.push_back(a.get<std::string>());
         if (auto it = spec.find("env"); it != spec.end() && it->is_array())
             for (const auto& e : *it) if (e.is_string()) cfg.env.push_back(e.get<std::string>());
         cfg.cwd  = spec.value("cwd", std::string{});
         cfg.name = spec.value("name", std::string{});
-        auto ch = ProcessChannel::spawn(std::move(cfg));
-        if (!ch) return std::unexpected(ch.error());
-        return std::shared_ptr<Channel>(*ch);
+        if (cfg.argv.empty())
+            return fail<std::shared_ptr<Channel>>(Errc::invalid_argument, "process transport: empty argv");
+        if (cfg.name.empty()) cfg.name = cfg.argv.front();
+        return io.spawn(cfg);
     }
 
     if (transport == "http" || transport == "rest") {
@@ -47,7 +51,10 @@ Result<std::shared_ptr<Channel>> open_channel(const Json& spec) {
         if (auto it = spec.find("headers"); it != spec.end() && it->is_object())
             for (const auto& [k, v] : it->items())
                 if (v.is_string()) cfg.headers.emplace_back(k, v.get<std::string>());
-        return std::shared_ptr<Channel>(std::make_shared<HttpChannel>(std::move(cfg)));
+        if (!io.http)
+            return fail<std::shared_ptr<Channel>>(Errc::unavailable,
+                "http transport: the host provides no HTTP for rag");
+        return std::shared_ptr<Channel>(std::make_shared<HttpChannel>(std::move(cfg), io.http));
     }
 
     return fail<std::shared_ptr<Channel>>(Errc::not_found,
@@ -63,16 +70,16 @@ using ::rag::rerank::AnyReranker;
 // One factory body shared by "process" and "http": open the channel from the
 // same spec, then wrap it. `dim` is required for an embedder (the peer's output
 // width) — default 768 if omitted.
-Result<AnyEmbedder> make_remote_embedder(const Json& c) {
-    auto ch = open_channel(c);
+Result<AnyEmbedder> make_remote_embedder(const Json& c, const plugin::Registries& all) {
+    auto ch = open_channel(c, all.io);
     if (!ch) return std::unexpected(ch.error());
     std::size_t dim = c.value("dim", std::size_t{768});
     std::string id  = c.value("name", std::string{"remote-embed"});
     return AnyEmbedder{RemoteEmbedder{std::move(*ch), dim, std::move(id)}};
 }
 
-Result<AnyReranker> make_remote_reranker(const Json& c) {
-    auto ch = open_channel(c);
+Result<AnyReranker> make_remote_reranker(const Json& c, const plugin::Registries& all) {
+    auto ch = open_channel(c, all.io);
     if (!ch) return std::unexpected(ch.error());
     std::string id = c.value("name", std::string{"remote-rerank"});
     return AnyReranker{RemoteReranker{std::move(*ch), std::move(id)}};
@@ -80,23 +87,17 @@ Result<AnyReranker> make_remote_reranker(const Json& c) {
 
 } // namespace
 
-void ensure_bridge_registered() noexcept {
-    static const bool once = [] {
-        auto& er = plugin::Registry<AnyEmbedder>::instance();
-        const std::string emb_desc =
-            "out-of-process embedder over a bridge (keys: cmd/args for process, url for http/rest)";
-        er.register_described("process", make_remote_embedder, emb_desc);
-        er.register_described("http",    make_remote_embedder, emb_desc);
-        er.register_described("rest",    make_remote_embedder, emb_desc);
-        auto& rr = plugin::Registry<AnyReranker>::instance();
-        const std::string rr_desc =
-            "out-of-process reranker over a bridge (keys: cmd/args for process, url for http/rest)";
-        rr.register_described("process", make_remote_reranker, rr_desc);
-        rr.register_described("http",    make_remote_reranker, rr_desc);
-        rr.register_described("rest",    make_remote_reranker, rr_desc);
-        return true;
-    }();
-    (void)once;
+void register_bridge(plugin::Registries& r) {
+    const std::string emb_desc =
+        "out-of-process embedder over a bridge (keys: cmd/args for process, url for http/rest)";
+    for (const char* name : {"process", "http", "rest"})
+        r.embedders.register_described(name,
+            make_remote_embedder, emb_desc);
+    const std::string rr_desc =
+        "out-of-process reranker over a bridge (keys: cmd/args for process, url for http/rest)";
+    for (const char* name : {"process", "http", "rest"})
+        r.rerankers.register_described(name,
+            make_remote_reranker, rr_desc);
 }
 
 } // namespace rag::bridge

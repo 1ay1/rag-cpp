@@ -16,8 +16,8 @@
 //   • Serialization — adjacency lists + normalized vectors persist to a blob;
 //     re-opening a corpus does not rebuild the graph.
 
+#include "rag/util/parallel.hpp"
 #include <cstdint>
-#include <atomic>
 #include <functional>
 #include <random>
 #include <span>
@@ -33,6 +33,8 @@
 namespace rag::index {
 
 struct HnswConfig {
+    // How build/seal split their parallel work (empty: inline). Not saved.
+    util::Splitter split;
     std::size_t M               = 16;    // max neighbours per node (base layer 2M)
     std::size_t ef_construction = 200;   // beam width during insert
     // Default beam width during query; overridable per call (see search()).
@@ -288,6 +290,11 @@ public:
     [[nodiscard]] std::string serialize() const;
     [[nodiscard]] static Result<HnswIndex> deserialize(std::string_view blob);
 
+    // Freeze the graph for reading: build the CSR mirror of the adjacency
+    // and the quantized codes. Idempotent; search() calls it, and an owner
+    // that wants concurrent searches calls it once first.
+    void seal() const;
+
 private:
     // Node payload WITHOUT the vector. Vectors live in a flat arena (`store_`)
     // rather than one std::vector<float> per node, because the graph walk is
@@ -307,24 +314,6 @@ private:
         std::vector<std::uint64_t> bits;    // sign code (binary mode)
         std::vector<std::vector<std::uint32_t>> links;  // links[layer]
     };
-
-    // One spinlock per node, guarding that node's `links` during a concurrent
-    // build. A spinlock (not a mutex) because the critical section is a few
-    // dozen nanoseconds — sorting at most 2M neighbour ids — and contention is
-    // rare: two threads must pick the same neighbour in the same layer.
-    // Held in a separate array so Node stays trivially movable/serializable.
-    struct alignas(64) NodeLock {                 // cache-line padded: no false sharing
-        std::atomic_flag flag = ATOMIC_FLAG_INIT;
-        void lock()   noexcept { while (flag.test_and_set(std::memory_order_acquire)) ; }
-        void unlock() noexcept { flag.clear(std::memory_order_release); }
-    };
-
-    // Non-null ONLY while build_batch's parallel phase 2 is running: points at
-    // that build's per-node lock array so concurrent readers (the phase-2
-    // searches) can snapshot adjacency under the same lock the writers hold.
-    // Set/cleared single-threaded at the phase boundaries; the parallel_for
-    // fork/join provides the happens-before for worker visibility.
-    mutable std::vector<NodeLock>* build_locks_ = nullptr;
 
     HnswConfig    cfg_{};
     std::size_t   dim_       = 0;
@@ -421,9 +410,6 @@ private:
     void ensure_id_index();
     mutable std::mt19937_64 rng_{cfg_.seed};
 
-    // Build the CSR mirror of `nodes_[].links`. Idempotent; cheap relative to
-    // the build that produced the graph (one pass to count, one to fill).
-    void seal() const;
     // Drop the CSR mirror because the graph is about to change.
     void unseal() noexcept {
         if (!sealed_) return;
@@ -476,14 +462,7 @@ private:
 
     // Neighbours of `n` in layer `L`, or {} if it does not reach that layer.
     // Reads the sealed CSR when available and falls back to the mutable
-    // vector-of-vectors during a build. During a CONCURRENT build (phase 2 of
-    // build_batch), writers mutate lk[L] under the per-node spinlock — so the
-    // reader takes the same lock and copies the adjacency into per-thread
-    // scratch. The copy is ≤ 2M+1 ids (≤132 B at M=16) under a few-ns
-    // spinlock; the previous lock-free read was a real data race on the
-    // vector's size (ASan container-overflow at search_layer_into, the
-    // source of the flaky 20-min CI hangs on libstdc++). Steady-state search
-    // (sealed CSR, or unsealed with no build running) is untouched.
+    // vector-of-vectors during a build.
     [[nodiscard]] std::span<const std::uint32_t>
     neighbours(std::uint32_t n, std::size_t L) const noexcept {
         if (sealed_) {
@@ -494,21 +473,15 @@ private:
         }
         const auto& lk = nodes_[n].links;
         if (L >= lk.size()) return {};
-        if (auto* locks = build_locks_) {
-            thread_local std::vector<std::uint32_t> snap;
-            auto& gate = (*locks)[n];
-            gate.lock();
-            snap.assign(lk[L].begin(), lk[L].end());
-            gate.unlock();
-            return {snap.data(), snap.size()};
-        }
         return {lk[L].data(), lk[L].size()};
     }
 
     // search_layer writes its result into caller-provided scratch instead of
     // returning a fresh vector: at ef_search=64 the return allocation was a
     // per-query malloc/free pair on the hottest path in the library.
-    void search_layer_into(std::span<const float> q, std::span<const std::uint64_t> q_bits,
+    struct Scratch;
+    void search_layer_into(Scratch& sc,
+                           std::span<const float> q, std::span<const std::uint64_t> q_bits,
                            std::span<const std::int8_t> q8,
                            std::span<const float> adc,
                            std::uint32_t entry, int layer, std::size_t ef,
@@ -517,9 +490,12 @@ private:
     search_layer(std::span<const float> q, std::span<const std::uint64_t> q_bits,
                  std::uint32_t entry, int layer, std::size_t ef) const;
     void connect(std::uint32_t node, int layer, std::vector<std::uint32_t> neighbours);
+    [[nodiscard]] std::vector<std::uint32_t> select_links(std::uint32_t node, int layer,
+                                                          const std::vector<std::uint32_t>& cands) const;
+    void link(std::uint32_t node, int layer, std::vector<std::uint32_t> links);
 
     // Score `cands` against node `n` and sort best-first into `out`, computing
-    // each similarity exactly once. Shared by connect() and connect_locked().
+    // each similarity exactly once.
     void score_and_sort(std::uint32_t node,
                         const std::vector<std::uint32_t>& cands,
                         std::vector<std::pair<float, std::uint32_t>>& out) const;
@@ -528,19 +504,14 @@ private:
     // produced (SQ8 integer or float dot, whichever is in use).
     [[nodiscard]] float sim_nodes(std::uint32_t a, std::uint32_t b) const;
 
-    // connect() variant used during a concurrent build: takes the per-node
-    // spinlocks before mutating adjacency.
-    void connect_locked(std::uint32_t node, int layer,
-                        std::vector<std::uint32_t> neighbours,
-                        std::vector<NodeLock>& locks);
-
     // ── Search scratch ───────────────────────────────────────────────────────
     // search_layer is the hottest function in the index: it runs on every hop
     // of every insert and every query. Allocating a visited-set and two heaps
-    // per call dominated its cost. Instead each thread keeps a persistent
-    // scratch block: an epoch-stamped visited array (O(1) clear — bump the
-    // epoch instead of rewriting n bytes) and vector-backed heaps that keep
-    // their capacity across calls.
+    // per call dominated its cost. Instead a search reuses a scratch block: an
+    // epoch-stamped visited array (O(1) clear — bump the epoch instead of
+    // rewriting n bytes) and vector-backed heaps that keep their capacity
+    // across calls. Queries use the index's own (the owner serializes them);
+    // each share of a parallel build has its own.
     struct Scratch {
         std::vector<std::uint32_t> visit_epoch;   // per-node last-seen epoch
         std::uint32_t             epoch = 0;
@@ -567,12 +538,7 @@ private:
             return true;
         }
     };
-    // thread_local so concurrent queries and parallel inserts each get their
-    // own scratch without locking or per-call allocation.
-    static Scratch& scratch() {
-        static thread_local Scratch s;
-        return s;
-    }
+    mutable Scratch scratch_;
 
     // Final-ranking score for one candidate, on the most precise
     // representation still resident. Declared after Scratch because it takes

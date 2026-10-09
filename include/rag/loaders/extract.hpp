@@ -8,9 +8,10 @@
 //      at all -- see ooxml.hpp for why that is worth doing rather than linking
 //      a stack of libraries.
 //
-//   2. AN EXTERNAL TOOL OWNS IT. Legacy binary Office (.doc/.xls/.ppt), RTF,
-//      EPUB, and PDF are extracted by shelling out to a converter if one is
-//      installed. These formats are genuinely large -- the .doc OLE compound
+//   2. AN EXTERNAL TOOL OWNS IT. Legacy binary Office (.doc/.xls/.ppt) and
+//      PDF are extracted by a converter program (pdftotext, antiword, …) if
+//      one is installed. rag-cpp starts no processes: the host runs the
+//      converter through Extractors::run. These formats are genuinely large -- the .doc OLE compound
 //      binary format is a filesystem inside a file, and a half-working parser
 //      for it is worse than none, because it produces plausible garbage that
 //      silently poisons an index.
@@ -24,12 +25,15 @@
 // condition. A caller cannot handle an index quietly full of mojibake, because
 // nothing surfaces the problem until retrieval has been bad for a month.
 //
-// The registry below is the extension point. Register a handler for any
-// extension (including one nobody has heard of) and every loader path picks it
-// up: load_file, load_directory, and the CLI.
+// Extractors (below) is the extension point: a value the caller builds and
+// passes to load_file / load_directory. Add a handler for any extension
+// (including one nobody has heard of) and every loader path that gets the
+// value picks it up.
 
 #include <filesystem>
 #include <functional>
+#include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -52,22 +56,49 @@ struct ExtractResult {
     std::string tool;      // which external tool produced it, when applicable
 };
 
+// Runs a converter program and returns its stdout, or nullopt only if it
+// could not start (not installed). A non-zero exit still returns what it
+// printed. argv[0] is the program name. The host implements it (agentty: its
+// sandboxed exec); rag-cpp never spawns.
+using RunFn = std::function<std::optional<std::string>(const std::vector<std::string>& argv)>;
+
+using ExtractFn = std::function<Result<std::string>(std::string_view bytes)>;
+
+// How files become text: the custom extractors and the way to run converter
+// programs. Default-constructed, it handles every in-process format and
+// reports the external ones as unavailable.
+struct Extractors {
+    RunFn run;   // empty: no converters
+
+    // A handler for `extension` (".acmerpt"). Registering an extension that
+    // already has a handler REPLACES it, which lets a caller override the
+    // built-in path for a format with a better one.
+    void add(std::string extension, ExtractFn fn, std::string description = {});
+
+    // Names of every custom extractor, for diagnostics.
+    [[nodiscard]] std::vector<std::string> custom() const;
+
+    struct Custom { ExtractFn fn; std::string desc; };
+    std::map<std::string, Custom, std::less<>> customs;
+};
+
 // Extract text from bytes already in memory. `hint` is a filename or extension
 // used only to pick a handler; content sniffing wins when the two disagree,
 // because a renamed file is common and a lying extension should not corrupt an
 // index. Pass "" when you have no hint at all.
-[[nodiscard]] Result<ExtractResult> extract_bytes(std::string_view bytes, std::string_view hint = {});
+[[nodiscard]] Result<ExtractResult> extract_bytes(std::string_view bytes, std::string_view hint = {},
+                                                  const Extractors& ex = {});
 
-// Extract text from a path. Uses extract_bytes for formats we own, and invokes
-// the external converter for those we do not.
-[[nodiscard]] Result<ExtractResult> extract_file(const std::filesystem::path& path);
+// Extract text from a path. Uses extract_bytes for formats we own, and runs
+// the external converter (through ex.run) for those we do not.
+[[nodiscard]] Result<ExtractResult> extract_file(const std::filesystem::path& path,
+                                                 const Extractors& ex = {});
 
 // ─── Capability reporting ─────────────────────────────────────────────────────
 //
 // "Does this build actually support .doc?" is a question worth being able to
 // answer before ingesting ten thousand files and finding out. `capabilities()`
-// probes for the external tools and reports honestly.
-
+// asks ex.run for each converter and reports honestly.
 struct FormatSupport {
     std::string extension;
     ExtractKind kind = ExtractKind::unknown;
@@ -75,26 +106,6 @@ struct FormatSupport {
     std::string requires_tool;     // "" for native formats
     std::string note;
 };
-
-[[nodiscard]] std::vector<FormatSupport> capabilities();
-
-// Is `tool` runnable on this machine? Cached after the first probe.
-[[nodiscard]] bool tool_available(std::string_view tool);
-
-// ─── Custom extractors ────────────────────────────────────────────────────────
-//
-// The escape hatch for a format that is internal to one company: a proprietary
-// report container, an instrument's binary log, a message archive with an
-// in-house schema. Register once at startup and every ingest path can read it.
-//
-// Handlers receive the raw bytes and return plain text. Registering an
-// extension that already has a handler REPLACES it, which is deliberate: it
-// lets a caller override the built-in PDF path with a better one.
-using ExtractFn = std::function<Result<std::string>(std::string_view bytes)>;
-
-void register_extractor(std::string extension, ExtractFn fn, std::string description = {});
-
-// Names of every registered custom extractor, for diagnostics.
-[[nodiscard]] std::vector<std::string> custom_extractors();
+[[nodiscard]] std::vector<FormatSupport> capabilities(const Extractors& ex = {});
 
 } // namespace rag::loaders

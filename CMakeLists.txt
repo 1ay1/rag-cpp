@@ -79,14 +79,6 @@ file(GLOB_RECURSE RAGCPP_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/
 # the glob must not pull them in when the corresponding option is off, or the
 # build fails on a machine with no OpenCL headers.
 list(REMOVE_ITEM RAGCPP_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/opencl_backend.cpp")
-# src/bridge/process.cpp is the subprocess Channel behind open_channel()'s
-# `"transport":"process"`. It USED to be dropped from the glob on WIN32 because
-# it was POSIX-only (fork/exec, <sys/wait.h>) — but src/bridge/register.cpp calls
-# ProcessChannel::spawn() and is always compiled, so removing the TU just moved
-# the failure from compile time to link time ('undefined reference to
-# rag::bridge::ProcessChannel::spawn'), and only in downstream executables.
-# It now carries a CreateProcess backend, so it builds everywhere. Do not
-# re-add an exclusion here without also stubbing the transport in register.cpp.
 
 add_library(ragcpp ${RAGCPP_SOURCES})
 add_library(ragcpp::ragcpp ALIAS ragcpp)
@@ -100,12 +92,6 @@ target_link_libraries(ragcpp PUBLIC nlohmann_json::nlohmann_json)
 
 # The plugin loader uses dlopen/dlsym (POSIX) — link the platform's dl library.
 target_link_libraries(ragcpp PUBLIC ${CMAKE_DL_LIBS})
-
-# The HTTP transport uses Winsock on Windows. mingw does not honour MSVC's
-# `#pragma comment(lib, ...)`, so link ws2_32 explicitly here.
-if(WIN32)
-    target_link_libraries(ragcpp PUBLIC ws2_32)
-endif()
 
 # ── Optional in-process embedder backends ────────────────────────────────────
 # Pin the ONNX Runtime version fetched when no system install is present.

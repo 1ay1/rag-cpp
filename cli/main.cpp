@@ -282,9 +282,10 @@ int cmd_info(const std::vector<std::string>& args) {
 // without reading source. A plugin dir can be loaded first so third-party names
 // show up too: `ragcpp list embedders --plugins=./plugins`.
 int cmd_list(const std::vector<std::string>& args) {
-    rag::plugin::ensure_builtins_registered();
+    auto regs = rag::plugin::Registries::builtin();
+    std::vector<rag::plugin::LoadedPlugin> plugins;
     if (std::string dir = opt(args, "--plugins", ""); !dir.empty())
-        (void)rag::plugin::load_plugin_dir(dir);
+        plugins = rag::plugin::load_plugin_dir(dir, regs);
 
     std::string which = args.empty() || args[0].rfind("--", 0) == 0 ? "" : args[0];
     auto dump = [](const char* title, auto&& rows) {
@@ -293,9 +294,9 @@ int cmd_list(const std::vector<std::string>& args) {
             std::printf("  %-14s %s\n", name.c_str(), desc.empty() ? "(no description)" : desc.c_str());
     };
     if (which.empty() || which == "embedders")
-        dump("embedders", rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().describe());
+        dump("embedders", regs.embedders.describe());
     if (which.empty() || which == "rerankers")
-        dump("rerankers", rag::plugin::Registry<rag::plugin::AnyReranker>::instance().describe());
+        dump("rerankers", regs.rerankers.describe());
     return 0;
 }
 

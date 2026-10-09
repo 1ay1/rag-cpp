@@ -11,6 +11,7 @@
 // pipeline is assembled at run time from a config. The hot inner scoring loops
 // they call (BM25, cosine, HNSW) remain non-virtual inside Corpus.
 
+#include "rag/util/parallel.hpp"
 #include <memory>
 #include <string>
 #include <string_view>
@@ -50,6 +51,8 @@ using StagePtr = std::shared_ptr<RetrievalStage>;
 // Hybrid retrieval: runs BM25 + dense (if available) and fuses with RRF/RSF.
 // This is normally the FIRST stage — it populates `candidates`.
 struct HybridRetrieveConfig {
+    // Runs lexical and dense side by side (empty: one after the other).
+    util::Splitter split;
     std::size_t candidate_k = 60;    // per-retriever pool before fusion
     float       bm25_weight = 1.0f;
     float       dense_weight = 1.0f;

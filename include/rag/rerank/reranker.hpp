@@ -69,7 +69,7 @@ struct CrossEncoderConfig {
 class CrossEncoderReranker {
 public:
     explicit CrossEncoderReranker(CrossEncoderConfig cfg,
-                                  std::shared_ptr<dense::HttpTransport> tp = dense::default_http_transport())
+                                  std::shared_ptr<dense::HttpTransport> tp)
         : cfg_(std::move(cfg)), tp_(std::move(tp)) {}
     [[nodiscard]] Result<std::vector<float>>
     rerank(std::string_view query, std::span<const std::string> passages) const;

@@ -19,7 +19,7 @@ namespace rag::index {
 
 using json = nlohmann::json;
 
-void Corpus::relink_meta() {
+void Corpus::relink_meta() const {
     for (auto& ch : chunks_)
         ch.meta = (ch.doc.get() < docs_.size()) ? &docs_[ch.doc.get()].meta : nullptr;
 }
@@ -50,15 +50,11 @@ void Corpus::move_from(Corpus&& o) {
 }
 
 Result<DocId> Corpus::add_document(std::string uri, std::string text, Metadata meta, std::string title) {
-    std::unique_lock lk(mu_);
     return add_document_locked(std::move(uri), std::move(text), std::move(meta), std::move(title));
 }
 
 Result<DocId> Corpus::upsert_document(std::string uri, std::string text, Metadata meta,
                                       std::string title) {
-    // ONE lock across find + remove + add, so two threads upserting the same
-    // uri cannot both miss and both insert.
-    std::unique_lock lk(mu_);
     if (!uri.empty())
         if (auto existing = find_by_uri_locked(uri))
             (void)remove_document_locked(*existing);
@@ -155,7 +151,6 @@ Result<DocId> Corpus::add_document_locked(std::string uri, std::string text, Met
 }
 
 Result<std::vector<DocId>> Corpus::add_documents(std::vector<DocInput> docs) {
-    std::unique_lock lk(mu_);   // taken ONCE for the whole batch
 
     // Group-commit the WAL up front: one durable append for all N documents
     // instead of N. We log first (before any mutation) for the same reason
@@ -195,17 +190,9 @@ Result<std::vector<DocId>> Corpus::add_documents(std::vector<DocInput> docs) {
 }
 
 void Corpus::ensure_linked() const {
-    // Double-checked: the common case is a clean corpus, where this is a single
-    // acquire read and no lock at all. Only the rare stale case pays for the
-    // mutex, and the re-check inside it stops two readers from both relinking.
-    // Atomic acquire/release (not a plain bool): the unlocked fast-path read
-    // races with the locked clear below, and the acquire must also see the
-    // relink's writes — TSan flagged the plain-bool version.
-    if (!meta_stale_.load(std::memory_order_acquire)) return;
-    std::lock_guard lk(lazy_mu_);
-    if (!meta_stale_.load(std::memory_order_relaxed)) return;
-    const_cast<Corpus*>(this)->relink_meta();
-    meta_stale_.store(false, std::memory_order_release);
+    if (!meta_stale_) return;
+    relink_meta();
+    meta_stale_ = false;
 }
 
 Result<void> Corpus::embed_pending() {
@@ -226,14 +213,15 @@ Result<void> Corpus::embed_pending() {
     // latency-bound (hint 8) — see dense::ConcurrencyAware.
     const std::size_t workers = std::min(embedder_->max_concurrency(), nb);
 
-    // First failure wins; later batches short-circuit rather than pile up
-    // retries against a backend that is already known to be down.
-    std::atomic<bool> failed{false};
-    std::mutex        err_mu;
-    Error             first_err{};
+    // Each batch records its own outcome; the first failure in batch order
+    // is the one reported. A share skips its remaining batches once one of
+    // its own has failed, so a backend that is down isn't hammered.
+    std::vector<std::optional<Error>> errs(nb);
+    const std::size_t shares = workers <= 1 ? 1 : workers;
+    std::vector<char> share_failed(shares, 0);
 
     auto run_batch = [&](std::size_t b) {
-        if (failed.load(std::memory_order_relaxed)) return;
+        if (share_failed[b % shares]) return;
         const std::size_t off = b * bs;
         const std::size_t end = std::min(off + bs, pending.size());
         std::vector<std::string> batch;
@@ -242,8 +230,8 @@ Result<void> Corpus::embed_pending() {
 
         auto res = embedder_->embed(batch);
         if (!res) {
-            std::lock_guard lk(err_mu);
-            if (!failed.exchange(true, std::memory_order_acq_rel)) first_err = res.error();
+            errs[b] = res.error();
+            share_failed[b % shares] = 1;
             return;
         }
         auto& vecs = *res;
@@ -254,14 +242,14 @@ Result<void> Corpus::embed_pending() {
     if (workers <= 1)
         for (std::size_t b = 0; b < nb; ++b) run_batch(b);
     else
-        util::parallel_for_dynamic(nb, workers, run_batch);
+        util::parallel_for_strided(cfg_.split, nb, workers, run_batch);
 
-    if (failed.load(std::memory_order_acquire)) return std::unexpected(first_err);
+    for (auto& e : errs)
+        if (e) return std::unexpected(std::move(*e));
     return {};
 }
 
 Result<void> Corpus::build() {
-    std::unique_lock lk(mu_);
     return build_locked();
 }
 
@@ -272,7 +260,9 @@ Result<void> Corpus::build_locked() {
         if (auto r = embed_pending(); !r) return r;  // degrade: propagate, caller may ignore
         // Build HNSW past threshold.
         if (chunks_.size() >= cfg_.hnsw_threshold) {
-            HnswIndex idx(cfg_.hnsw);
+            auto hc = cfg_.hnsw;
+            if (hc.split.inline_only()) hc.split = cfg_.split;
+            HnswIndex idx(hc);
             // Collect the embedded chunks, then construct the graph in parallel.
             // build_batch stages all nodes first and links them across every
             // core — the dominant cost of indexing a large corpus.
@@ -337,19 +327,13 @@ std::string Corpus::Explanation::summary() const {
 }
 
 Corpus::Explanation Corpus::explain(std::string_view query, ChunkId id) const {
-    std::shared_lock lk(mu_);
     ensure_linked();
     Explanation e;
     e.chunk = id;
 
     // finalize() is a lazy read-path repair elsewhere; explain() must see the
     // same idf/avgdl the scorer would, or its numbers would not match a search.
-    // Same double-checked lazy_mu_ dance as lexical_search_locked, and for the
-    // same reason: this is a write under a shared lock.
-    if (!bm25_.finalized()) {
-        std::lock_guard lz(lazy_mu_);
-        if (!bm25_.finalized()) const_cast<Corpus*>(this)->bm25_.finalize();
-    }
+    if (!bm25_.finalized()) bm25_.finalize();
 
     auto terms = bm25_.tokenizer().tokenize(query);
     std::sort(terms.begin(), terms.end());
@@ -378,7 +362,6 @@ Corpus::Explanation Corpus::explain(std::string_view query, ChunkId id) const {
 }
 
 void Corpus::ensure_packed() const {
-    std::lock_guard lz(lazy_mu_);
     if (packed_valid_ && packed_epoch_ == epoch_) return;
 
     packed_.clear();
@@ -415,7 +398,6 @@ void Corpus::ensure_packed() const {
 Result<std::vector<std::vector<Hit>>>
 Corpus::dense_search_batch(std::span<const std::string> queries, std::size_t k,
                            const MetaFilter& filter) const {
-    std::shared_lock lk(mu_);
     // Empty in, empty out — checked BEFORE the embedder, because asking zero
     // questions is not a question a missing embedder can fail to answer.
     if (queries.empty()) return std::vector<std::vector<Hit>>{};
@@ -433,7 +415,7 @@ Corpus::dense_search_batch(std::span<const std::string> queries, std::size_t k,
         const std::size_t dim = packed_dim_;
         const std::size_t nq  = queries.size();
 
-        if (n > 0 && dim > 0 && gpu::available() && nq * n * dim >= gpu::min_batch_work()) {
+        if (n > 0 && dim > 0 && cfg_.use_gpu && gpu::available() && nq * n * dim >= gpu::min_batch_work()) {
             // Embed every query first; a partial batch is not worth salvaging.
             std::vector<float> qmat;
             qmat.reserve(nq * dim);
@@ -480,8 +462,14 @@ Corpus::dense_search_batch(std::span<const std::string> queries, std::size_t k,
     return out;
 }
 
+void Corpus::prepare_read() const {
+    ensure_linked();
+    if (!bm25_.finalized()) bm25_.finalize();
+    if (hnsw_) hnsw_->seal();
+    else if (embedder_) ensure_packed();
+}
+
 std::vector<Hit> Corpus::lexical_search(std::string_view query, std::size_t k) const {
-    std::shared_lock lk(mu_);
     return lexical_search_locked(query, k);
 }
 
@@ -490,14 +478,7 @@ std::vector<Hit> Corpus::lexical_search_locked(std::string_view query, std::size
     // a caller may therefore query without an intervening build(). finalize()
     // is idempotent and pure in the accumulated counts, so bringing it up to
     // date here is both cheap and correct.
-    //
-    // It is also a WRITE performed under a shared lock, so it needs lazy_mu_:
-    // without it two concurrent readers would finalize the same index at the
-    // same time. Double-checked, so a finalized index costs one bool read.
-    if (!bm25_.finalized()) {
-        std::lock_guard lz(lazy_mu_);
-        if (!bm25_.finalized()) const_cast<Corpus*>(this)->bm25_.finalize();
-    }
+    if (!bm25_.finalized()) bm25_.finalize();
     if (deleted_docs_.empty()) return bm25_.search(query, k);
     // Over-fetch, then drop tombstoned chunks and truncate to k.
     auto hits = bm25_.search(query, k + deleted_docs_.size() * 2 + k);
@@ -513,7 +494,6 @@ std::vector<Hit> Corpus::lexical_search_locked(std::string_view query, std::size
 }
 
 Result<void> Corpus::remove_document(DocId id) {
-    std::unique_lock lk(mu_);
     return remove_document_locked(id);
 }
 
@@ -538,11 +518,9 @@ Result<void> Corpus::remove_document_locked(DocId id) {
 }
 
 bool Corpus::is_deleted(DocId id) const noexcept {
-    std::shared_lock lk(mu_);
     return deleted_docs_.count(id.get()) != 0;
 }
 std::size_t Corpus::live_document_count() const noexcept {
-    std::shared_lock lk(mu_);
     return docs_.size() - deleted_docs_.size();
 }
 
@@ -560,7 +538,6 @@ Result<Vector> Corpus::embed_text(const std::string& text) const {
 
 Result<std::vector<Hit>> Corpus::dense_search(std::string_view query, std::size_t k,
                                               const MetaFilter& filter) const {
-    std::shared_lock lk(mu_);
     return dense_search_locked(query, k, filter);
 }
 
@@ -627,9 +604,9 @@ Result<std::vector<Hit>> Corpus::dense_search_locked(std::string_view query, std
         const std::size_t dim = packed_dim_;
         const float*      base = packed_.data();
         const float*      q    = qv->data();
-        std::vector<std::vector<Hit>> parts(util::block_count(np));
+        std::vector<std::vector<Hit>> parts(util::block_count(cfg_.split, np));
 
-        util::parallel_blocks(np, [&](std::size_t lo, std::size_t hi, std::size_t b) {
+        util::parallel_blocks(cfg_.split, np, [&](std::size_t lo, std::size_t hi, std::size_t b) {
             auto& local = parts[b];
             local.reserve((hi - lo) / 4 + 8);
             for (std::size_t r = lo; r < hi; ++r) {
@@ -657,9 +634,9 @@ Result<std::vector<Hit>> Corpus::dense_search_locked(std::string_view query, std
 
     // AoS fallback: ragged/mixed-dimension corpus that packed nothing.
     const std::size_t n = chunks_.size();
-    std::vector<std::vector<Hit>> parts(util::block_count(n));
+    std::vector<std::vector<Hit>> parts(util::block_count(cfg_.split, n));
 
-    util::parallel_blocks(n, [&](std::size_t lo, std::size_t hi, std::size_t b) {
+    util::parallel_blocks(cfg_.split, n, [&](std::size_t lo, std::size_t hi, std::size_t b) {
         auto& local = parts[b];
         local.reserve((hi - lo) / 4 + 8);
         for (std::size_t i = lo; i < hi; ++i) {
@@ -685,7 +662,6 @@ Result<std::vector<Hit>> Corpus::dense_search_locked(std::string_view query, std
 }
 
 const Chunk* Corpus::chunk(ChunkId id) const {
-    std::shared_lock lk(mu_);
     return chunk_locked(id);
 }
 const Chunk* Corpus::chunk_locked(ChunkId id) const {
@@ -693,7 +669,6 @@ const Chunk* Corpus::chunk_locked(ChunkId id) const {
     return id.get() < chunks_.size() ? &chunks_[id.get()] : nullptr;
 }
 const Document* Corpus::document(DocId id) const {
-    std::shared_lock lk(mu_);
     return document_locked(id);
 }
 const Document* Corpus::document_locked(DocId id) const {
@@ -701,7 +676,6 @@ const Document* Corpus::document_locked(DocId id) const {
 }
 
 std::optional<DocId> Corpus::find_by_uri(std::string_view uri) const {
-    std::shared_lock lk(mu_);
     return find_by_uri_locked(uri);
 }
 
@@ -715,7 +689,6 @@ std::optional<DocId> Corpus::find_by_uri_locked(std::string_view uri) const {
 }
 
 SearchResult Corpus::resolve(const Hit& h) const {
-    std::shared_lock lk(mu_);
     return resolve_locked(h);
 }
 
@@ -731,7 +704,6 @@ SearchResult Corpus::resolve_locked(const Hit& h) const {
 }
 
 bool Corpus::passes(ChunkId id, const MetaFilter& f) const {
-    std::shared_lock lk(mu_);
     return passes_locked(id, f);
 }
 
@@ -747,67 +719,16 @@ bool Corpus::passes_locked(ChunkId id, const MetaFilter& f) const {
 // BM25 (inverted index), HNSW (ANN graph). CRC-verified on load.
 // ─────────────────────────────────────────────────────────────────────────────
 Result<void> Corpus::save(const std::string& path) const {
-    // save() splits into two phases that want very different lock treatment.
-    //
-    //   1. SNAPSHOT — walk docs_/chunks_/bm25_/hnsw_ and pack them into section
-    //      blobs. This touches corpus state, so it must hold a lock, and the
-    //      lock is what makes the snapshot consistent: no document can be
-    //      appended halfway through serializing the arrays.
-    //
-    //   2. WRITE — concatenate those blobs, CRC the result, write it to a temp
-    //      file, fsync, rename, fsync the directory. This touches NO corpus
-    //      state whatsoever; the Container owns its own copies.
-    //
-    // Phase 2 is the expensive one — measured on a 20k-doc corpus it is ~24 of
-    // the ~28 ms, almost all of it CRC and the big concatenating copy — and it
-    // used to run with the shared lock still held. Readers did not care (they
-    // share it too), but every WRITER blocked for the whole thing: an
-    // add_document() concurrent with a save loop measured 6.0 ms mean against
-    // 0.001 ms uncontended. Dropping the lock between the phases takes that
-    // stall down to just the snapshot.
-    store::Container snap;
-    std::uint64_t    at_epoch = 0;
-    {
-        std::shared_lock lk(mu_);
-        auto s = snapshot_locked();
-        if (!s) return std::unexpected(s.error());
-        snap     = std::move(*s);
-        at_epoch = epoch_;
-    }
-
-    // PUBLISH, in epoch order.
-    //
-    // Splitting the phases means two concurrent save()s can interleave as:
-    // A snapshots at epoch 10, B snapshots at epoch 20, B renames, A renames —
-    // and the file on disk goes BACKWARDS to epoch 10.
-    //
-    // This is rare but real, and it took an honest harness to see it. A loop
-    // that loads the file while savers and a writer run showed nothing at all
-    // with 3-8 savers on 8 cores: the savers stay roughly in lockstep, so their
-    // renames happen to come out in snapshot order. Only when the savers are
-    // OVERSUBSCRIBED (16 and 32 threads on 8 cores, so the scheduler preempts
-    // one between its snapshot and its rename) does the on-disk doc count go
-    // backwards — 2 and 4 times per 300 loads. With this gate: 0, at 16, 32 and
-    // 64 savers.
-    //
-    // The rename is therefore serialized and gated on the epoch that last
-    // reached this path. A snapshot that lost the race is DROPPED, not written:
-    // its content is a strict prefix of what is already there, so discarding it
-    // loses nothing, and reporting success is honest — the caller asked for the
-    // state at their save() call to be durable, and a newer state that contains
-    // it is on disk.
-    auto& st = path_state(path);
-    std::lock_guard pk(st.mu);
-    if (st.any && st.published > at_epoch) return {};
-    if (auto r = snap.write_file(path); !r) return r;
-    st.published = at_epoch;
-    st.any       = true;
-    return {};
+    // Snapshot the sections, then write them (temp file, fsync, rename,
+    // fsync the directory). The Container owns its copies, so the write
+    // touches no corpus state.
+    auto snap = snapshot_locked();
+    if (!snap) return std::unexpected(snap.error());
+    return snap->write_file(path);
 }
 
 // ─── Write-ahead log ────────────────────────────────────────────────────
 Result<void> Corpus::open_wal(const std::string& path, store::SyncMode mode) {
-    std::unique_lock lk(mu_);
 
     // REPLAY FIRST, then open for appending.
     //
@@ -847,41 +768,22 @@ Result<void> Corpus::open_wal(const std::string& path, store::SyncMode mode) {
 }
 
 bool Corpus::has_wal() const noexcept {
-    std::shared_lock lk(mu_);
     return wal_.is_open();
 }
 
 std::uint64_t Corpus::wal_bytes() const noexcept {
-    std::shared_lock lk(mu_);
     return wal_.size_bytes();
 }
 
 Result<void> Corpus::checkpoint(const std::string& path) {
-    // save() takes its own lock and does the snapshot/publish dance, so it runs
-    // OUTSIDE the write lock here — taking mu_ around it would deadlock (mu_ is
-    // not recursive) and would also block writers for the whole serialization,
-    // which is exactly what the snapshot/publish split was built to avoid.
     if (auto s = save(path); !s) return s;
 
     // Only now is it safe to drop the log. save() has fsync'd the snapshot and
     // renamed it into place, so every record in the log is represented on disk.
     // Truncating first would leave a window in which a crash loses mutations
     // that were already acknowledged.
-    std::unique_lock lk(mu_);
     if (!wal_.is_open()) return {};
     return wal_.truncate();
-}
-
-Corpus::PathState& Corpus::path_state(const std::string& path) {
-    // The registry lock is held only long enough to find/insert the entry; the
-    // per-path lock — which is what the slow file I/O runs under — is taken by
-    // the caller. node-based map so references stay valid as it grows.
-    static std::mutex registry_mu;
-    static std::unordered_map<std::string, std::unique_ptr<PathState>> registry;
-    std::lock_guard lk(registry_mu);
-    auto& slot = registry[path];
-    if (!slot) slot = std::make_unique<PathState>();
-    return *slot;
 }
 
 Result<store::Container> Corpus::snapshot_locked() const {

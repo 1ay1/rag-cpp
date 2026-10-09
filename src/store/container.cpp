@@ -3,7 +3,6 @@
 #include "rag/store/container.hpp"
 
 #include <array>
-#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <filesystem>
@@ -152,16 +151,14 @@ Result<Container> Container::parse(std::string_view blob) {
 // rename itself is durable). Without the second one, a power loss can leave the
 // directory entry pointing at the old inode even though the data was written.
 Result<void> Container::write_file(const std::string& path) const {
-    // Temp name in the destination's directory, salted so two concurrent saves
-    // to the same path cannot collide on it.
+    // Temp name in the destination's directory, salted (pid + random) so two
+    // saves to the same path cannot collide on it.
     const auto slash = path.find_last_of('/');
     const std::string dir = (slash == std::string::npos) ? std::string(".")
                                                          : path.substr(0, slash);
-    static std::atomic<std::uint64_t> counter{0};
     std::random_device rd;
     const std::string tmp = path + ".tmp." + std::to_string(::getpid()) + "."
-                          + std::to_string(counter.fetch_add(1, std::memory_order_relaxed))
-                          + "." + std::to_string(rd());
+                          + std::to_string(rd()) + std::to_string(rd());
 
     const std::string blob = serialize();
     {

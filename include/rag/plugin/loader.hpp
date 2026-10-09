@@ -1,6 +1,20 @@
 #pragma once
 // rag/plugin/loader.hpp — load out-of-tree backends from shared libraries.
 //
+// A third party compiles a shared object that exports
+//
+//   extern "C" void rag_plugin_register(rag::plugin::Registries& regs);
+//
+// and registers its backends into `regs`. At runtime the host calls
+// `load_plugin("/path/to/libmyembedder.so", regs)` with its own copy of the
+// registries, and the plugin's names become usable by config — no recompile
+// of the app, no core change, and no global state: the backends land in the
+// registries the host passed. (Build plugins with the same compiler, flags and
+// rag headers as the host.)
+
+#pragma once
+// rag/plugin/loader.hpp — load out-of-tree backends from shared libraries.
+//
 // The registry (registry.hpp) lets a backend register itself by name; the
 // built-ins do so from src/plugin/builtins.cpp. This header closes the loop for
 // THIRD parties: they compile a shared object that contains RAG_REGISTER blocks
@@ -24,7 +38,7 @@
 #include <vector>
 
 #include "rag/core/types.hpp"
-#include "rag/plugin/registry.hpp"
+#include "rag/plugin/builder.hpp"
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -72,18 +86,18 @@ private:
 };
 
 // The optional explicit hook a plugin may export.
-using PluginRegisterFn = void (*)();
+using PluginRegisterFn = void (*)(Registries&);
 inline constexpr const char* kPluginRegisterSymbol = "rag_plugin_register";
 
 // Load one shared library. Its static initializers run immediately (convention
 // 1); if it exports `rag_plugin_register`, that is called too (convention 2).
-[[nodiscard]] inline Result<LoadedPlugin> load_plugin(std::string_view path) {
+[[nodiscard]] inline Result<LoadedPlugin> load_plugin(std::string_view path, Registries& regs) {
 #if defined(_WIN32)
     HMODULE h = ::LoadLibraryA(std::string(path).c_str());
     if (!h) return fail<LoadedPlugin>(Errc::not_found,
                                       "LoadLibrary failed for '" + std::string(path) + "'");
     if (auto sym = ::GetProcAddress(h, kPluginRegisterSymbol))
-        reinterpret_cast<PluginRegisterFn>(sym)();
+        reinterpret_cast<PluginRegisterFn>(sym)(regs);
     return LoadedPlugin{reinterpret_cast<void*>(h), std::string(path)};
 #else
     ::dlerror(); // clear
@@ -96,7 +110,7 @@ inline constexpr const char* kPluginRegisterSymbol = "rag_plugin_register";
     }
     ::dlerror();
     if (void* sym = ::dlsym(h, kPluginRegisterSymbol))
-        reinterpret_cast<PluginRegisterFn>(sym)();
+        reinterpret_cast<PluginRegisterFn>(sym)(regs);
     return LoadedPlugin{h, std::string(path)};
 #endif
 }
@@ -106,6 +120,6 @@ inline constexpr const char* kPluginRegisterSymbol = "rag_plugin_register";
 // dir is not an error (returns empty). Individual load failures are collected in
 // `errors` if provided, and skipped.
 [[nodiscard]] std::vector<LoadedPlugin>
-load_plugin_dir(std::string_view dir, std::vector<Error>* errors = nullptr);
+load_plugin_dir(std::string_view dir, Registries& regs, std::vector<Error>* errors = nullptr);
 
 } // namespace rag::plugin

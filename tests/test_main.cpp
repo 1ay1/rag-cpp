@@ -1,5 +1,6 @@
 // tests/test_main.cpp — a minimal, dependency-free test harness + all tests.
 
+#include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -21,6 +22,19 @@
 #include <rag/gpu/device.hpp>
 #include <rag/util/parallel.hpp>
 #include <rag/dense/wordpiece.hpp>   // header-only; pair encoding is testable w/o ONNX
+
+// The parallelism a host would hand in. rag-cpp has no threads of its own;
+// tests may. One thread per share, joined before returning.
+static rag::util::Splitter test_threads() {
+    const unsigned hc = std::max(2u, std::thread::hardware_concurrency());
+    return rag::util::Splitter(
+        [](std::size_t n, const std::function<void(std::size_t)>& fn) {
+            std::vector<std::jthread> ts;
+            for (std::size_t i = 1; i < n; ++i) ts.emplace_back([&fn, i] { fn(i); });
+            fn(0);
+        },
+        hc);
+}
 
 namespace {
 struct Case { std::string name; std::function<void()> fn; };
@@ -291,86 +305,6 @@ TEST(corpus_semantic_chunking_is_selectable) {
     CHECK(!hits.empty());
 }
 
-// ─── Concurrent readers + a writer must not corrupt the corpus ──────
-//
-// This is the shape `ragcpp serve --write` exposes: retrieve requests read the
-// corpus while index/add mutates it. Chunk::meta is a BORROWED pointer into
-// docs_[].meta, and add_document() push_backs into docs_ — reallocating and
-// freeing the storage every one of those pointers refers to. Before Corpus
-// took a lock, a 4-reader/1-writer harness of exactly this shape segfaulted on
-// every single run.
-TEST(corpus_survives_concurrent_readers_and_writer) {
-    rag::index::Corpus corpus;
-    for (int i = 0; i < 100; ++i)
-        REQUIRE(corpus.add_document("seed" + std::to_string(i),
-                                    "retrieval augmented generation vector index " + std::to_string(i),
-                                    {{"kind", "seed"}}).has_value());
-    REQUIRE(corpus.build().has_value());
-
-    std::atomic<bool> stop{false};
-    std::atomic<long> reads{0}, corrupt{0};
-
-    std::vector<std::thread> readers;
-    for (int t = 0; t < 4; ++t) {
-        readers.emplace_back([&] {
-            while (!stop.load(std::memory_order_relaxed)) {
-                for (const auto& h : corpus.lexical_search("retrieval vector", 5)) {
-                    auto r = corpus.resolve(h);
-                    // Every document was created with a non-empty uri. Anything
-                    // else means we read through a dangling pointer or a
-                    // half-constructed document.
-                    if (r.uri.empty()) corrupt.fetch_add(1, std::memory_order_relaxed);
-                }
-                reads.fetch_add(1, std::memory_order_relaxed);
-            }
-        });
-    }
-
-    for (int i = 0; i < 800; ++i)
-        (void)corpus.add_document("new" + std::to_string(i),
-                                  "newly indexed retrieval vector document " + std::to_string(i),
-                                  {{"kind", "new"}});
-    // The readers race the writer, but under heavy CPU contention (e.g. another
-    // benchmark saturating every core) the OS can schedule them out for the
-    // whole — fast — ingest, leaving reads==0. That is scheduler starvation, not
-    // a correctness failure: the property under test is "concurrent reads never
-    // observe a torn document", which is `corrupt == 0`. So give the readers a
-    // bounded chance to actually run at least once before declaring they did,
-    // rather than asserting on a count the scheduler controls.
-    for (int spin = 0; spin < 1000 && reads.load() == 0; ++spin)
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    stop = true;
-    for (auto& t : readers) t.join();
-
-    CHECK_EQ(corrupt.load(), 0L);
-    CHECK(reads.load() > 0);        // the readers really ran
-    CHECK_EQ(corpus.document_count(), std::size_t{900});
-}
-
-// Two concurrent READERS race each other even with no writer present, because
-// the const read path performs lazy repairs (relink_meta, bm25 finalize, hnsw
-// seal) — that laziness is what keeps bulk ingest from being quadratic. A
-// shared_mutex alone does not cover it; the repairs need their own lock.
-TEST(corpus_concurrent_readers_see_consistent_results) {
-    rag::index::Corpus corpus;
-    for (int i = 0; i < 200; ++i)
-        REQUIRE(corpus.add_document("d" + std::to_string(i),
-                                    "alpha beta gamma retrieval " + std::to_string(i)).has_value());
-    // Deliberately NOT calling build(): this leaves bm25 unfinalized so the
-    // first readers all race to finalize it on the read path.
-    std::vector<std::thread> ts;
-    std::atomic<long> mismatch{0};
-    std::size_t expected = corpus.lexical_search("alpha retrieval", 10).size();
-    for (int t = 0; t < 8; ++t)
-        ts.emplace_back([&] {
-            for (int i = 0; i < 200; ++i)
-                if (corpus.lexical_search("alpha retrieval", 10).size() != expected)
-                    mismatch.fetch_add(1, std::memory_order_relaxed);
-        });
-    for (auto& t : ts) t.join();
-    CHECK_EQ(mismatch.load(), 0L);
-}
-
 // ─── save() is crash-safe ───────────────────────────────────────
 //
 // Saving is a REPLACEMENT. Truncating the destination and writing into it means
@@ -446,81 +380,15 @@ TEST(tombstones_survive_save_load) {
     std::remove(path.c_str());
 }
 
-// ─── concurrent save()s never publish out of order ──────────────────────────
-//
-// save() serializes its snapshot under a shared lock and then writes+renames
-// with the lock RELEASED (so writers are not blocked for the whole file I/O).
-// That opens a window in which an older snapshot's rename can land after a
-// newer one's, moving the on-disk state backwards. Documents are only added
-// here, so the on-disk count must be monotonic.
-//
-// Savers are deliberately oversubscribed relative to cores: with only a few
-// they stay in lockstep and the reordering never shows up.
-TEST(concurrent_saves_never_move_the_file_backwards) {
-    const std::string path = test_temp_path("ragcpp_saveorder_test.ragdb");
-    std::remove(path.c_str());
-
-    rag::index::Corpus corpus;
-    for (int i = 0; i < 400; ++i)
-        REQUIRE(corpus.add_document("seed" + std::to_string(i), "seed document " + std::to_string(i)).has_value());
-    REQUIRE(corpus.build().has_value());
-    REQUIRE(corpus.save(path).has_value());
-
-    std::atomic<bool> stop{false};
-    const unsigned savers = std::max(4u, std::thread::hardware_concurrency() * 2);
-    std::vector<std::thread> ts;
-    for (unsigned t = 0; t < savers; ++t)
-        ts.emplace_back([&, t] {
-            std::this_thread::sleep_for(std::chrono::microseconds(37 * t));
-            while (!stop.load(std::memory_order_relaxed)) (void)corpus.save(path);
-        });
-    std::thread writer([&] {
-        for (int i = 0; i < 2000 && !stop.load(std::memory_order_relaxed); ++i)
-            (void)corpus.add_document("new" + std::to_string(i), "new document " + std::to_string(i));
-    });
-
-    std::size_t high_water = 0;
-    long regressions = 0, observed = 0;
-    for (int i = 0; i < 60; ++i) {
-        auto r = rag::index::Corpus::load(path);
-        if (!r) continue;                       // torn reads are write_file's job, tested above
-        const std::size_t n = r->document_count();
-        ++observed;
-        if (n < high_water) ++regressions;
-        else high_water = n;
-    }
-    stop = true;
-    writer.join();
-    for (auto& t : ts) t.join();
-
-    CHECK(observed > 0);
-    CHECK_EQ(regressions, 0L);
-    std::remove(path.c_str());
-}
-
-// Concurrent upserts of the SAME uri must never produce a duplicate — RCP
-// §7.10 requires an explicit id to replace, not duplicate. Spelling the upsert
-// as find-then-remove-then-add at the call site takes the lock three times, so
-// two threads can both observe "not present" and both insert.
-TEST(concurrent_upsert_of_same_uri_never_duplicates) {
-    rag::index::Corpus corpus;
-    constexpr int kThreads = 8, kRounds = 40;
-
-    std::vector<std::thread> ts;
-    for (int t = 0; t < kThreads; ++t)
-        ts.emplace_back([&, t] {
-            for (int i = 0; i < kRounds; ++i)
-                (void)corpus.upsert_document("shared-uri",
-                                             "revision from thread " + std::to_string(t));
-        });
-    for (auto& th : ts) th.join();
-
-    // Exactly one LIVE document may carry that uri, however many revisions were
-    // written. (Tombstoned predecessors still occupy slots, which is why this
-    // checks the live count rather than document_count().)
-    CHECK_EQ(corpus.live_document_count(), std::size_t{1});
-    auto found = corpus.find_by_uri("shared-uri");
-    CHECK(found.has_value());
+// An upsert of a uri replaces the live document, never duplicates it (RCP
+// §7.10: an explicit id replaces).
+TEST(upsert_of_same_uri_never_duplicates) {
+    rag::index::Corpus c;
+    for (int i = 0; i < 5; ++i)
+        REQUIRE(c.upsert_document("same.md", "version " + std::to_string(i)).has_value());
+    CHECK_EQ(c.live_document_count(), std::size_t{1});
+    auto hits = c.lexical_search("version", 10);
+    CHECK_EQ(hits.size(), std::size_t{1});
 }
 
 TEST(engine_hybrid_search) {
@@ -778,7 +646,9 @@ TEST(hnsw_parallel_build_matches_serial_recall) {
     for (std::size_t i = 0; i < fx.n; ++i)
         serial.add(static_cast<std::uint32_t>(i), fx.vecs[i]);
 
-    rag::index::HnswIndex parallel(cfg);
+    auto pcfg = cfg;
+    pcfg.split = test_threads();
+    rag::index::HnswIndex parallel(pcfg);
     parallel.build_batch(fx.n,
         [&](std::size_t i) { return std::span<const float>(fx.vecs[i]); },
         [&](std::size_t i) { return static_cast<std::uint32_t>(i); });
@@ -1494,6 +1364,7 @@ struct CountingEmbedder {
 rag::index::Corpus embed_corpus(std::size_t conc, std::size_t docs,
                                 CountingEmbedder* out_probe = nullptr) {
     rag::index::CorpusConfig cfg;
+    cfg.split           = test_threads();
     cfg.embed_batch     = 4;
     cfg.hnsw_threshold  = 1'000'000;   // keep this test about embedding only
     rag::index::Corpus c{cfg};
@@ -1539,14 +1410,13 @@ TEST(parallel_embedding_honours_concurrency_hint) {
 
     // hint == 1 must never overlap two embed calls.
     CHECK_EQ(probe_serial.peak->load(), 1);
-    // hint > 1 should actually overlap (pool has >1 thread on any CI box we
-    // care about; if it genuinely has one core this degrades to 1, so only
-    // assert overlap when the machine can provide it).
-    if (rag::util::max_workers() > 1) CHECK(probe_par.peak->load() > 1);
+    // hint > 1 overlaps (the test splitter has at least two shares).
+    CHECK(probe_par.peak->load() > 1);
 }
 
 TEST(parallel_embedding_propagates_backend_failure) {
     rag::index::CorpusConfig cfg;
+    cfg.split          = test_threads();
     cfg.embed_batch    = 4;
     cfg.hnsw_threshold = 1'000'000;
     rag::index::Corpus c{cfg};
@@ -1958,6 +1828,9 @@ TEST(hybrid_search_is_deterministic_under_concurrency) {
 
     rag::Engine e;
     e.with_embedder(rag::dense::AnyEmbedder{rag::dense::HashEmbedder{128}});
+    rag::pipeline::HybridRetrieveConfig hc;
+    hc.split = test_threads();   // lexical and dense side by side
+    e.with_pipeline(rag::pipeline::Pipeline::standard_with(hc));
     for (int i = 0; i < 600; ++i) {
         std::string s;
         for (int j = 0; j < 40; ++j) { s += w[pick(rng)]; s += ' '; }
@@ -2459,13 +2332,14 @@ TEST(extract_bytes_refuses_to_index_binary_garbage) {
 TEST(custom_extractor_handles_a_format_nobody_has_heard_of) {
     // The in-house-format escape hatch: register once, and every ingest path
     // can read a proprietary container.
-    rag::loaders::register_extractor(".acmerpt", [](std::string_view b) {
+    rag::loaders::Extractors ex;
+    ex.add(".acmerpt", [](std::string_view b) {
         std::string out(b);
         for (char& c : out) if (c == '|') c = ' ';
         return rag::Result<std::string>{out};
     }, "ACME internal report");
 
-    auto r = rag::loaders::extract_bytes("field|value|another", "q4.acmerpt");
+    auto r = rag::loaders::extract_bytes("field|value|another", "q4.acmerpt", ex);
     CHECK(r.has_value());
     CHECK_EQ(r->text, std::string("field value another"));
 }
@@ -2600,8 +2474,7 @@ TEST(onnx_reranker_reports_availability) {
 TEST(plugin_onnx_reranker_registered_by_name) {
     // The in-process cross-encoder must be reachable BY NAME like cross_encoder,
     // so config/CLI can select {"type":"onnx"} for reranking too.
-    rag::plugin::ensure_builtins_registered();
-    CHECK(rag::plugin::Registry<rag::plugin::AnyReranker>::instance().contains("onnx"));
+    CHECK(rag::plugin::Registries::builtin().rerankers.contains("onnx"));
 }
 
 TEST(onnx_reranker_real_model_if_available) {
@@ -3217,8 +3090,7 @@ TEST(onnx_embedder_real_model_if_available) {
 // ── Plugin registry ──────────────────────────────────────────────────────────
 
 TEST(plugin_builtins_registered) {
-    rag::plugin::ensure_builtins_registered();
-    auto& reg = rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance();
+    auto& reg = rag::plugin::Registries::builtin().embedders;
     CHECK(reg.contains("hash"));
     CHECK(reg.contains("ollama"));
     CHECK(reg.contains("openai"));
@@ -3257,28 +3129,27 @@ TEST(plugin_missing_type_is_error) {
 
 TEST(plugin_custom_registration_roundtrip) {
     // Simulate a third-party plugin registering a factory at runtime.
-    rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().register_factory(
-        "unit_test_custom", [](const nlohmann::json& c) -> rag::Result<rag::plugin::AnyEmbedder> {
+    auto regs = rag::plugin::Registries::builtin();
+    regs.embedders.register_factory(
+        "unit_test_custom", [](const nlohmann::json& c, const rag::plugin::Registries&)
+                                -> rag::Result<rag::plugin::AnyEmbedder> {
             auto dim = c.value("dim", 32);
             return rag::plugin::AnyEmbedder{rag::dense::HashEmbedder{static_cast<std::size_t>(dim)}};
         });
-    auto emb = rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().create_from(
-        nlohmann::json{{"type", "unit_test_custom"}, {"dim", 77}});
+    auto emb = regs.make_embedder(nlohmann::json{{"type", "unit_test_custom"}, {"dim", 77}});
     REQUIRE(emb.has_value());
     CHECK_EQ(emb->dimension(), 77u);
 }
 
 TEST(plugin_reranker_registered) {
-    rag::plugin::ensure_builtins_registered();
-    CHECK(rag::plugin::Registry<rag::plugin::AnyReranker>::instance().contains("cross_encoder"));
+    CHECK(rag::plugin::Registries::builtin().rerankers.contains("cross_encoder"));
 }
 
 TEST(plugin_describe_carries_config_hints) {
     // describe() powers `ragcpp list` / --help: every built-in must self-document
     // the config keys it takes, so a user can discover the config surface without
     // reading source. Assert a few known backends have non-empty descriptions.
-    rag::plugin::ensure_builtins_registered();
-    auto rows = rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().describe();
+    auto rows = rag::plugin::Registries::builtin().embedders.describe();
     std::map<std::string, std::string> by_name(rows.begin(), rows.end());
     REQUIRE(by_name.count("hash"));
     CHECK(!by_name["hash"].empty());
@@ -3291,14 +3162,24 @@ TEST(plugin_describe_carries_config_hints) {
 TEST(plugin_new_hosted_providers_registered) {
     // "Really add more": voyage / together were added as ~6-line registrations
     // over the OpenAI-compatible backend. They must be reachable by name and
-    // constructible (no network is touched at construction).
-    rag::plugin::ensure_builtins_registered();
-    auto v = rag::plugin::make_embedder(
+    // constructible (no network is touched at construction). Network backends
+    // need the host's HTTP; without it the name resolves but reports unavailable.
+    auto bare = rag::plugin::make_embedder(
+        nlohmann::json{{"type", "voyage"}, {"api_key", "k"}});
+    REQUIRE(!bare.has_value());
+    CHECK_EQ(bare.error().code, rag::Errc::unavailable);
+
+    struct NoNet final : rag::dense::HttpTransport {
+        rag::Result<rag::dense::HttpResponse> post(const rag::dense::HttpRequest&) const override {
+            return rag::fail<rag::dense::HttpResponse>(rag::Errc::unavailable, "test: no network");
+        }
+    };
+    auto regs = rag::plugin::Registries::with_io({.http = std::make_shared<NoNet>()});
+    auto v = regs.make_embedder(
         nlohmann::json{{"type", "voyage"}, {"api_key", "k"}, {"dim", 512}});
     REQUIRE(v.has_value());
     CHECK_EQ(v->dimension(), 512u);
-    auto t = rag::plugin::make_embedder(
-        nlohmann::json{{"type", "together"}, {"api_key", "k"}});
+    auto t = regs.make_embedder(nlohmann::json{{"type", "together"}, {"api_key", "k"}});
     REQUIRE(t.has_value());
 }
 
@@ -3315,7 +3196,7 @@ TEST(plugin_config_view_is_total) {
     // reference to the spec, which in real use is the const Json& a factory is
     // handed and which outlives the call; here we keep it in a named local.)
     nlohmann::json spec{{"dim", 128}, {"name", "x"}, {"inner", {{"type", "hash"}}}};
-    rag::plugin::Config c{spec};
+    rag::plugin::Config c{spec, rag::plugin::Registries::builtin()};
     CHECK_EQ(c.get<int>("dim", 7), 128);
     CHECK_EQ(c.get<int>("absent", 7), 7);       // missing -> default
     CHECK_EQ(c.get<int>("name", 7), 7);         // wrong type -> default, no throw
@@ -3336,17 +3217,18 @@ TEST(plugin_config_view_is_total) {
 TEST(plugin_register_embedder_helper_wraps_concept) {
     // register_embedder accepts a factory returning a bare concept MODEL and
     // wraps it in AnyEmbedder for you. Register a throwaway backend and build it.
-    rag::plugin::register_embedder(
+    auto regs = rag::plugin::Registries::builtin();
+    regs.embedder(
         "unit_test_helper_embedder", "test-only (keys: dim)",
         [](rag::plugin::Config c) -> rag::Result<rag::dense::HashEmbedder> {
             return rag::dense::HashEmbedder{c.get<std::size_t>("dim", 32)};
         });
-    auto e = rag::plugin::make_embedder(
+    auto e = regs.make_embedder(
         nlohmann::json{{"type", "unit_test_helper_embedder"}, {"dim", 48}});
     REQUIRE(e.has_value());
     CHECK_EQ(e->dimension(), 48u);
     // ...and it is self-described.
-    auto rows = rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().describe();
+    auto rows = regs.embedders.describe();
     std::map<std::string, std::string> by_name(rows.begin(), rows.end());
     CHECK(by_name["unit_test_helper_embedder"].find("test-only") != std::string::npos);
 }
@@ -3357,8 +3239,7 @@ TEST(plugin_local_embedders_registered_by_name) {
     // the caller naming the C++ type. (They existed as classes but were not
     // registered, so `{"type":"onnx"}` used to fail with "unknown type" even
     // on a build that supports ONNX.)
-    rag::plugin::ensure_builtins_registered();
-    auto& reg = rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance();
+    auto& reg = rag::plugin::Registries::builtin().embedders;
     CHECK(reg.contains("onnx"));
     CHECK(reg.contains("gguf"));
 }
@@ -3453,12 +3334,14 @@ TEST(plugin_composition_nests_arbitrarily) {
 }
 
 TEST(plugin_load_missing_lib_is_error) {
-    auto r = rag::plugin::load_plugin("/no/such/plugin.so");
+    auto regs = rag::plugin::Registries::builtin();
+    auto r = rag::plugin::load_plugin("/no/such/plugin.so", regs);
     CHECK(!r.has_value());
 }
 
 TEST(plugin_load_dir_missing_is_empty) {
-    auto v = rag::plugin::load_plugin_dir("/no/such/dir/at/all");
+    auto regs = rag::plugin::Registries::builtin();
+    auto v = rag::plugin::load_plugin_dir("/no/such/dir/at/all", regs);
     CHECK(v.empty());
 }
 
@@ -3528,36 +3411,35 @@ TEST(bridge_remote_retriever) {
 }
 
 TEST(bridge_registered_in_registry) {
-    rag::plugin::ensure_builtins_registered();
-    CHECK(rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().contains("process"));
-    CHECK(rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().contains("http"));
-    CHECK(rag::plugin::Registry<rag::plugin::AnyReranker>::instance().contains("process"));
+    CHECK(rag::plugin::Registries::builtin().embedders.contains("process"));
+    CHECK(rag::plugin::Registries::builtin().embedders.contains("http"));
+    CHECK(rag::plugin::Registries::builtin().rerankers.contains("process"));
 }
 
 TEST(bridge_open_channel_unknown_transport) {
-    auto ch = rag::bridge::open_channel(nlohmann::json{{"transport", "carrier_pigeon"}});
+    auto ch = rag::bridge::open_channel(nlohmann::json{{"transport", "carrier_pigeon"}},
+                                        rag::plugin::HostIo{});
     CHECK(!ch.has_value());
     CHECK_EQ(ch.error().code, rag::Errc::not_found);
 }
 
-TEST(bridge_process_roundtrip_with_cat) {
-    // Spawn a trivial line-echo peer that speaks the protocol using only a shell.
-    // It reads a request line and emits a valid reply, exercising the real pipe.
-    //
-    // The program name differs by platform: POSIX can name /bin/sh directly,
-    // while on Windows CreateProcess resolves via PATH and an MSYS path like
-    // "/bin/sh" is meaningless to it — "sh" finds MSYS2's sh.exe on PATH.
-#if defined(_WIN32)
-    const char* shell = "sh";
-#else
-    const char* shell = "/bin/sh";
-#endif
-    rag::bridge::ProcessConfig cfg;
-    cfg.argv = {shell, "-c",
-                "while IFS= read -r line; do printf '{\"ok\":true,\"result\":{\"scores\":[1.0]}}\\n'; done"};
-    auto ch = rag::bridge::ProcessChannel::spawn(cfg);
-    REQUIRE(ch.has_value());
-    rag::bridge::RemoteReranker rr{*ch, "sh-echo"};
+TEST(bridge_line_channel_roundtrip) {
+    // The host owns the process; rag only speaks lines over the pipe it hands
+    // back. An in-memory peer that answers every request is enough to drive it.
+    auto pending = std::make_shared<std::string>();
+    rag::bridge::LineIo io;
+    io.write = [pending](std::string_view) {
+        *pending += "{\"ok\":true,\"result\":{\"scores\":[1.0]}}\n";
+        return true;
+    };
+    io.read = [pending](char* buf, std::size_t cap) {
+        const std::size_t n = std::min(cap, pending->size());
+        std::memcpy(buf, pending->data(), n);
+        pending->erase(0, n);
+        return n;
+    };
+    auto ch = std::make_shared<rag::bridge::LineChannel>(std::move(io), "mem-echo");
+    rag::bridge::RemoteReranker rr{ch, "mem-echo"};
     std::vector<std::string> ps{"only one"};
     auto s = rr.rerank("q", ps);
     REQUIRE(s.has_value());
@@ -3565,43 +3447,53 @@ TEST(bridge_process_roundtrip_with_cat) {
     CHECK(std::abs((*s)[0] - 1.0f) < 1e-6f);
 }
 
-TEST(bridge_process_empty_argv_is_an_error) {
-    // Platform-independent: must be rejected before any spawn syscall.
-    auto ch = rag::bridge::ProcessChannel::spawn(rag::bridge::ProcessConfig{});
-    REQUIRE(!ch.has_value());
-    CHECK_EQ(ch.error().code, rag::Errc::invalid_argument);
+TEST(bridge_line_channel_eof_is_transport_error) {
+    // A peer that died (or never started) reads as EOF: an error, never a hang.
+    rag::bridge::LineIo io;
+    io.write = [](std::string_view) { return true; };
+    io.read  = [](char*, std::size_t) { return std::size_t{0}; };
+    rag::bridge::LineChannel ch{std::move(io), "dead"};
+    auto r = ch.call("ping", nlohmann::json::object());
+    REQUIRE(!r.has_value());
+    CHECK_EQ(r.error().code, rag::Errc::transport_error);
+    CHECK(!ch.alive());
 }
 
-TEST(bridge_process_spawn_of_missing_program_fails_cleanly) {
-    // A bad argv[0] must surface as a transport_error, never a throw, a hang,
-    // or a half-built channel. On POSIX the child exec fails after fork, so the
-    // failure shows up as EOF on the first call; on Windows CreateProcess fails
-    // outright and spawn() itself reports it. Accept either shape — what this
-    // pins down is that the caller gets an error and the process stays healthy.
-    rag::bridge::ProcessConfig cfg;
-    cfg.argv = {"ragcpp-no-such-program-cba9871"};
-    auto ch = rag::bridge::ProcessChannel::spawn(cfg);
-    if (!ch.has_value()) {
-        CHECK_EQ(ch.error().code, rag::Errc::transport_error);
-    } else {
-        auto r = (*ch)->call("ping", nlohmann::json::object());
-        CHECK(!r.has_value());
-    }
+TEST(bridge_process_transport_without_host_spawn_is_unavailable) {
+    auto ch = rag::bridge::open_channel(
+        nlohmann::json{{"transport", "process"}, {"argv", {"/bin/sh"}}}, rag::plugin::HostIo{});
+    REQUIRE(!ch.has_value());
+    CHECK_EQ(ch.error().code, rag::Errc::unavailable);
 }
 
-TEST(bridge_open_channel_process_transport_is_linked) {
-    // Regression guard for a LINK-time bug, not a runtime one: process.cpp was
-    // once excluded from the build on Windows while register.cpp still called
-    // ProcessChannel::spawn(), so every downstream binary failed to link with
-    // 'undefined reference to rag::bridge::ProcessChannel::spawn'. Naming the
-    // "process" transport through the public open_channel() entry point keeps
-    // that edge exercised on every platform the tests run on. An empty argv is
-    // deliberate: it fails in the config check, so no child is ever spawned,
-    // yet the symbol must still resolve for this file to link at all.
-    auto ch = rag::bridge::open_channel(nlohmann::json{{"transport", "process"},
-                                                      {"argv", nlohmann::json::array()}});
+TEST(bridge_process_transport_hands_spec_to_host) {
+    // Empty argv is rejected before the host is asked; otherwise the host gets
+    // the parsed spec, with the name defaulting to argv[0].
+    rag::bridge::ProcessSpec seen;
+    int calls = 0;
+    rag::plugin::HostIo io;
+    io.spawn = [&](const rag::bridge::ProcessSpec& spec)
+        -> rag::Result<std::shared_ptr<rag::bridge::Channel>> {
+        ++calls;
+        seen = spec;
+        return rag::fail<std::shared_ptr<rag::bridge::Channel>>(rag::Errc::transport_error, "stub");
+    };
+    auto empty = rag::bridge::open_channel(
+        nlohmann::json{{"transport", "process"}, {"argv", nlohmann::json::array()}}, io);
+    REQUIRE(!empty.has_value());
+    CHECK_EQ(empty.error().code, rag::Errc::invalid_argument);
+    CHECK_EQ(calls, 0);
+
+    auto ch = rag::bridge::open_channel(
+        nlohmann::json{{"transport", "process"}, {"argv", {"peer", "-x"}},
+                       {"env", {"A=1"}}, {"cwd", "/tmp"}}, io);
     REQUIRE(!ch.has_value());
-    CHECK_EQ(ch.error().code, rag::Errc::invalid_argument);
+    CHECK_EQ(ch.error().code, rag::Errc::transport_error);
+    CHECK_EQ(calls, 1);
+    CHECK_EQ(seen.argv.size(), 2u);
+    CHECK_EQ(seen.name, std::string("peer"));
+    CHECK_EQ(seen.cwd, std::string("/tmp"));
+    CHECK_EQ(seen.env.size(), 1u);
 }
 
 // ── GPU batch scoring ────────────────────────────────────────────────────────
@@ -3783,9 +3675,10 @@ TEST(gpu_score_batch_validates_and_routes) {
 
 // A corpus big enough that the batch path is worth taking, with HNSW disabled
 // so the brute-force scan (the only offloadable shape) is what runs.
-rag::index::Corpus batch_corpus(std::size_t docs, std::size_t dim) {
+rag::index::Corpus batch_corpus(std::size_t docs, std::size_t dim, bool use_gpu = true) {
     rag::index::CorpusConfig cfg;
     cfg.hnsw_threshold = 1'000'000;    // force the scan path
+    cfg.use_gpu        = use_gpu;
     rag::index::Corpus c{cfg};
     auto emb = rag::plugin::make_embedder(nlohmann::json{{"type", "hash"}, {"dim", dim}});
     c.set_embedder(std::move(*emb));
@@ -3972,23 +3865,13 @@ TEST(dense_batch_matches_with_gpu_disabled) {
     // The same equivalence must hold on the pure-CPU path, so this test is not
     // silently vacuous on a machine without a GPU (and so the GPU arm above is
     // not the only thing ever exercised on a machine with one).
-    //
-    // ORDERING HAZARD: gpu::disable() is a one-way latch with process-global
-    // scope — there is no re-enable, by design (a caller that turned the GPU
-    // off did so because something was wrong with it). So this test compares
-    // against a result captured BEFORE it flips the latch, and the existing
-    // gpu_disable_is_honoured test relies on the same property. Any test that
-    // needs a live GPU must therefore run before this one; tests run in
-    // registration order, so keep GPU-dependent cases above this line.
-    auto c = batch_corpus(3000, 64);
+    auto c   = batch_corpus(3000, 64, /*use_gpu=*/true);
+    auto cpu = batch_corpus(3000, 64, /*use_gpu=*/false);
     std::vector<std::string> queries{"vectors", "ranking", "indexes and graphs"};
 
     auto with_gpu = c.dense_search_batch(queries, 8);
     REQUIRE(with_gpu.has_value());
-
-    rag::gpu::disable();
-    CHECK(!rag::gpu::available());
-    auto without = c.dense_search_batch(queries, 8);
+    auto without = cpu.dense_search_batch(queries, 8);
     REQUIRE(without.has_value());
 
     REQUIRE(with_gpu->size() == without->size());
@@ -3997,21 +3880,6 @@ TEST(dense_batch_matches_with_gpu_disabled) {
         for (std::size_t i = 0; i < (*without)[q].size(); ++i)
             CHECK_EQ((*with_gpu)[q][i].chunk.get(), (*without)[q][i].chunk.get());
     }
-}
-
-TEST(gpu_disable_is_honoured) {
-    // Runs last by construction: disable() is deliberately a ONE-WAY switch, so
-    // this test permanently turns the GPU off for the process. A reversible
-    // toggle would race with in-flight dispatches for no real benefit.
-    rag::gpu::disable();
-    CHECK(!rag::gpu::available());
-    CHECK(rag::gpu::device_info().backend == rag::gpu::Backend::none);
-
-    const std::size_t dim = 64;
-    GpuFixture fx(40000, 16, dim);
-    std::vector<float> out(40000 * 16, 7.0f);
-    CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, dim, out));
-    CHECK_EQ(out[0], 7.0f);          // declined means UNTOUCHED, not partial
 }
 
 // ── Write-ahead log ───────────────────────────────────────────────────────
@@ -4556,45 +4424,6 @@ TEST(contextualizer_output_reaches_the_index) {
 }
 
 // ── ChunkLease ────────────────────────────────────────────────────────────
-
-TEST(chunk_lease_blocks_writers_for_its_lifetime) {
-    // chunks() used to hand out a reference into storage after releasing the
-    // lock, so a concurrent add_document() could reallocate the vector under a
-    // bulk consumer (graph/raptor/splade all iterate it for a long time). The
-    // lease keeps the read lock alive, so a writer must wait.
-    rag::index::Corpus c;
-    for (int i = 0; i < 64; ++i)
-        c.add_document("d" + std::to_string(i), "alpha beta gamma document body");
-
-    std::atomic<bool> wrote{false};
-    std::thread w;
-    {
-        auto lease = c.chunks();
-        const std::size_t n = lease.size();
-        const rag::Chunk* base = lease.get().data();
-
-        w = std::thread([&] {
-            // Enough documents to force at least one reallocation.
-            for (int i = 0; i < 512; ++i)
-                c.add_document("w" + std::to_string(i), "delta epsilon inserted while leased");
-            wrote.store(true);
-        });
-
-        // While the lease is held the writer cannot make progress, so the view
-        // stays exactly as taken: same length, same backing storage.
-        for (int i = 0; i < 200; ++i) {
-            CHECK_EQ(lease.size(), n);
-            CHECK(lease.get().data() == base);
-            std::this_thread::sleep_for(std::chrono::microseconds(20));
-        }
-        CHECK(!wrote.load());   // blocked, as designed
-        // Dropping the lease here releases the read lock and lets it through.
-    }
-
-    w.join();
-    CHECK(wrote.load());
-    CHECK(c.document_count() == std::size_t{64 + 512});
-}
 
 TEST(chunk_lease_iterates_like_the_vector_it_replaced) {
     // Source compatibility: every existing call site is `for (auto& ch :

@@ -4,10 +4,10 @@
 #include "rag/dense/simd.hpp"
 #include "rag/util/parallel.hpp"
 
-#include <atomic>
 #include <cctype>
 #include <cstdint>
-#include <mutex>
+#include <optional>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -126,23 +126,17 @@ Result<std::vector<Vector>> OpenAIEmbedder::embed(std::span<const std::string> t
 // independent and the transport is thread-safe, so we issue them CONCURRENTLY
 // (up to cfg_.concurrency) instead of serially: ingest latency drops from N×RTT
 // toward ceil(N/concurrency)×RTT. Results are written to their own slots so
-// order is preserved, and the first error wins.
+// order is preserved, and the first error (in text order) wins.
 Result<std::vector<Vector>> LlamaCppEmbedder::embed(std::span<const std::string> texts) const {
     if (texts.empty()) return std::vector<Vector>{};
 
     std::vector<Vector> out(texts.size());
-    std::atomic<bool>   failed{false};
-    Error               first_err{};
-    std::mutex          err_mu;
+    std::vector<std::optional<Error>> errs(texts.size());
 
     auto one = [&](std::size_t i) {
-        if (failed.load(std::memory_order_acquire)) return;
         json req; req["content"] = texts[i];
         auto resp = tp_->post_json(cfg_.host, cfg_.port, cfg_.path, req.dump(), cfg_.timeout);
-        auto set_err = [&](Error e) {
-            std::lock_guard lk(err_mu);
-            if (!failed.exchange(true, std::memory_order_acq_rel)) first_err = std::move(e);
-        };
+        auto set_err = [&](Error e) { errs[i] = std::move(e); };
         if (!resp) { set_err(resp.error()); return; }
         if (resp->status != 200) {
             set_err(Error{Errc::transport_error, "llamacpp status " + std::to_string(resp->status)});
@@ -166,9 +160,10 @@ Result<std::vector<Vector>> LlamaCppEmbedder::embed(std::span<const std::string>
     if (workers <= 1 || texts.size() == 1)
         for (std::size_t i = 0; i < texts.size(); ++i) one(i);
     else
-        util::parallel_for_dynamic(texts.size(), workers, one);
+        util::parallel_for_strided(cfg_.split, texts.size(), workers, one);
 
-    if (failed.load(std::memory_order_acquire)) return std::unexpected(first_err);
+    for (auto& e : errs)
+        if (e) return std::unexpected(std::move(*e));
     if (dim_ == 0 && !out.empty()) dim_ = out.front().size();
     return out;
 }

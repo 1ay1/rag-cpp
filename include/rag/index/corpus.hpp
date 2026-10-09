@@ -8,11 +8,10 @@
 // Embedder the Corpus is a first-class BM25 lexical store; with one it becomes
 // a hybrid store and (past a size threshold) builds an HNSW graph.
 
+#include "rag/util/parallel.hpp"
 #include <memory>
 #include <functional>
-#include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -33,6 +32,12 @@
 namespace rag::index {
 
 struct CorpusConfig {
+    // How embedding and the dense scan split their parallel work (empty:
+    // inline). Also used for the HNSW build. Not saved with the index.
+    util::Splitter         split;
+    // Let dense_search_batch use a GPU when one is present. Off compares the
+    // two paths, or works around a misbehaving driver. Not saved.
+    bool                   use_gpu = true;
     text::ChunkOptions     chunk;
     lexical::Bm25Params    bm25;
     text::TokenizeOptions  tokenize;
@@ -132,11 +137,6 @@ public:
     // Chunks hold a borrowed pointer into `docs_` metadata; any move must
     // re-link those pointers to the NEW storage, and copying is disabled to
     // avoid silently sharing dangling pointers. (Move is cheap: vector steals.)
-    //
-    // Moving is NOT thread-safe and must not race with any other access: the
-    // mutexes below are not themselves moved (a locked mutex cannot be), so a
-    // move while another thread holds a lock is undefined. Move a Corpus only
-    // while you have exclusive ownership of it — typically right after load().
     Corpus(const Corpus&) = delete;
     Corpus& operator=(const Corpus&) = delete;
     Corpus(Corpus&& o) noexcept { move_from(std::move(o)); }
@@ -185,16 +185,8 @@ public:
     // embedder is set) embed its chunks. Returns the assigned DocId.
     Result<DocId> add_document(std::string uri, std::string text, Metadata meta = {}, std::string title = {});
 
-    // Add, replacing any live document that already has this uri — as ONE
-    // atomic step.
-    //
-    // The obvious spelling of an upsert at the call site is
-    //   if (auto old = find_by_uri(u)) remove_document(*old);
-    //   add_document(u, ...);
-    // which takes the lock three separate times. Two threads upserting the same
-    // uri can then both observe "not present" and both insert, producing the
-    // duplicate that RCP §7.10 explicitly forbids. Holding the write lock across
-    // the whole read-modify-write is the only way to make it a real upsert.
+    // Add, replacing any live document that already has this uri (RCP §7.10:
+    // an explicit id is an upsert, not a duplicate).
     Result<DocId> upsert_document(std::string uri, std::string text, Metadata meta = {},
                                   std::string title = {});
 
@@ -206,13 +198,9 @@ public:
         std::string title{};
     };
 
-    // Bulk ingest, acquiring the write lock ONCE for the whole batch.
-    //
-    // The per-document add_document() takes mu_ per call and (when a WAL is
-    // attached) issues one durable append per document. For bulk loads that is
-    // N lock round-trips and N fsyncs where one of each suffices: this holds the
-    // lock across the whole batch and, if a WAL is open, wraps the appends in a
-    // single group-commit so the batch costs ONE sync, not N. Chunking/indexing
+    // Bulk ingest. The per-document add_document() (when a WAL is attached)
+    // issues one durable append per document; this wraps the batch's appends
+    // in a single group-commit so it costs ONE sync, not N. Chunking/indexing
     // per document is unchanged (and already avoids the O(corpus) finalize —
     // that stays lazy until build()/read). Returns one DocId per input, in
     // order; on the first failure it stops and returns the error (documents
@@ -234,6 +222,13 @@ public:
 
     // ── Retrieval primitives ────────────────────────────────────────────────
     [[nodiscard]] std::vector<Hit> lexical_search(std::string_view query, std::size_t k) const;
+
+    // Do every lazy repair the read path would (relink meta, finalize BM25,
+    // seal the ANN graph, pack the matrix). After it, lexical_search and
+    // dense_search touch no shared mutable state except their own scratch,
+    // so the two may run side by side (HybridRetrieveStage does). Cheap when
+    // nothing is stale.
+    void prepare_read() const;
     [[nodiscard]] Result<std::vector<Hit>> dense_search(std::string_view query, std::size_t k) const;
 
     // Dense search with a metadata pre-filter pushed into the ANN walk (or the
@@ -273,10 +268,10 @@ public:
     [[nodiscard]] std::optional<DocId> find_by_uri(std::string_view uri) const;
     [[nodiscard]] SearchResult    resolve(const Hit& h) const;
     [[nodiscard]] std::size_t     chunk_count()    const noexcept {
-        std::shared_lock lk(mu_); return chunks_.size();
+        return chunks_.size();
     }
     [[nodiscard]] std::size_t     document_count() const noexcept {
-        std::shared_lock lk(mu_); return docs_.size();
+        return docs_.size();
     }
 
     // How many chunk rows dense_search_batch() would actually score.
@@ -289,33 +284,15 @@ public:
     // otherwise unobservable, since the batch path only reaches the mirror when
     // a GPU is present. Exposed so the invariant is testable on any machine.
     [[nodiscard]] std::size_t batch_row_count() const noexcept {
-        std::shared_lock lk(mu_);
         ensure_packed();
         return packed_ids_.size();
     }
-    // A borrowed, READ-LOCKED view of the chunk vector.
-    //
-    // This exists because the obvious accessor — `const std::vector<Chunk>&
-    // chunks() const` — was a data race by construction: it took a shared lock,
-    // released it at the return statement, and handed the caller a reference
-    // into storage a concurrent add_document() may reallocate. Every bulk
-    // consumer (graph, raptor, splade) iterates that vector for as long as it
-    // takes to build an index over the whole corpus, which is exactly the
-    // window in which a served corpus accepts a write.
-    //
-    // The lease keeps the shared lock alive for as long as the view is, so the
-    // structure cannot change underneath the loop. It is move-only and must
-    // not outlive the Corpus. Holding one BLOCKS WRITERS — that is the trade:
-    // a consistent snapshot without copying the chunks. Take it, iterate, drop
-    // it; do not stash one in a long-lived object.
-    //
-    // Deadlock note: mu_ is not recursive, so do not call another Corpus
-    // method that locks (chunk(), document(), chunk_count(), ...) while a lease
-    // is held on the same thread. tokenizer() is safe — it takes no lock.
+    // A borrowed view of the chunk vector (graph, raptor and splade iterate
+    // it to build their indexes). Valid until the next mutation; the owner
+    // makes sure none happens while one is held.
     class ChunkLease {
     public:
-        ChunkLease(std::shared_lock<std::shared_mutex> lk, const std::vector<Chunk>& v)
-            : lk_(std::move(lk)), v_(&v) {}
+        explicit ChunkLease(const std::vector<Chunk>& v) : v_(&v) {}
 
         [[nodiscard]] const std::vector<Chunk>& get() const noexcept { return *v_; }
         operator const std::vector<Chunk>&() const noexcept { return *v_; }
@@ -326,14 +303,12 @@ public:
         [[nodiscard]] const Chunk& operator[](std::size_t i) const noexcept { return (*v_)[i]; }
 
     private:
-        std::shared_lock<std::shared_mutex> lk_;
-        const std::vector<Chunk>*           v_;
+        const std::vector<Chunk>* v_;
     };
 
     [[nodiscard]] ChunkLease chunks() const {
-        std::shared_lock lk(mu_);
         ensure_linked();
-        return ChunkLease(std::move(lk), chunks_);
+        return ChunkLease(chunks_);
     }
     [[nodiscard]] const text::Tokenizer& tokenizer() const noexcept { return bm25_.tokenizer(); }
 
@@ -425,75 +400,34 @@ private:
     text::Contextualizer              contextualizer_;
     text::PropositionFn               propositionizer_;
     std::vector<Document>             docs_;
-    std::vector<Chunk>                chunks_;
-    lexical::Bm25Index                bm25_{cfg_.bm25, cfg_.tokenize};
+    // mutable: the const read path relinks chunk meta and finalizes BM25
+    // lazily (see below).
+    mutable std::vector<Chunk>        chunks_;
+    mutable lexical::Bm25Index        bm25_{cfg_.bm25, cfg_.tokenize};
     std::optional<HnswIndex>          hnsw_;
     bool                              dirty_ = false;
 
-    // ── Concurrency ────────────────────────────────────────────────
-    // A served Corpus is read by many request threads and written by index/add
-    // at the same time. Without this, add_document() reallocating docs_ frees
-    // the storage that every Chunk::meta pointer borrows into, and a concurrent
-    // reader dereferences it: measured as an immediate segfault on every run of
-    // a 4-reader/1-writer harness.
+    // ── Ownership ──────────────────────────────────────────────────
+    // One owner at a time: a Corpus holds no lock. The const read path
+    // repairs lazily (relink_meta(), bm25_.finalize(), the packed matrix,
+    // hnsw_->seal()) — that laziness is what made bulk ingest non-quadratic —
+    // so even concurrent READERS must be serialized by the owner (agentty
+    // keeps its Engine under one maya::guarded).
     //
-    // TWO locks, because there are two distinct hazards:
-    //
-    //   mu_ (shared_mutex) guards the STRUCTURE — docs_, chunks_, bm25_, hnsw_,
-    //     deleted_docs_. Readers share it, mutators take it exclusively. It is
-    //     a shared_mutex rather than a plain mutex because the workload is
-    //     overwhelmingly read-heavy and queries must not serialize behind each
-    //     other.
-    //
-    //   lazy_mu_ guards the LAZY REPAIRS that the read path performs —
-    //     relink_meta(), bm25_.finalize(), hnsw_->seal(). These are the reason
-    //     a shared_mutex alone is not enough: the const read path MUTATES
-    //     (that laziness is what made bulk ingest non-quadratic), so two
-    //     concurrent readers holding only a shared lock would race each other
-    //     with no writer present at all. Each repair is idempotent, so a short
-    //     exclusive lock around it is both correct and cheap — it is taken only
-    //     when the corresponding dirty flag is set, which is never on a steady
-    //     -state read.
-    //
-    // Lock ORDER is always mu_ then lazy_mu_; nothing ever acquires them the
-    // other way round, so the pair cannot deadlock.
-    //
-    // `mutable` so const read methods can take a shared lock.
-    mutable std::shared_mutex mu_;
-    mutable std::mutex        lazy_mu_;
     // A chunk borrows a pointer to its document's metadata, and add_document()
     // may reallocate `docs_`. Rather than relink every chunk on every add (O(n)
     // per document — quadratic ingest), we mark the pointers stale and repair
-    // them lazily, before any accessor can hand one out. Mutable + const
-    // ensure_linked() because this is memoization, not observable state.
-    mutable std::atomic<bool>         meta_stale_{false};
+    // them lazily, before any accessor can hand one out.
+    mutable bool                      meta_stale_ = false;
 
-    // Monotonic count of structural mutations (add/upsert/remove/build). Every
-    // snapshot records the epoch it was taken at, so save() can refuse to
-    // publish a snapshot older than one already on disk. Guarded by mu_ like
-    // the rest of the structure.
+    // Monotonic count of structural mutations (add/upsert/remove/build),
+    // recorded in every snapshot.
     std::uint64_t                     epoch_ = 0;
 
-    // Serializes the PUBLISH step of save() (the temp-file write + rename) and
-    // remembers the newest epoch that has reached disk, PER DESTINATION PATH.
-    //
-    // Static because two different Corpus objects can legitimately target the
-    // same path, so the ordering hazard is a property of the path, not of the
-    // object. Per-path rather than one global lock because the publish step is
-    // the expensive half of a save — a single mutex would make a host serving
-    // several corpora serialize their file I/O against each other for no
-    // reason, trading one stall for another.
-    struct PathState {
-        std::mutex    mu;
-        std::uint64_t published = 0;
-        bool          any       = false;
-    };
-    static PathState& path_state(const std::string& path);
     std::unordered_set<std::uint32_t> deleted_docs_;   // tombstoned DocId values
 
-    // Optional write-ahead log. Appended under the write lock, so log order
-    // matches the order mutations were applied in memory — which is what makes
-    // replay reproduce the same corpus.
+    // Optional write-ahead log, appended in the order mutations are applied in
+    // memory — which is what makes replay reproduce the same corpus.
     //
     // `replaying_` suppresses logging while replay() is feeding records back
     // through add_document/remove_document. Without it, recovery would append
@@ -503,19 +437,13 @@ private:
 
     [[nodiscard]] Result<void> embed_pending();
 
-    // add/remove with the write lock ALREADY held, so compound operations
-    // (upsert) can be performed atomically.
+    // The internals the public methods delegate to (the _locked suffix is
+    // historical: they once ran under the corpus lock).
     Result<DocId> add_document_locked(std::string uri, std::string text, Metadata meta,
                                       std::string title);
     Result<void>  remove_document_locked(DocId id);
     [[nodiscard]] std::optional<DocId> find_by_uri_locked(std::string_view uri) const;
 
-    // Unlocked internals. Every public method acquires the appropriate lock and
-    // then delegates here, so that methods which call ONE ANOTHER (e.g.
-    // lexical_search -> chunk, dense_search -> passes -> chunk) do not attempt
-    // to re-acquire a lock they already hold. std::shared_mutex is NOT
-    // recursive: a second shared_lock on the same thread deadlocks if a writer
-    // is queued between them.
     [[nodiscard]] const Chunk*    chunk_locked(ChunkId id) const;
     [[nodiscard]] const Document* document_locked(DocId id) const;
     [[nodiscard]] SearchResult    resolve_locked(const Hit& h) const;
@@ -536,18 +464,17 @@ private:
     //
     // Built lazily on first batch use and invalidated by any structural
     // mutation (via epoch_), so a corpus that never runs a batch query never
-    // pays the memory. Guarded by lazy_mu_, like the other read-path repairs.
+    // pays the memory.
     mutable std::vector<float>         packed_;
     mutable std::vector<std::uint32_t> packed_ids_;
     mutable std::size_t                packed_dim_   = 0;
     mutable std::uint64_t              packed_epoch_ = 0;
     mutable bool                       packed_valid_ = false;
 
-    // Ensure packed_ reflects the current chunks_. Caller must hold mu_.
+    // Ensure packed_ reflects the current chunks_.
     void ensure_packed() const;
-    // Pack the whole corpus into container sections. Caller must hold at least a
-    // shared lock; the returned Container owns copies, so the caller can (and
-    // should) release the lock before paying for CRC + file I/O.
+    // Pack the whole corpus into container sections. The returned Container
+    // owns copies.
     [[nodiscard]] Result<store::Container> snapshot_locked() const;
 
     // Repair borrowed meta pointers if a preceding add_document() invalidated
@@ -555,7 +482,7 @@ private:
     void ensure_linked() const;
 
     // Re-point every chunk's borrowed `meta` at the current `docs_` storage.
-    void relink_meta();
+    void relink_meta() const;
     // Steal all state from `o` and relink meta pointers to our storage.
     void move_from(Corpus&& o);
 };

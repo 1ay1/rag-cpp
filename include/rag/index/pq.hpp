@@ -16,6 +16,7 @@
 // can use to (a) shrink a flat brute-force store, or (b) rescore HNSW survivors
 // from compressed codes. Trained once on the corpus; serializable.
 
+#include "rag/util/parallel.hpp"
 #include <cstdint>
 #include <span>
 #include <string>
@@ -27,6 +28,7 @@
 namespace rag::index {
 
 struct PqConfig {
+    util::Splitter split;            // how training/encoding split (empty: inline)
     std::size_t   m          = 8;    // subquantizers (dim must be divisible by m)
     std::size_t   ksub       = 256;  // centroids per subspace (1 byte ⇒ 256)
     std::size_t   iters      = 25;   // k-means iterations

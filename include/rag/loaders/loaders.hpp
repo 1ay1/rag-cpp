@@ -22,6 +22,7 @@
 
 #include "rag/core/document.hpp"
 #include "rag/core/types.hpp"
+#include "rag/loaders/extract.hpp"
 
 namespace rag::loaders {
 
@@ -42,11 +43,11 @@ struct LoadedDoc {
 // all retrieval wants — so a self-contained .rtf loader needs no textutil.
 [[nodiscard]] std::string rtf_to_text(std::string_view rtf);
 
-[[nodiscard]] Result<std::string> pdf_to_text(const std::filesystem::path& path); // needs `pdftotext`
 
 // Load one file, choosing the extractor from its extension. Returns unavailable
 // for binary/unsupported types.
-[[nodiscard]] Result<LoadedDoc> load_file(const std::filesystem::path& path);
+[[nodiscard]] Result<LoadedDoc> load_file(const std::filesystem::path& path,
+                                        const Extractors& ex = {});
 
 // ─── Tabular (CSV/TSV) ───────────────────────────────────────────────
 // A CSV is not prose, and chunking it as prose destroys it: rows are
@@ -106,6 +107,7 @@ struct DirOptions {
     std::size_t max_file_bytes = 4 * 1024 * 1024;   // skip huge files
     std::size_t max_files = 0;                       // 0 = unlimited
     bool        follow_symlinks = false;
+    Extractors  extractors;   // custom handlers + how to run converters
 };
 
 // Recursively load a directory. Each returned LoadedDoc has meta["ext"],

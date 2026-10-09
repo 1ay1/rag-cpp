@@ -222,31 +222,22 @@ namespace {
 
 // Memoized stemming.
 //
-// porter_stem is a long chain of suffix tests and string rewrites — profiling
-// a 20k-document ingest showed it (and the `replace`/`ends_with` helpers it
-// calls) as the single dominant cost, above chunking and above BM25 posting
-// construction. But it is a PURE function of the word, and word frequency is
-// Zipfian: a few thousand distinct tokens cover the overwhelming majority of
-// occurrences in real text.
-//
-// So cache it. Thread-local, so no locking and no sharing between the
-// concurrent ingest paths; bounded, so a pathological input (hashes, base64,
-// minified JS — text with unbounded distinct "words") cannot grow it without
-// limit. On overflow we simply clear and start again rather than implement LRU
-// eviction: the access pattern is heavily skewed, so the hot words are back in
-// the cache almost immediately, and a clear is O(1) amortized against the
-// misses it costs.
-const std::string& stem_cached(const std::string& word) {
-    static constexpr std::size_t kMaxEntries = 1u << 16;   // ~65k distinct words
-    static thread_local std::unordered_map<std::string, std::string> cache;
-
-    auto it = cache.find(word);
-    if (it != cache.end()) return it->second;
-    if (cache.size() >= kMaxEntries) cache.clear();
-    return cache.emplace(word, porter_stem(word)).first->second;
-}
-
 } // namespace
+
+// porter_stem is a long chain of suffix tests and string rewrites — profiling
+// a 20k-document ingest showed it as the single dominant cost, above chunking
+// and BM25 posting construction. It is a pure function of the word, so it is
+// memoized per Tokenizer; bounded, so a pathological input (hashes, base64,
+// minified JS) cannot grow it without limit. On overflow it clears rather
+// than evicting: the access pattern is heavily skewed, so the hot words are
+// back almost immediately.
+const std::string& Tokenizer::stem_cached(const std::string& word) const {
+    static constexpr std::size_t kMaxEntries = 1u << 16;   // ~65k distinct words
+    auto it = stems_.find(word);
+    if (it != stems_.end()) return it->second;
+    if (stems_.size() >= kMaxEntries) stems_.clear();
+    return stems_.emplace(word, porter_stem(word)).first->second;
+}
 
 std::vector<std::string> Tokenizer::tokenize(std::string_view text) const {
     std::vector<std::string> out;

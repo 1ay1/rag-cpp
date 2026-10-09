@@ -51,10 +51,12 @@ public:
     // Config-driven embedder attach: build a registered embedder by name from a
     // JSON spec (bare name string, or object with a "type" field). Enables the
     // whole framework to be wired from a config file with zero backend knowledge
-    // at the call site, and picks up any plugin loaded via load_plugin_dir().
+    // at the call site. `regs` defaults to the built-ins; pass your own copy
+    // to reach plugins loaded with load_plugin_dir().
     //   engine.with_embedder_spec({{"type","ollama"},{"model","nomic-embed-text"}});
-    Result<void> with_embedder_spec(const plugin::Json& spec) {
-        auto e = plugin::make_embedder(spec);
+    Result<void> with_embedder_spec(const plugin::Json& spec,
+                                    const plugin::Registries& regs = plugin::Registries::builtin()) {
+        auto e = regs.make_embedder(spec);
         if (!e) return std::unexpected(e.error());
         corpus_.set_embedder(std::move(*e));
         return {};

@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <thread>
 
 #include "rag/dense/simd.hpp"
 
@@ -58,9 +57,9 @@ Result<OnnxEmbedder> OnnxEmbedder::load(LocalEmbedderConfig cfg) {
     auto& im = *e.impl_;
     im.cfg = std::move(cfg);
     im.id  = im.cfg.identity_tag.empty() ? "onnx" : im.cfg.identity_tag;
-    int threads = im.cfg.threads > 0 ? im.cfg.threads
-                : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
-    im.opts.SetIntraOpNumThreads(threads);
+    // 0 lets onnxruntime size its own intra-op pool (it uses the core
+    // count); the host can pin it with cfg.threads.
+    im.opts.SetIntraOpNumThreads(im.cfg.threads > 0 ? im.cfg.threads : 0);
     im.opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     try {
         auto tk = WordPieceTokenizer::load(im.cfg.tokenizer_path);
@@ -203,8 +202,9 @@ Result<GgufEmbedder> GgufEmbedder::load(LocalEmbedderConfig cfg) {
     llama_context_params cp = llama_context_default_params();
     cp.embeddings = true;
     cp.n_ubatch = cp.n_batch = 2048;
-    cp.n_threads = im.cfg.threads > 0 ? im.cfg.threads
-                 : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    // The host sets cfg.threads (agentty: its core count); 0 leaves
+    // llama.cpp's own default.
+    if (im.cfg.threads > 0) cp.n_threads = cp.n_threads_batch = im.cfg.threads;
     im.ctx = llama_init_from_model(im.model, cp);
     if (!im.ctx)
         return std::unexpected(Error{Errc::unavailable, "gguf context init failed"});

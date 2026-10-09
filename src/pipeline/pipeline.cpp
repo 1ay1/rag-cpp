@@ -50,15 +50,16 @@ Result<Context> HybridRetrieveStage::process(Context ctx) const {
                            : corpus.dense_search(ctx.query, pool);
     };
 
-    if (run_dense) {
-        // Dense and lexical side by side on the host's executor (it must not
-        // deadlock when nested, which is what makes this safe inside a
-        // server handling queries in parallel).
-        util::executor().parallel_for(2, [&](std::size_t i) {
+    if (run_dense && !cfg_.split.inline_only()) {
+        // Dense and lexical side by side on the caller's splitter. Repairs
+        // first, so neither branch writes anything the other reads.
+        corpus.prepare_read();
+        cfg_.split(2, [&](std::size_t i) {
             if (i == 0) do_lexical(); else do_dense();
         });
     } else {
         do_lexical();
+        if (run_dense) do_dense();
     }
 
     // Declare each retriever's THEORETICAL score bounds rather than letting

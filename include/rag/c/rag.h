@@ -50,12 +50,12 @@ typedef enum rag_status {
     RAG_ERR_UNKNOWN = 255
 } rag_status;
 
-/* Human-readable message for the last error on the calling thread (borrowed,
- * valid until the next library call on this thread). */
-const char* rag_last_error(void);
+/* Human-readable message for the last error on `eng` (borrowed, valid until
+ * the next call on `eng`). The library keeps no per-thread state. */
+typedef struct rag_engine rag_engine;
+const char* rag_engine_last_error(const rag_engine* eng);
 
 /* ── Opaque handles ─────────────────────────────────────────────────────── */
-typedef struct rag_engine   rag_engine;
 typedef struct rag_embedder rag_embedder;   /* an AnyEmbedder wrapper        */
 typedef struct rag_reranker rag_reranker;   /* an AnyReranker wrapper        */
 typedef struct rag_results  rag_results;    /* a search result set           */
@@ -63,23 +63,9 @@ typedef struct rag_results  rag_results;    /* a search result set           */
 /* ── Embedders ──────────────────────────────────────────────────────────── */
 /* Deterministic local embedder (no network) — great default / fallback.     */
 rag_embedder* rag_embedder_hash(size_t dim);
-/* Ollama /api/embed on host:port with the given model + dimension.          */
-rag_embedder* rag_embedder_ollama(const char* host, uint16_t port,
-                                  const char* model, size_t dim);
-/* OpenAI-compatible /v1/embeddings. tls!=0 requires a TLS-capable build.     */
-rag_embedder* rag_embedder_openai(const char* host, uint16_t port, int tls,
-                                  const char* path, const char* model,
-                                  const char* api_key, size_t dim);
-/* llama.cpp server /embedding. */
-rag_embedder* rag_embedder_llamacpp(const char* host, uint16_t port, size_t dim);
+/* (Network embedders and rerankers are C++ only: rag-cpp opens no sockets,
+ * and they take the host's HttpTransport.) */
 void          rag_embedder_free(rag_embedder*);
-
-/* ── Rerankers ──────────────────────────────────────────────────────────── */
-/* TEI /rerank cross-encoder. */
-rag_reranker* rag_reranker_tei(const char* host, uint16_t port);
-/* Cohere/Jina-style /v1/rerank (Bearer api_key). */
-rag_reranker* rag_reranker_cohere(const char* host, uint16_t port, int tls,
-                                  const char* model, const char* api_key);
 void          rag_reranker_free(rag_reranker*);
 
 /* ── Engine lifecycle ───────────────────────────────────────────────────── */
@@ -133,7 +119,9 @@ void        rag_results_free(rag_results*);
 rag_status  rag_engine_save(rag_engine*, const char* path);
 /* Load a saved corpus into a fresh engine. Reattach an embedder afterward if
  * you want live query embedding. */
-rag_engine* rag_engine_load(const char* path, rag_status* out_status);
+/* On failure returns NULL and sets *out_status; `out_message` (optional,
+ * may be NULL) receives an owned message to free with rag_string_free(). */
+rag_engine* rag_engine_load(const char* path, rag_status* out_status, char** out_message);
 
 /* ── Memory ─────────────────────────────────────────────────────────────── */
 void rag_string_free(char*);

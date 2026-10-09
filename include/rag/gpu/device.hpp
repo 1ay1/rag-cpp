@@ -123,11 +123,8 @@ struct DeviceInfo {
 // Info for the active device; `backend == none` when running on CPU.
 [[nodiscard]] const DeviceInfo& device_info() noexcept;
 
-// Force the GPU off for this process. Intended for benchmarks and for tests
-// that need to compare the two paths; also a safety valve for a host that hits
-// a driver problem in the field. Cannot be undone — a one-way switch is much
-// easier to reason about than a toggle racing with in-flight work.
-void disable() noexcept;
+// To keep a corpus off the GPU, set CorpusConfig::use_gpu = false (or
+// RAGCPP_GPU_BACKEND=none for the whole process).
 
 // ── Batched scoring ─────────────────────────────────────────────────────────
 //

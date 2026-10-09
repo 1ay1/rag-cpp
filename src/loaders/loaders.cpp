@@ -219,31 +219,6 @@ std::string rtf_to_text(std::string_view rtf) {
     return clean;
 }
 
-// ─── PDF → text (via pdftotext) ───────────────────────────────────────────────
-Result<std::string> pdf_to_text(const fs::path& path) {
-    // pdftotext <in> - : write extracted text to stdout.
-#ifdef _WIN32
-    std::string cmd = "pdftotext -q \"" + path.string() + "\" - 2>NUL";
-    std::FILE* pipe = ::_popen(cmd.c_str(), "r");
-#else
-    std::string cmd = "pdftotext -q \"" + path.string() + "\" - 2>/dev/null";
-    std::FILE* pipe = ::popen(cmd.c_str(), "r");
-#endif
-    if (!pipe) return fail<std::string>(Errc::unavailable, "pdftotext not available");
-    std::string out;
-    std::array<char, 4096> buf;
-    std::size_t got;
-    while ((got = std::fread(buf.data(), 1, buf.size(), pipe)) > 0) out.append(buf.data(), got);
-#ifdef _WIN32
-    int rc = ::_pclose(pipe);
-#else
-    int rc = ::pclose(pipe);
-#endif
-    if (rc != 0 && out.empty())
-        return fail<std::string>(Errc::unavailable, "pdftotext failed (install poppler-utils)");
-    return out;
-}
-
 // ─── Single file ──────────────────────────────────────────────────────────────
 namespace {
 std::string lower_ext(const fs::path& p) {
@@ -253,7 +228,7 @@ std::string lower_ext(const fs::path& p) {
 }
 } // namespace
 
-Result<LoadedDoc> load_file(const fs::path& path) {
+Result<LoadedDoc> load_file(const fs::path& path, const Extractors& ex) {
     std::error_code ec;
     if (!fs::is_regular_file(path, ec)) return fail<LoadedDoc>(Errc::not_found, path.string());
     std::string ext = lower_ext(path);
@@ -268,9 +243,9 @@ Result<LoadedDoc> load_file(const fs::path& path) {
     // ones a library owns, a named error for the ones that need OCR. Going
     // through extract_file here rather than special-casing extensions is what
     // makes a .docx work identically in load_file, load_directory, and the CLI,
-    // and what lets register_extractor() add a company's internal format to all
+    // and what lets a custom extractor add a company's internal format to all
     // three at once.
-    auto r = extract_file(path);
+    auto r = extract_file(path, ex);
     if (!r) return std::unexpected(r.error());
     d.text = std::move(r->text);
     if (r->kind == ExtractKind::external && !r->tool.empty()) d.meta["extractor"] = r->tool;
@@ -308,7 +283,7 @@ load_directory(const fs::path& root, const DirOptions& opts, const ProgressFn& o
         if (entry.file_size(ec) > opts.max_file_bytes) { if (on_file) on_file(entry.path(), false); continue; }
         if (opts.max_files > 0 && docs.size() >= opts.max_files) break;
 
-        auto d = load_file(entry.path());
+        auto d = load_file(entry.path(), opts.extractors);
         bool ok = d.has_value();
         if (ok) {
             d->meta["rel"] = fs::relative(entry.path(), root, ec).string();

@@ -16,7 +16,7 @@ _lib = C.CDLL(_lib_path)
 
 # ── prototypes ────────────────────────────────────────────────────────────────
 _lib.rag_version.restype = C.c_char_p
-_lib.rag_last_error.restype = C.c_char_p
+_lib.rag_engine_last_error.restype = C.c_char_p
 _lib.rag_engine_new.restype = C.c_void_p
 _lib.rag_embedder_hash.restype = C.c_void_p
 _lib.rag_embedder_hash.argtypes = [C.c_size_t]

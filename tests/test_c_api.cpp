@@ -56,7 +56,7 @@ int main() {
                             / "ragcpp_c_api.ragdb").string();
     C_CHECK(rag_engine_save(eng, path.c_str()) == RAG_OK);
     rag_status st = RAG_ERR_UNKNOWN;
-    rag_engine* loaded = rag_engine_load(path.c_str(), &st);
+    rag_engine* loaded = rag_engine_load(path.c_str(), &st, nullptr);
     C_CHECK(st == RAG_OK);
     C_CHECK(loaded != nullptr);
     if (loaded) {
