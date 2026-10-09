@@ -148,7 +148,7 @@ public:
     void set_embedder(dense::AnyEmbedder e) { embedder_ = std::move(e); }
     // The runtime half of the config, which load() cannot restore: the
     // splitter and GPU are the caller's, not the file's.
-    void set_runtime(util::Splitter split, const gpu::Device* gpu) {
+    void set_parallelism(util::Splitter split, const gpu::Device* gpu) {
         cfg_.split = std::move(split);
         cfg_.gpu   = gpu;
     }
