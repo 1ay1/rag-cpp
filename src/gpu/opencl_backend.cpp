@@ -29,7 +29,7 @@
 // On NVIDIA/AMD/Intel ICDs the overhead is not present and this is the path that
 // makes GPU acceleration available at all.
 
-#include <atomic>
+#include <new>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -86,16 +86,18 @@ struct Ctx {
     cl_context       context  = nullptr;
     cl_command_queue queue    = nullptr;
     cl_program       program  = nullptr;
-    cl_kernel        kernel   = nullptr;
     char             name[256] = {0};
     cl_ulong         max_alloc = 0;
     cl_bool          unified   = CL_FALSE;
     bool             ok        = false;
 };
 
-Ctx& ctx() {
-    static Ctx c;
-    return c;
+void release(Ctx* c) {
+    if (!c) return;
+    if (c->program) clReleaseProgram(c->program);
+    if (c->queue)   clReleaseCommandQueue(c->queue);
+    if (c->context) clReleaseContext(c->context);
+    delete c;
 }
 
 // Pick the best device across every platform: a real GPU if one exists,
@@ -111,7 +113,7 @@ Ctx& ctx() {
 // name itself as a known software implementation.
 bool looks_like_software(const char* name) {
     if (!name) return false;
-    static const char* kSoftware[] = {
+    constexpr const char* kSoftware[] = {
         "pocl", "llvmpipe", "swiftshader", "softpipe", "oclgrind", "portable computing",
     };
     std::string lower(name);
@@ -163,56 +165,53 @@ bool pick_device(Ctx& c) {
 
 extern "C" {
 
-bool opencl_init() noexcept {
-    Ctx& c = ctx();
-    if (c.ok) return true;
-    if (!pick_device(c)) return false;
+void* opencl_open(char* name_out, unsigned long name_cap,
+                  int* unified_out, unsigned long long* max_buffer_out) noexcept {
+    Ctx* c = new (std::nothrow) Ctx{};
+    if (!c) return nullptr;
+    auto fail = [&]() -> void* { release(c); return nullptr; };
+    if (!pick_device(*c)) return fail();
 
     cl_int err = CL_SUCCESS;
-    c.context = clCreateContext(nullptr, 1, &c.device, nullptr, nullptr, &err);
-    if (err != CL_SUCCESS || !c.context) return false;
+    c->context = clCreateContext(nullptr, 1, &c->device, nullptr, nullptr, &err);
+    if (err != CL_SUCCESS || !c->context) return fail();
 
     // clCreateCommandQueue is deprecated in OpenCL 2.0 but is the only call
     // available on 1.2-only drivers, which is most of the installed base.
-    c.queue = clCreateCommandQueue(c.context, c.device, 0, &err);
-    if (err != CL_SUCCESS || !c.queue) return false;
+    c->queue = clCreateCommandQueue(c->context, c->device, 0, &err);
+    if (err != CL_SUCCESS || !c->queue) return fail();
 
-    c.program = clCreateProgramWithSource(c.context, 1, &kKernelSource, nullptr, &err);
-    if (err != CL_SUCCESS || !c.program) return false;
+    c->program = clCreateProgramWithSource(c->context, 1, &kKernelSource, nullptr, &err);
+    if (err != CL_SUCCESS || !c->program) return fail();
 
-    // -cl-fast-relaxed-math is NOT used: it permits reassociation, and this
-    // kernel's results must match the CPU dot product closely enough that a
-    // GPU-scored batch and a CPU-scored one rank identically. A faster kernel
-    // that reorders results is a correctness bug wearing a performance costume.
-    err = clBuildProgram(c.program, 1, &c.device, "-cl-mad-enable", nullptr, nullptr);
-    if (err != CL_SUCCESS) return false;
+    // No -cl-fast-relaxed-math: it permits reassociation, and GPU and CPU
+    // scores must agree closely enough to rank identically.
+    err = clBuildProgram(c->program, 1, &c->device, "-cl-mad-enable", nullptr, nullptr);
+    if (err != CL_SUCCESS) return fail();
 
-    c.kernel = clCreateKernel(c.program, "score_batch", &err);
-    if (err != CL_SUCCESS || !c.kernel) return false;
+    clGetDeviceInfo(c->device, CL_DEVICE_NAME, sizeof c->name - 1, c->name, nullptr);
+    clGetDeviceInfo(c->device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof c->max_alloc, &c->max_alloc, nullptr);
+    clGetDeviceInfo(c->device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof c->unified, &c->unified, nullptr);
+    c->ok = true;
 
-    clGetDeviceInfo(c.device, CL_DEVICE_NAME, sizeof c.name - 1, c.name, nullptr);
-    clGetDeviceInfo(c.device, CL_DEVICE_MAX_MEM_ALLOC_SIZE, sizeof c.max_alloc, &c.max_alloc, nullptr);
-    clGetDeviceInfo(c.device, CL_DEVICE_HOST_UNIFIED_MEMORY, sizeof c.unified, &c.unified, nullptr);
-
-    c.ok = true;
-    return true;
+    if (name_out && name_cap)
+        std::snprintf(name_out, name_cap, "%s", c->name[0] ? c->name : "opencl");
+    if (unified_out)    *unified_out    = c->unified ? 1 : 0;
+    if (max_buffer_out) *max_buffer_out = static_cast<unsigned long long>(c->max_alloc);
+    return c;
 }
 
-void opencl_info(char* name_out, unsigned long name_cap,
-                 int* unified_out, unsigned long long* max_buffer_out) noexcept {
-    const Ctx& c = ctx();
-    if (name_out && name_cap) {
-        std::snprintf(name_out, name_cap, "%s", c.name[0] ? c.name : "opencl");
-    }
-    if (unified_out)    *unified_out    = c.unified ? 1 : 0;
-    if (max_buffer_out) *max_buffer_out = static_cast<unsigned long long>(c.max_alloc);
-}
+void opencl_close(void* ctx) noexcept { release(static_cast<Ctx*>(ctx)); }
 
-bool opencl_score_batch(const float* corpus, const float* queries,
+// Callable from several threads on one context: the queue and program are
+// thread-safe in OpenCL 1.2, and each call makes its own kernel object because
+// clSetKernelArg on a shared one is not.
+bool opencl_score_batch(void* ctx, const float* corpus, const float* queries,
                         unsigned long dim, unsigned long n, unsigned long nq,
                         float* out) noexcept {
-    Ctx& c = ctx();
-    if (!c.ok || !corpus || !queries || !out) return false;
+    if (!ctx || !corpus || !queries || !out) return false;
+    const Ctx& c = *static_cast<const Ctx*>(ctx);
+    if (!c.ok) return false;
 
     const std::size_t corpus_bytes = static_cast<std::size_t>(n) * dim * sizeof(float);
     const std::size_t query_bytes  = static_cast<std::size_t>(nq) * dim * sizeof(float);
@@ -249,13 +248,14 @@ bool opencl_score_batch(const float* corpus, const float* queries,
     const cl_uint u_dim = static_cast<cl_uint>(dim);
     const cl_uint u_n   = static_cast<cl_uint>(n);
     const cl_uint u_nq  = static_cast<cl_uint>(nq);
-    bool ok = true;
-    ok &= clSetKernelArg(c.kernel, 0, sizeof(cl_mem), &d_corpus) == CL_SUCCESS;
-    ok &= clSetKernelArg(c.kernel, 1, sizeof(cl_mem), &d_query)  == CL_SUCCESS;
-    ok &= clSetKernelArg(c.kernel, 2, sizeof(cl_uint), &u_dim)   == CL_SUCCESS;
-    ok &= clSetKernelArg(c.kernel, 3, sizeof(cl_uint), &u_n)     == CL_SUCCESS;
-    ok &= clSetKernelArg(c.kernel, 4, sizeof(cl_uint), &u_nq)    == CL_SUCCESS;
-    ok &= clSetKernelArg(c.kernel, 5, sizeof(cl_mem), &d_out)    == CL_SUCCESS;
+    cl_kernel kernel = clCreateKernel(c.program, "score_batch", &err);
+    bool ok = err == CL_SUCCESS && kernel;
+    if (ok) ok &= clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_corpus) == CL_SUCCESS;
+    ok &= clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_query)  == CL_SUCCESS;
+    ok &= clSetKernelArg(kernel, 2, sizeof(cl_uint), &u_dim)   == CL_SUCCESS;
+    ok &= clSetKernelArg(kernel, 3, sizeof(cl_uint), &u_n)     == CL_SUCCESS;
+    ok &= clSetKernelArg(kernel, 4, sizeof(cl_uint), &u_nq)    == CL_SUCCESS;
+    ok &= clSetKernelArg(kernel, 5, sizeof(cl_mem), &d_out)    == CL_SUCCESS;
 
     if (ok) {
         // Round the candidate dimension up to a work-group multiple; the kernel
@@ -264,11 +264,11 @@ bool opencl_score_batch(const float* corpus, const float* queries,
         const std::size_t gws0 = ((static_cast<std::size_t>(n) + kTile - 1) / kTile) * kTile;
         const std::size_t global[2] = { gws0, static_cast<std::size_t>(nq) };
         const std::size_t local[2]  = { kTile, 1 };
-        err = clEnqueueNDRangeKernel(c.queue, c.kernel, 2, nullptr, global, local, 0, nullptr, nullptr);
+        err = clEnqueueNDRangeKernel(c.queue, kernel, 2, nullptr, global, local, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) {
             // Some drivers reject an explicit local size for this shape; let the
             // implementation choose rather than failing the whole dispatch.
-            err = clEnqueueNDRangeKernel(c.queue, c.kernel, 2, nullptr, global, nullptr, 0, nullptr, nullptr);
+            err = clEnqueueNDRangeKernel(c.queue, kernel, 2, nullptr, global, nullptr, 0, nullptr, nullptr);
         }
         ok = (err == CL_SUCCESS);
     }
@@ -287,6 +287,7 @@ bool opencl_score_batch(const float* corpus, const float* queries,
         }
     }
 
+    if (kernel) clReleaseKernel(kernel);
     clReleaseMemObject(d_corpus);
     clReleaseMemObject(d_query);
     clReleaseMemObject(d_out);

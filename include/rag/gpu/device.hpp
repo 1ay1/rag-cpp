@@ -84,30 +84,20 @@ namespace rag::gpu {
 // 37 ms against a 46.7 ms CPU scan, turning a 1.70x win into 0.73x. Corpus
 // keeps an epoch-keyed mirror instead.
 
-// What the active backend is, for diagnostics and for tests that must assert
-// they exercised the path they think they did.
-//
 // Two backends ship. They are not redundant:
 //
-//   metal   Apple-only, but on Apple silicon it is the better path — unified
-//           memory means no host<->device copy, and the driver is the one the
-//           hardware was designed around.
+//   metal   Apple-only, but on Apple silicon it is the better path: unified
+//           memory means no host<->device copy.
 //   opencl  Everything else: NVIDIA, AMD, Intel, and Apple as a fallback. One
-//           kernel source compiled at runtime by the vendor's driver, so a
-//           single build runs on any of them without a vendor SDK at build
-//           time. This is what makes GPU acceleration available off Apple.
-//
-// Selection is automatic (see select_backend below); a build may contain both.
+//           kernel source compiled at runtime by the vendor's driver.
 enum class Backend { none, metal, opencl };
 
 [[nodiscard]] const char* backend_name(Backend b) noexcept;
 
 // Which backends were COMPILED IN, regardless of whether a device exists now.
-// Lets a diagnostic distinguish "this binary cannot use your GPU" from "this
-// machine has no usable GPU", which are very different problems for a user.
 [[nodiscard]] std::vector<Backend> compiled_backends();
 
-// Description of the device actually in use.
+// Description of an opened device.
 struct DeviceInfo {
     Backend     backend = Backend::none;
     std::string name    = "cpu";
@@ -115,41 +105,57 @@ struct DeviceInfo {
     std::size_t max_buffer_bytes = 0;
 };
 
-// Is a GPU usable right now? False when built without GPU support, when no
-// device exists, or when shader compilation failed at startup. Cheap after the
-// first call (the answer is memoized along with the compiled pipelines).
-[[nodiscard]] bool available() noexcept;
-
-// Info for the active device; `backend == none` when running on CPU.
-[[nodiscard]] const DeviceInfo& device_info() noexcept;
-
-// To keep a corpus off the GPU, set CorpusConfig::use_gpu = false (or
-// RAGCPP_GPU_BACKEND=none for the whole process).
-
-// ── Batched scoring ─────────────────────────────────────────────────────────
-//
-// Score every one of `nq` queries against every one of `n` candidates:
-//
-//     out[q * n + i] = dot(queries[q], corpus[i])
-//
-// `corpus` is n*dim floats, row-major; `queries` is nq*dim floats, row-major;
-// `out` must have room for nq*n floats. Vectors are used as given \u2014 this does
-// not normalize, matching rag::dense::dot, which assumes unit vectors.
-//
-// Returns false if the work was NOT done on the GPU (no device, batch too
-// small to be worth a dispatch, buffer larger than the device allows). A false
-// return means `out` is untouched and the caller must run its own CPU path;
-// it is a routing answer, not an error.
-[[nodiscard]] bool score_batch(std::span<const float> corpus,
-                               std::span<const float> queries,
-                               std::size_t dim,
-                               std::span<float> out) noexcept;
-
 // The smallest total work (nq * n * dim multiply-adds) for which score_batch
 // will accept a job. Below this the dispatch round trip dominates and the CPU
-// is faster; exposed so callers can make the same routing decision without
-// speculatively calling in, and so the threshold is testable rather than a
-// magic number buried in a .cpp.
+// is faster.
 [[nodiscard]] std::size_t min_batch_work() noexcept;
+
+// An opened GPU. The caller owns it: open it once (it compiles kernels, so it
+// is not free), hand a pointer to every CorpusConfig that may use it, and keep
+// it alive while they do. score_batch is safe to call from several threads on
+// one Device. A default-constructed Device is "no GPU".
+class Device {
+public:
+    // Which backend to try. `any` tries Metal, then OpenCL; a backend that
+    // fails to initialise falls through to the next.
+    enum class Prefer { any, metal, opencl };
+
+    // Probe and open a device. Never fails: no usable GPU gives a Device whose
+    // available() is false.
+    [[nodiscard]] static Device open(Prefer prefer = Prefer::any);
+
+    Device() = default;
+    Device(Device&& o) noexcept;
+    Device& operator=(Device&& o) noexcept;
+    Device(const Device&)            = delete;
+    Device& operator=(const Device&) = delete;
+    ~Device();
+
+    [[nodiscard]] bool available() const noexcept { return handle_ != nullptr; }
+    [[nodiscard]] const DeviceInfo& info() const noexcept { return info_; }
+
+    // Score every one of `nq` queries against every one of `n` candidates:
+    //
+    //     out[q * n + i] = dot(queries[q], corpus[i])
+    //
+    // `corpus` is n*dim floats, row-major; `queries` is nq*dim floats,
+    // row-major; `out` must have room for nq*n floats. Vectors are used as
+    // given (no normalising), matching rag::dense::dot.
+    //
+    // Returns false if the work was NOT done on the GPU (no device, batch too
+    // small to be worth a dispatch, buffer larger than the device allows). A
+    // false return means `out` is untouched and the caller runs its own CPU
+    // path; it is a routing answer, not an error.
+    [[nodiscard]] bool score_batch(std::span<const float> corpus,
+                                   std::span<const float> queries,
+                                   std::size_t dim,
+                                   std::span<float> out) const noexcept;
+
+private:
+    void reset() noexcept;
+
+    DeviceInfo info_;
+    void*      handle_ = nullptr;   // the backend's context
+};
 
 } // namespace rag::gpu

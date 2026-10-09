@@ -12,7 +12,7 @@
 //    Requiring it would make the GPU path unbuildable for most people who
 //    check out this repo. newLibraryWithSource: goes through the same compiler
 //    inside the driver, costs a few milliseconds ONCE at first use, and is
-//    memoized for the process lifetime.
+//    kept for as long as the caller keeps the Device.
 //
 // 2. Buffers use MTLResourceStorageModeShared and are created with
 //    newBufferWithBytesNoCopy where alignment permits. On Apple silicon the CPU
@@ -28,6 +28,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <unistd.h>
 
 // Deliberately NOT including rag/gpu/device.hpp. This translation unit is
@@ -127,52 +128,56 @@ struct Ctx {
     bool ok = false;
 };
 
-Ctx& ctx() { static Ctx c; return c; }
 
 } // namespace
 
 extern "C" {
 
-bool metal_init() noexcept {
+// Returns an owned Ctx (ARC releases its ids when it is deleted), or null.
+void* metal_open(char* name_out, unsigned long name_cap,
+                 int* unified_out, unsigned long long* max_buffer_out) noexcept {
     @autoreleasepool {
-        Ctx& c = ctx();
-        c.device = MTLCreateSystemDefaultDevice();
-        if (!c.device) return false;               // headless / no GPU
-        c.queue = [c.device newCommandQueue];
-        if (!c.queue) return false;
+        Ctx* c = new (std::nothrow) Ctx{};
+        if (!c) return nullptr;
+        auto fail = [&]() -> void* { delete c; return nullptr; };
+        c->device = MTLCreateSystemDefaultDevice();
+        if (!c->device) return fail();             // headless / no GPU
+        c->queue = [c->device newCommandQueue];
+        if (!c->queue) return fail();
 
         NSError* err = nil;
         id<MTLLibrary> lib =
-            [c.device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource]
-                                   options:nil
-                                     error:&err];
-        if (!lib) return false;                    // driver refused to compile
+            [c->device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource]
+                                    options:nil
+                                      error:&err];
+        if (!lib) return fail();                   // driver refused to compile
         id<MTLFunction> fn = [lib newFunctionWithName:@"score_batch"];
-        if (!fn) return false;
-        c.pso = [c.device newComputePipelineStateWithFunction:fn error:&err];
-        if (!c.pso) return false;
+        if (!fn) return fail();
+        c->pso = [c->device newComputePipelineStateWithFunction:fn error:&err];
+        if (!c->pso) return fail();
+        c->ok = true;
 
-        c.ok = true;
-        return true;
+        if (name_out && name_cap) {
+            const char* n = [[c->device name] UTF8String];
+            std::strncpy(name_out, n ? n : "metal", name_cap - 1);
+            name_out[name_cap - 1] = '\0';
+        }
+        if (unified_out)    *unified_out = c->device.hasUnifiedMemory ? 1 : 0;
+        if (max_buffer_out) *max_buffer_out = (unsigned long long)c->device.maxBufferLength;
+        return c;
     }
 }
 
-void metal_info(char* name_out, unsigned long name_cap,
-                int* unified_out, unsigned long long* max_buffer_out) noexcept {
-    Ctx& c = ctx();
-    if (name_out && name_cap) {
-        const char* n = (c.ok && c.device) ? [[c.device name] UTF8String] : "metal";
-        std::strncpy(name_out, n ? n : "metal", name_cap - 1);
-        name_out[name_cap - 1] = '\0';
-    }
-    if (unified_out)    *unified_out = (c.ok && c.device.hasUnifiedMemory) ? 1 : 0;
-    if (max_buffer_out) *max_buffer_out =
-        c.ok ? (unsigned long long)c.device.maxBufferLength : 0ull;
+void metal_close(void* ctx) noexcept {
+    @autoreleasepool { delete static_cast<Ctx*>(ctx); }
 }
 
-bool metal_score_batch(const float* corpus, const float* queries, unsigned long dim,
+// MTLDevice, MTLCommandQueue and pipeline states are thread-safe, so one Ctx
+// serves concurrent calls; each call makes its own buffers and encoder.
+bool metal_score_batch(void* ctx, const float* corpus, const float* queries, unsigned long dim,
                        unsigned long n, unsigned long nq, float* out) noexcept {
-    Ctx& c = ctx();
+    if (!ctx) return false;
+    const Ctx& c = *static_cast<const Ctx*>(ctx);
     if (!c.ok) return false;
 
     @autoreleasepool {

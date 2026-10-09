@@ -29,12 +29,14 @@ using clk = std::chrono::steady_clock;
 static double ms(clk::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
 
 int main() {
-    std::printf("gpu available: %s\n\n", rag::gpu::available() ? "yes" : "no");
+    const auto gpu = rag::gpu::Device::open();
+    std::printf("gpu available: %s\n\n", gpu.available() ? "yes" : "no");
 
     for (std::size_t docs : {50000ul, 200000ul}) {
         for (std::size_t nq : {8ul, 32ul, 128ul}) {
             rag::index::CorpusConfig cfg;
             cfg.hnsw_threshold = 1'000'000;          // force the scan path
+            cfg.gpu = &gpu;
             rag::index::Corpus c{cfg};
             auto emb = rag::plugin::make_embedder(nlohmann::json{{"type", "hash"}, {"dim", 384}});
             c.set_embedder(std::move(*emb));

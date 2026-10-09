@@ -415,7 +415,7 @@ Corpus::dense_search_batch(std::span<const std::string> queries, std::size_t k,
         const std::size_t dim = packed_dim_;
         const std::size_t nq  = queries.size();
 
-        if (n > 0 && dim > 0 && cfg_.use_gpu && gpu::available() && nq * n * dim >= gpu::min_batch_work()) {
+        if (n > 0 && dim > 0 && cfg_.gpu && cfg_.gpu->available() && nq * n * dim >= gpu::min_batch_work()) {
             // Embed every query first; a partial batch is not worth salvaging.
             std::vector<float> qmat;
             qmat.reserve(nq * dim);
@@ -429,7 +429,7 @@ Corpus::dense_search_batch(std::span<const std::string> queries, std::size_t k,
 
             if (ok) {
                 std::vector<float> scores(nq * n);
-                if (gpu::score_batch(packed_, qmat, dim, scores)) {
+                if (cfg_.gpu->score_batch(packed_, qmat, dim, scores)) {
                     std::vector<std::vector<Hit>> out(nq);
                     for (std::size_t q = 0; q < nq; ++q) {
                         // Partial top-k per query over that query's score row.

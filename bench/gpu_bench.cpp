@@ -26,8 +26,9 @@ static double ms(clk::duration d) { return std::chrono::duration<double, std::mi
 int main(int argc, char** argv) {
     const std::size_t dim = argc > 1 ? std::strtoul(argv[1], nullptr, 10) : 384;
 
-    const auto& info = rag::gpu::device_info();
-    std::printf("gpu       : %s\n", rag::gpu::available() ? "available" : "NOT available (CPU only)");
+    const auto gpu = rag::gpu::Device::open();
+    const auto& info = gpu.info();
+    std::printf("gpu       : %s\n", gpu.available() ? "available" : "NOT available (CPU only)");
     std::printf("backend   : %s\n", rag::gpu::backend_name(info.backend));
     std::printf("device    : %s%s\n", info.name.c_str(),
                 info.unified_memory ? "  (unified memory)" : "");
@@ -70,9 +71,9 @@ int main(int argc, char** argv) {
         const double cpu_ms = ms(clk::now() - t0);
 
         std::vector<float> out(n * nq);
-        (void)rag::gpu::score_batch(corpus, queries, dim, out);          // warm
+        (void)gpu.score_batch(corpus, queries, dim, out);          // warm
         auto t1 = clk::now();
-        const bool ran = rag::gpu::score_batch(corpus, queries, dim, out);
+        const bool ran = gpu.score_batch(corpus, queries, dim, out);
         const double gpu_ms = ms(clk::now() - t1);
 
         if (!ran) {

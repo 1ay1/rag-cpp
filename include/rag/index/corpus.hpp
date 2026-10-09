@@ -22,6 +22,7 @@
 #include "rag/core/types.hpp"
 #include "rag/dense/embedder.hpp"
 #include "rag/index/hnsw.hpp"
+#include "rag/gpu/device.hpp"
 #include "rag/lexical/bm25.hpp"
 #include "rag/store/container.hpp"
 #include "rag/store/wal.hpp"
@@ -35,9 +36,10 @@ struct CorpusConfig {
     // How embedding and the dense scan split their parallel work (empty:
     // inline). Also used for the HNSW build. Not saved with the index.
     util::Splitter         split;
-    // Let dense_search_batch use a GPU when one is present. Off compares the
-    // two paths, or works around a misbehaving driver. Not saved.
-    bool                   use_gpu = true;
+    // A GPU dense_search_batch may use; null keeps it on the CPU. The caller
+    // owns the Device and keeps it alive while this corpus may use it. Not
+    // saved.
+    const gpu::Device*     gpu = nullptr;
     text::ChunkOptions     chunk;
     lexical::Bm25Params    bm25;
     text::TokenizeOptions  tokenize;
@@ -144,6 +146,12 @@ public:
 
     // Attach a dense embedder (enables the dense half). Optional.
     void set_embedder(dense::AnyEmbedder e) { embedder_ = std::move(e); }
+    // The runtime half of the config, which load() cannot restore: the
+    // splitter and GPU are the caller's, not the file's.
+    void set_runtime(util::Splitter split, const gpu::Device* gpu) {
+        cfg_.split = std::move(split);
+        cfg_.gpu   = gpu;
+    }
     [[nodiscard]] bool has_embedder() const noexcept { return embedder_.has_value(); }
     // Read-only view of the attached embedder (its dimension/identity/embed),
     // or nullptr when none is set. Lets front-ends (e.g. the RCP server) both
@@ -253,7 +261,7 @@ public:
     // Routing is automatic and conservative: this uses the GPU only when there
     // is no HNSW graph to walk (a graph walk is pointer-chasing and must never
     // be offloaded), no metadata filter, the batch clears
-    // gpu::min_batch_work(), and a GPU is present. Otherwise it runs the same
+    // gpu::min_batch_work(), and CorpusConfig::gpu is an open device. Otherwise it runs the same
     // threaded NEON path a loop would, so it is never SLOWER than looping.
     [[nodiscard]] Result<std::vector<std::vector<Hit>>>
     dense_search_batch(std::span<const std::string> queries, std::size_t k,

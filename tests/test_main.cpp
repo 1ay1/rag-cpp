@@ -3539,9 +3539,15 @@ struct GpuFixture {
 
 } // namespace
 
+// One device for the whole test run: opening compiles kernels.
+const rag::gpu::Device& test_gpu() {
+    static const rag::gpu::Device d = rag::gpu::Device::open();
+    return d;
+}
+
 TEST(gpu_reports_a_coherent_device) {
-    const auto& info = rag::gpu::device_info();
-    if (rag::gpu::available()) {
+    const auto& info = test_gpu().info();
+    if (test_gpu().available()) {
         // A device that says it is present must describe itself consistently.
         // This also guards the ABI boundary: the Metal backend is Objective-C++
         // compiled by Clang against libc++ while the library may be built by
@@ -3578,8 +3584,8 @@ TEST(gpu_compiled_backends_are_coherent) {
 
     // A device can only be active if its backend was compiled in. The converse
     // does NOT hold: a build may contain OpenCL on a machine with no GPU.
-    if (rag::gpu::available()) {
-        const auto active = rag::gpu::device_info().backend;
+    if (test_gpu().available()) {
+        const auto active = test_gpu().info().backend;
         bool found = false;
         for (auto b : compiled) if (b == active) found = true;
         CHECK(found);
@@ -3596,7 +3602,7 @@ TEST(gpu_active_backend_matches_cpu_whichever_it_is) {
     // work-group. It is deliberately phrased over whatever is active rather
     // than over a named backend, so adding a backend does not require adding a
     // test to notice it is wrong.
-    if (!rag::gpu::available()) return;
+    if (!test_gpu().available()) return;
 
     const std::size_t dim = 128;
     const std::size_t nq  = 8;
@@ -3606,7 +3612,7 @@ TEST(gpu_active_backend_matches_cpu_whichever_it_is) {
     GpuFixture fx(n, nq, dim);
 
     std::vector<float> out(n * nq, -999.0f);
-    if (!rag::gpu::score_batch(fx.corpus, fx.queries, dim, out)) return;   // declined
+    if (!test_gpu().score_batch(fx.corpus, fx.queries, dim, out)) return;   // declined
 
     const std::vector<float> ref = cpu_score_batch(fx.corpus, fx.queries, dim);
     REQUIRE(ref.size() == out.size());
@@ -3636,7 +3642,7 @@ TEST(gpu_score_batch_matches_cpu_or_declines) {
     GpuFixture fx(n, nq, dim);
 
     std::vector<float> out(n * nq, -999.0f);
-    const bool ran = rag::gpu::score_batch(fx.corpus, fx.queries, dim, out);
+    const bool ran = test_gpu().score_batch(fx.corpus, fx.queries, dim, out);
     if (!ran) { CHECK(true); return; }           // no device: nothing to verify
 
     const std::vector<float> ref = cpu_score_batch(fx.corpus, fx.queries, dim);
@@ -3657,16 +3663,22 @@ TEST(gpu_score_batch_validates_and_routes) {
     std::vector<float> out(1000 * 4);
 
     // Malformed shapes are refused rather than read out of bounds.
-    CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, 0, out));
-    CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, dim + 1, out));   // not a divisor
+    CHECK(!test_gpu().score_batch(fx.corpus, fx.queries, 0, out));
+    CHECK(!test_gpu().score_batch(fx.corpus, fx.queries, dim + 1, out));   // not a divisor
     std::vector<float> tiny_out(3);
-    CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, dim, tiny_out));  // output too small
+    CHECK(!test_gpu().score_batch(fx.corpus, fx.queries, dim, tiny_out));  // output too small
+
+    // No device declines everything.
+    const rag::gpu::Device none;
+    CHECK(!none.available());
+    CHECK(none.info().backend == rag::gpu::Backend::none);
+    CHECK(!none.score_batch(fx.corpus, fx.queries, dim, out));
 
     // Below the measured crossover the GPU must DECLINE even when present:
     // shipping work to a device that loses to the CPU is the failure mode this
     // whole threshold exists to prevent.
     CHECK(1000u * 4u * dim < rag::gpu::min_batch_work());
-    CHECK(!rag::gpu::score_batch(fx.corpus, fx.queries, dim, out));
+    CHECK(!test_gpu().score_batch(fx.corpus, fx.queries, dim, out));
 
     CHECK(rag::gpu::min_batch_work() > 0);
 }
@@ -3678,7 +3690,7 @@ TEST(gpu_score_batch_validates_and_routes) {
 rag::index::Corpus batch_corpus(std::size_t docs, std::size_t dim, bool use_gpu = true) {
     rag::index::CorpusConfig cfg;
     cfg.hnsw_threshold = 1'000'000;    // force the scan path
-    cfg.use_gpu        = use_gpu;
+    cfg.gpu            = use_gpu ? &test_gpu() : nullptr;
     rag::index::Corpus c{cfg};
     auto emb = rag::plugin::make_embedder(nlohmann::json{{"type", "hash"}, {"dim", dim}});
     c.set_embedder(std::move(*emb));
@@ -3705,7 +3717,7 @@ TEST(dense_batch_matches_the_per_query_path_exactly) {
     const std::size_t dim = 384;
     const std::size_t nq  = 32;
     const std::size_t need = rag::gpu::min_batch_work() / (nq * dim) + 1000;
-    if (!rag::gpu::available()) return;    // CPU-only machines: covered below
+    if (!test_gpu().available()) return;    // CPU-only machines: covered below
 
     auto c = batch_corpus(need, dim);
     std::vector<std::string> queries;

@@ -496,8 +496,8 @@ Measured on standard ANN datasets, recall@10 vs exact cosine, `M=16`,
 ## GPU batch scoring
 
 Two interchangeable backends: **Metal** (Apple) and **OpenCL** (NVIDIA, AMD,
-Intel, and Apple as a fallback). Selection is automatic; `RAGCPP_GPU_BACKEND`
-overrides it.
+Intel, and Apple as a fallback). `gpu::Device::open()` picks one; its `Prefer`
+argument limits the choice.
 
 dim 384, k=10, Apple M-series:
 

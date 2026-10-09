@@ -8,8 +8,7 @@
 
 #include "rag/gpu/device.hpp"
 
-#include <cstdlib>
-#include <cstring>
+#include <utility>
 
 namespace rag::gpu {
 
@@ -50,93 +49,92 @@ namespace detail {
 // on exit. Only trivially-copyable C types may cross this line.
 #if defined(RAGCPP_WITH_METAL)
 extern "C" {
-bool metal_init() noexcept;
-void metal_info(char* name_out, unsigned long name_cap,
-                int* unified_out, unsigned long long* max_buffer_out) noexcept;
-bool metal_score_batch(const float*, const float*, unsigned long, unsigned long,
-                       unsigned long, float*) noexcept;
+void* metal_open(char* name_out, unsigned long name_cap,
+                 int* unified_out, unsigned long long* max_buffer_out) noexcept;
+void metal_close(void* ctx) noexcept;
+bool metal_score_batch(void* ctx, const float*, const float*, unsigned long,
+                       unsigned long, unsigned long, float*) noexcept;
 }
 #endif
 #if defined(RAGCPP_WITH_OPENCL)
 extern "C" {
-bool opencl_init() noexcept;
-void opencl_info(char* name_out, unsigned long name_cap,
-                 int* unified_out, unsigned long long* max_buffer_out) noexcept;
-bool opencl_score_batch(const float*, const float*, unsigned long, unsigned long,
-                        unsigned long, float*) noexcept;
+void* opencl_open(char* name_out, unsigned long name_cap,
+                  int* unified_out, unsigned long long* max_buffer_out) noexcept;
+void opencl_close(void* ctx) noexcept;
+bool opencl_score_batch(void* ctx, const float*, const float*, unsigned long,
+                        unsigned long, unsigned long, float*) noexcept;
 }
 #endif
-
-DeviceInfo& info() noexcept {
-    static DeviceInfo i;
-    return i;
-}
-
-// Probe the devices exactly once and choose a backend. static-local
-// initialization is thread-safe (C++11 [stmt.dcl]/4) and the probe is expensive
-// — it compiles kernels — so doing it under the initializer rather than a
-// hand-rolled flag also avoids a double-compile race.
-//
-// ORDER OF PREFERENCE, and why:
-//   1. RAGCPP_GPU_BACKEND=metal|opencl|none forces the choice. Without this a
-//      user on a machine where one driver misbehaves has no recourse short of
-//      rebuilding, and a test cannot exercise the non-default backend at all.
-//   2. Metal, when built in. On Apple silicon it wins on the merits: unified
-//      memory means no host<->device copy, where the OpenCL path must stage
-//      through clCreateBuffer.
-//   3. OpenCL. The portable path — NVIDIA, AMD, Intel, and Apple as a fallback.
-// A backend that fails to initialize falls through to the next rather than
-// disabling the GPU entirely: a broken OpenCL ICD should not cost an Apple user
-// their Metal path, and vice versa.
-bool initialized() noexcept {
-    static const bool ok = [] {
-        const char* want = std::getenv("RAGCPP_GPU_BACKEND");
-        const bool force_metal  = want && std::strcmp(want, "metal")  == 0;
-        const bool force_opencl = want && std::strcmp(want, "opencl") == 0;
-        const bool force_none   = want && std::strcmp(want, "none")   == 0;
-        if (force_none) return false;
-
-        char name[256] = {0};
-        int unified = 0;
-        unsigned long long max_buf = 0;
-        // These feed metal_info()/opencl_info() below; unused when neither GPU
-        // backend is compiled in (e.g. the Windows build).
-        (void)name; (void)unified; (void)max_buf;
-
-#if defined(RAGCPP_WITH_METAL)
-        if (!force_opencl && metal_init()) {
-            metal_info(name, sizeof name, &unified, &max_buf);
-            info().backend          = Backend::metal;
-            info().name             = name[0] ? name : "metal";
-            info().unified_memory   = unified != 0;
-            info().max_buffer_bytes = static_cast<std::size_t>(max_buf);
-            return true;
-        }
-#endif
-#if defined(RAGCPP_WITH_OPENCL)
-        if (!force_metal && opencl_init()) {
-            opencl_info(name, sizeof name, &unified, &max_buf);
-            info().backend          = Backend::opencl;
-            info().name             = name[0] ? name : "opencl";
-            info().unified_memory   = unified != 0;
-            info().max_buffer_bytes = static_cast<std::size_t>(max_buf);
-            return true;
-        }
-#endif
-        (void)force_metal; (void)force_opencl;
-        return false;
-    }();
-    return ok;
-}
 
 } // namespace detail
 
-bool available() noexcept { return detail::initialized(); }
+// Metal first when allowed: on Apple silicon unified memory means no copy,
+// where OpenCL must stage through clCreateBuffer. A backend that fails to
+// initialise falls through to the next, so a broken OpenCL ICD does not cost
+// an Apple user their Metal path.
+Device Device::open(Prefer prefer) {
+    Device d;
+    char name[256] = {0};
+    int unified = 0;
+    unsigned long long max_buf = 0;
+    (void)name; (void)unified; (void)max_buf; (void)prefer;
 
-const DeviceInfo& device_info() noexcept {
-    (void)available();          // ensure the probe has run before reporting
-    return detail::info();
+    auto adopt = [&](void* h, Backend b, const char* fallback) {
+        d.handle_                = h;
+        d.info_.backend          = b;
+        d.info_.name             = name[0] ? name : fallback;
+        d.info_.unified_memory   = unified != 0;
+        d.info_.max_buffer_bytes = static_cast<std::size_t>(max_buf);
+    };
+#if defined(RAGCPP_WITH_METAL)
+    if (prefer != Prefer::opencl)
+        if (void* h = detail::metal_open(name, sizeof name, &unified, &max_buf)) {
+            adopt(h, Backend::metal, "metal");
+            return d;
+        }
+#endif
+#if defined(RAGCPP_WITH_OPENCL)
+    if (prefer != Prefer::metal)
+        if (void* h = detail::opencl_open(name, sizeof name, &unified, &max_buf)) {
+            adopt(h, Backend::opencl, "opencl");
+            return d;
+        }
+#endif
+    (void)adopt;
+    return d;
 }
+
+void Device::reset() noexcept {
+    if (!handle_) return;
+    switch (info_.backend) {
+#if defined(RAGCPP_WITH_METAL)
+        case Backend::metal:  detail::metal_close(handle_); break;
+#endif
+#if defined(RAGCPP_WITH_OPENCL)
+        case Backend::opencl: detail::opencl_close(handle_); break;
+#endif
+        default: break;
+    }
+    handle_ = nullptr;
+    info_ = {};
+}
+
+Device::Device(Device&& o) noexcept
+    : info_(std::move(o.info_)), handle_(std::exchange(o.handle_, nullptr)) {
+    o.info_ = {};
+}
+
+Device& Device::operator=(Device&& o) noexcept {
+    if (this != &o) {
+        reset();
+        info_   = std::move(o.info_);
+        handle_ = std::exchange(o.handle_, nullptr);
+        o.info_ = {};
+    }
+    return *this;
+}
+
+Device::~Device() { reset(); }
 
 std::size_t min_batch_work() noexcept {
     // Measured crossover, not a guess.
@@ -162,34 +160,32 @@ std::size_t min_batch_work() noexcept {
     return 2ull * 1000ull * 1000ull * 1000ull;
 }
 
-bool score_batch(std::span<const float> corpus, std::span<const float> queries,
-                 std::size_t dim, std::span<float> out) noexcept {
-    if (dim == 0) return false;
+bool Device::score_batch(std::span<const float> corpus, std::span<const float> queries,
+                         std::size_t dim, std::span<float> out) const noexcept {
+    if (!handle_ || dim == 0) return false;
     if (corpus.size() % dim || queries.size() % dim) return false;
     const std::size_t n  = corpus.size() / dim;
     const std::size_t nq = queries.size() / dim;
     if (n == 0 || nq == 0) return false;
     if (out.size() < n * nq) return false;
     if (n * nq * dim < min_batch_work()) return false;   // too small to pay for
-    if (!available()) return false;
 
     // A buffer bigger than the device can allocate is a decline, not an error:
-    // the caller's CPU path handles it correctly and is what would have run
-    // anyway. Checked against whichever backend was selected.
-    if (detail::info().max_buffer_bytes &&
-        corpus.size() * sizeof(float) > detail::info().max_buffer_bytes) return false;
+    // the caller's CPU path handles it.
+    if (info_.max_buffer_bytes && corpus.size() * sizeof(float) > info_.max_buffer_bytes)
+        return false;
 
-    switch (detail::info().backend) {
+    switch (info_.backend) {
 #if defined(RAGCPP_WITH_METAL)
         case Backend::metal:
-            return detail::metal_score_batch(corpus.data(), queries.data(),
+            return detail::metal_score_batch(handle_, corpus.data(), queries.data(),
                                              static_cast<unsigned long>(dim),
                                              static_cast<unsigned long>(n),
                                              static_cast<unsigned long>(nq), out.data());
 #endif
 #if defined(RAGCPP_WITH_OPENCL)
         case Backend::opencl:
-            return detail::opencl_score_batch(corpus.data(), queries.data(),
+            return detail::opencl_score_batch(handle_, corpus.data(), queries.data(),
                                               static_cast<unsigned long>(dim),
                                               static_cast<unsigned long>(n),
                                               static_cast<unsigned long>(nq), out.data());

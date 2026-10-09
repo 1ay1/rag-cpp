@@ -17,11 +17,15 @@ provably faster.
 
 ## Which backend gets used
 
-Selection happens once, at first use:
+The caller opens a `rag::gpu::Device` once and points each
+`CorpusConfig::gpu` at it; a corpus with a null `gpu` stays on the CPU.
+`Device::open(Prefer)` picks:
 
-1. `RAGCPP_GPU_BACKEND=metal|opencl|none` overrides everything, if set.
-2. **Metal**, when compiled in and a device initialises.
-3. **OpenCL**, otherwise.
+1. **Metal**, when compiled in, allowed by `Prefer`, and a device initialises.
+2. **OpenCL**, otherwise.
+
+`Prefer::metal` / `Prefer::opencl` limit the choice to one backend. The library
+reads no environment variables; a host that wants a switch reads its own.
 
 A backend that fails to initialise falls through to the next rather than
 disabling the GPU entirely — a broken OpenCL ICD should not cost an Apple user
@@ -31,10 +35,13 @@ their Metal path.
 for (auto b : rag::gpu::compiled_backends())   // what this BINARY can use
     std::printf("%s\n", rag::gpu::backend_name(b));
 
-if (rag::gpu::available())                      // what this MACHINE has now
+auto gpu = rag::gpu::Device::open();             // what this MACHINE has now
+if (gpu.available())
     std::printf("active: %s (%s)\n",
-                rag::gpu::backend_name(rag::gpu::device_info().backend),
-                rag::gpu::device_info().name.c_str());
+                rag::gpu::backend_name(gpu.info().backend), gpu.info().name.c_str());
+
+rag::index::CorpusConfig cfg;
+cfg.gpu = &gpu;                                  // keep `gpu` alive while used
 ```
 
 Those are deliberately two different questions: "this build cannot use your GPU"
@@ -101,7 +108,7 @@ offloaded **only** when all of these hold:
 - there is **no metadata filter**,
 - the batch clears `gpu::min_batch_work()` (a minimum `nq · n · dim` multiply-add
   count — currently ~2 G MACs),
-- a GPU is actually present (`gpu::available()`).
+- `CorpusConfig::gpu` points at an open device (`Device::available()`).
 
 Otherwise it falls back to the per-query CPU loop — so it is **never slower**.
 Below the threshold the measured GPU/CPU ratio is ~1.0×; the win only shows up on
@@ -142,13 +149,13 @@ arbitrarily — so the two code paths could return the same *set* in a different
 cmake -B build -DRAGCPP_WITH_METAL=OFF
 ```
 
-The Metal code is then not compiled in, `gpu::available()` is always false, and
+The Metal code is then not compiled in, `Device::open()` finds nothing, and
 every batch runs on the CPU. On non-Apple platforms this is automatic.
 
 ## Testing note
 
-`gpu::disable()` is a one-way, process-global latch used by tests to force the
-CPU path. On CI / non-Apple hosts the GPU kernel itself isn't exercised (the
-equivalence test's GPU arm returns early when `gpu::available()` is false); the
+Tests force the CPU path by leaving `CorpusConfig::gpu` null. On CI / non-Apple
+hosts the GPU kernel itself isn't exercised (the equivalence test's GPU arm
+returns early when the opened `Device` is not available); the
 CPU-equivalence arm still runs everywhere. The kernel is exercised on Apple
 developer hardware.
