@@ -8,10 +8,8 @@
 #include "rag/util/parallel.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <fstream>
-#include <mutex>
 
 #include <nlohmann/json.hpp>
 
