@@ -17,9 +17,9 @@
 #include <string>
 
 namespace {
-void print_names() {
+void print_names(const rag::plugin::Registries& regs) {
     std::printf("  embedders: ");
-    for (const auto& n : rag::plugin::Registry<rag::plugin::AnyEmbedder>::instance().names())
+    for (const auto& n : regs.embedders.names())
         std::printf("%s ", n.c_str());
     std::printf("\n");
 }
@@ -28,20 +28,22 @@ void print_names() {
 int main(int argc, char** argv) {
     std::string plugin_path = argc > 1 ? argv[1] : "./liblocal_ngram_plugin.so";
 
-    rag::plugin::ensure_builtins_registered();
+    // No global registry: the host owns a copy of the built-ins and the plugin
+    // registers into that copy.
+    auto regs = rag::plugin::Registries::builtin();
     std::printf("Before loading the plugin:\n");
-    print_names();   // note: onnx/gguf are already here (built-in, by name)
+    print_names(regs);   // note: onnx/gguf are already here (built-in, by name)
 
     // ── 1. built-in local embedders resolve by name ──────────────────────────
     // On a build without -DRAGCPP_WITH_ONNX this returns a CLEAR typed error
     // rather than "unknown type" — the name exists, the feature does not.
-    if (auto e = rag::plugin::make_embedder(
+    if (auto e = regs.make_embedder(
             nlohmann::json{{"type", "onnx"}, {"model_path", "bge-small.onnx"}});
         !e)
         std::printf("\n  onnx by name -> %s\n", e.error().message.c_str());
 
     // ── 2. load the out-of-tree plugin ───────────────────────────────────────
-    auto loaded = rag::plugin::load_plugin(plugin_path);
+    auto loaded = rag::plugin::load_plugin(plugin_path, regs);
     if (!loaded) {
         std::printf("\nload failed: %s\n(pass the built plugin path as argv[1])\n",
                     loaded.error().message.c_str());
@@ -49,7 +51,7 @@ int main(int argc, char** argv) {
     }
     loaded->keep();   // keep the .so resident for the process lifetime
     std::printf("\nAfter loading %s:\n", plugin_path.c_str());
-    print_names();    // "local_ngram" now appears
+    print_names(regs);    // "local_ngram" now appears
 
     // ── 3. build an engine whose embedder is the plugin's, chosen by config ──
     // The composition here says: "prefer a local ONNX model; if this build can't
@@ -63,7 +65,7 @@ int main(int argc, char** argv) {
                        {"inner", {{"type", "local_ngram"}, {"dim", 384}, {"ngram", 3}}}}}};
 
     rag::Engine engine;
-    if (auto r = engine.with_embedder_spec(spec); !r) {
+    if (auto r = engine.with_embedder_spec(spec, regs); !r) {
         std::printf("with_embedder_spec failed: %s\n", r.error().message.c_str());
         return 1;
     }

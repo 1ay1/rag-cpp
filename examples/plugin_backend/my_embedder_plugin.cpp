@@ -57,14 +57,16 @@ private:
 
 } // namespace
 
-// Convention 1: a static registrar. Runs on dlopen. This alone is enough.
-RAG_REGISTER(rag::plugin::AnyEmbedder, "reverse_hash",
-    [](const nlohmann::json& cfg) -> rag::Result<rag::plugin::AnyEmbedder> {
-        auto dim = cfg.value("dim", 256);
-        return rag::plugin::AnyEmbedder{ReverseHashEmbedder{static_cast<std::size_t>(dim)}};
-    });
-
-// Convention 2 (optional): an explicit hook, called by load_plugin after dlopen.
-// Useful if a toolchain would strip the "unused" static registrar above. Here it
-// is a no-op because the static registrar already did the work.
-extern "C" void rag_plugin_register() { /* registrars already ran */ }
+// The entry point load_plugin() calls after dlopen. There is no global
+// registry: the host passes ITS copy of the registries, and the plugin adds its
+// backends to that copy only.
+extern "C" void rag_plugin_register(rag::plugin::Registries& regs) {
+    regs.embedder("reverse_hash", "toy embedder: hash of the reversed text (keys: dim)",
+        [](rag::plugin::Config c) -> rag::Result<ReverseHashEmbedder> {
+            int dim = c.get("dim", 256);
+            if (dim <= 0)
+                return rag::fail<ReverseHashEmbedder>(
+                    rag::Errc::invalid_argument, "reverse_hash: dim must be positive");
+            return ReverseHashEmbedder{static_cast<std::size_t>(dim)};
+        });
+}

@@ -101,9 +101,10 @@ static_assert(rag::Embedder<LocalNgramEmbedder>,
 // The ergonomic way (rag/plugin/builder.hpp): return your concept type from a
 // Config -> Result<T> lambda. The AnyEmbedder wrap, the not-throwing config
 // parsing, and the describe() text are all handled — no macro, no comma trap.
-// Registered from rag_plugin_register(), which load_plugin() calls after dlopen.
-extern "C" void rag_plugin_register() {
-    rag::plugin::register_embedder(
+// Registered from rag_plugin_register(), which load_plugin() calls after dlopen
+// with the host's own registries (there is no global registry).
+extern "C" void rag_plugin_register(rag::plugin::Registries& regs) {
+    regs.embedder(
         "local_ngram",
         "in-process character n-gram feature-hash embedder, no deps (keys: dim, ngram)",
         [](rag::plugin::Config c) -> rag::Result<LocalNgramEmbedder> {

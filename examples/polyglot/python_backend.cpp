@@ -4,8 +4,14 @@
 // as a subprocess and speaks JSON over the pipe — the Python side provides the
 // embedder AND a full retriever, with no C++ knowledge of Python and no Python
 // knowledge of C++ beyond the wire protocol.
+//
+// rag-cpp itself starts no processes: the host supplies HostIo::spawn (here the
+// small portable one in host_process.hpp) and rag runs the protocol over the
+// pipes it returns.
 
 #include <rag/rag.hpp>
+
+#include "host_process.hpp"
 
 #include <cstdio>
 #include <string>
@@ -13,7 +19,10 @@
 int main(int argc, char** argv) {
     std::string server = argc > 1 ? argv[1] : "examples/polyglot/ragcpp_server.py";
 
-    rag::plugin::ensure_builtins_registered(); // pulls in process/http transports
+    // The built-in registries, plus the host's IO: the process/http transports
+    // are registered, and `spawn` is how they reach a child.
+    const rag::plugin::HostIo io = example::host_io();
+    const auto regs = rag::plugin::Registries::with_io(io);
 
     // 1) Use the Python model as the engine's embedder, purely from config.
     rag::Engine engine;
@@ -22,7 +31,7 @@ int main(int argc, char** argv) {
         {"argv", {"python3", server}},
         {"dim", 384},
         {"name", "python:reference"},
-    });
+    }, regs);
     if (!attach) {
         std::printf("attach failed: %s\n", attach.error().message.c_str());
         std::printf("(is python3 on PATH? pass the server path as argv[1])\n");
@@ -42,7 +51,7 @@ int main(int argc, char** argv) {
         {"transport", "process"},
         {"argv", {"python3", server}},
         {"name", "python:retriever"},
-    });
+    }, io);
     if (ch) {
         rag::bridge::RemoteRetriever retr{*ch, "python:retriever"};
         if (auto r = retr.retrieve("great wall", 3)) {
