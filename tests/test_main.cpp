@@ -29,9 +29,12 @@ static rag::util::Splitter test_threads() {
     const unsigned hc = std::max(2u, std::thread::hardware_concurrency());
     return rag::util::Splitter(
         [](std::size_t n, const std::function<void(std::size_t)>& fn) {
-            std::vector<std::jthread> ts;
+            // std::thread + join, not std::jthread: Apple's libc++ (every
+            // macOS clang job) still ships without jthread.
+            std::vector<std::thread> ts;
             for (std::size_t i = 1; i < n; ++i) ts.emplace_back([&fn, i] { fn(i); });
             fn(0);
+            for (auto& t : ts) t.join();
         },
         hc);
 }
